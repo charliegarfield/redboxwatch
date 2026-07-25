@@ -1343,6 +1343,14 @@ def _render_about() -> str:
     <p class="rationale">Charlie is 22 and a recent college graduate. He believes technology can make
     democracy more transparent. Red Box Watch is unaffiliated with any campaign, party,
     or PAC.</p>
+    <h2 class="section-head"><span class="redbox"></span>Open source</h2>
+    <p class="rationale">The entire pipeline &#8212; candidate discovery, crawling, classification,
+    evidence archiving, and the generator that builds this site &#8212; is open source at
+    <a href="https://github.com/charliegarfield/redboxwatch">github.com/charliegarfield/redboxwatch</a>
+    (AGPL&#8209;3.0). A site that asks campaigns to work in the open should work in the
+    open itself: the methodology can be read, checked, and re-run. Every finding
+    published <em>here</em> passed human review before publication; output from other
+    deployments of the code is not a finding of Red Box Watch.</p>
     <h2 class="section-head"><span class="redbox"></span>Contact</h2>
     <p class="rationale">Press and media inquiries:
     <a class="px-mail" href="#">press&nbsp;[at]&nbsp;redboxwatch&nbsp;[dot]&nbsp;org</a>.
