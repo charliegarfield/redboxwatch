@@ -1,0 +1,35 @@
+# Secrets
+.env
+keys.txt
+*.key
+
+# Deployment-local config (contact address, robots overrides, model choices)
+config.local.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Data & artifacts (raw evidence, DB, caches)
+data/
+!data/.gitkeep
+*.sqlite
+*.sqlite3
+*.db
+.fec_cache/
+
+# Generated site (build output; contains copied evidence). Regenerate with
+# `python -m redbox publish`.
+site/
+
+# Design mockups (kept locally; large screenshots, not part of the build)
+design-concepts/
+
+# OS
+.DS_Store
+.wrangler/

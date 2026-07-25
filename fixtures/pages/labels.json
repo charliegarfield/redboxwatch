@@ -1,0 +1,12 @@
+{
+  "_comment": "Labeled fixtures for the classifier acceptance test (spec §3.5, acceptance #3). 'accept' lists permissible classifications; a page mixing a press kit with directive guidance must classify on the guidance.",
+  "labels": [
+    {"file": "positive_plainprose.txt", "accept": ["red_box_guidance"], "note": "known plain-prose example: segmented audiences + channel/timing/geo directives + b-roll for ad use"},
+    {"file": "negative_presskit.txt", "accept": ["no_guidance_detected"], "note": "standard press kit — logos, headshots, bios, contact"},
+    {"file": "negative_issues.txt", "accept": ["no_guidance_detected"], "note": "issue/platform page written to persuade voters directly"},
+    {"file": "negative_donate.txt", "accept": ["no_guidance_detected"], "note": "donation + volunteer CTA"},
+    {"file": "ambiguous_mixed.txt", "accept": ["red_box_guidance", "ambiguous"], "note": "press kit mixed with a directive closing-message instruction"},
+    {"file": "positive_paid_comms.txt", "accept": ["red_box_guidance"], "note": "real-pattern red box: segment->channel media-buy directives explicitly addressed to 'paid communication' + ad assets (audience test PASSES -> positive)"},
+    {"file": "negative_internal_press_notes.txt", "accept": ["no_guidance_detected", "ambiguous"], "note": "AUDIENCE TEST case: directive ('ADD FOR NATIONAL PRESS RELEASE', 'background for reporters', 'not for publication') but addressed to the campaign's own press shop / journalists, NOT an outside spender -> not red-boxing"}
+  ]
+}

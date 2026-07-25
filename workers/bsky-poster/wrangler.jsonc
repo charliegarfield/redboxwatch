@@ -1,0 +1,19 @@
+// Posts newly published Red Box Watch findings to Bluesky.
+// Reads the public JSON Feed, dedupes via KV, posts via AT Protocol.
+// Secrets (wrangler secret put): BSKY_APP_PASSWORD, RUN_TOKEN.
+{
+  "name": "redboxwatch-bsky-poster",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-24",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "triggers": { "crons": ["7 * * * *"] },
+  "kv_namespaces": [
+    { "binding": "STATE", "id": "3b4ca5874bec471889aaf2955b0352f6" }
+  ],
+  "vars": {
+    "FEED_URL": "https://redboxwatch.org/feed.json",
+    "BSKY_HANDLE": "redboxwatch.bsky.social",
+    "MAX_POSTS_PER_RUN": "5"
+  }
+}

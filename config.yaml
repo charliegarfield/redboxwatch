@@ -1,0 +1,188 @@
+# Red-Boxing Tracker configuration (spec §6).
+# Secrets are NOT here — they come from the environment / .env
+# (FEC_API_KEY, ANTHROPIC_API_KEY). See .env.example.
+
+election_year: 2026
+
+# Drop "paper candidates": require this much in FEC-reported receipts.
+receipts_floor: 50000
+
+# Contested-GENERAL screen: a district where >=2 candidates from >=2 parties
+# each clear this floor is a contested general, and those candidates enter the
+# universe even if their primaries are uncontested. Pure FEC data (unlike the
+# ratings overlay below) — red-boxing follows money, not ratings, so a safe
+# incumbent with a funded challenger still gets scanned. Higher than
+# receipts_floor so one token challenger doesn't qualify a district. 0 disables.
+general_receipts_floor: 100000
+
+# Baseline coverage (added 2026-07-22): people look up safe-seat members too,
+# so the universe is not contest-gated only.
+#   include_incumbents      - every sitting incumbent (FEC I flag) enters the
+#                             universe, even below receipts_floor and with no
+#                             funded opposition. Incumbency is the notability
+#                             signal; expect few findings, but "scanned, clean"
+#                             is itself the answer visitors want.
+#   include_funded_nominees - a race's sole funded candidate of a party
+#                             (uncontested primary -> presumptive nominee)
+#                             enters if they clear receipts_floor.
+include_incumbents: true
+include_funded_nominees: true
+
+# Race-rating ratings to keep for the competitive-general overlay.
+rating_threshold: [Tilt, Lean, Toss-up]
+
+# Which rating adapter to use. "fixture" (offline) ships with the repo; live
+# adapters (spec §3.1B) can be added behind this flag when you have licensed
+# access to a ratings source.
+rating_source: fixture
+
+# Universe to build at `discover` time (override per-run with `discover --mode`):
+#   primary - candidates in a contested primary (+ competitive overlay if ratings
+#             are configured). The original behavior. Default.
+#   general - primary WINNERS (nominees) only: who is on the November ballot.
+#   full    - per race, primary-style selection while a state is pre-primary and
+#             nominee-style once it has voted (states primary on different dates).
+scan_mode: primary
+
+# Nominee resolution (general/full modes). A nominee is mapped to its FEC
+# candidate by (state, office, district, party): manual override (verified) ->
+# uncontested-auto (lone funded candidate) -> results feed. feed: "civicapi"
+# (free, key-less; coverage varies by state — validate with
+# scripts/validate_civicapi.py) or "none" (override + uncontested only).
+nominees:
+  feed: civicapi
+
+# Scan safety. URL verification is a review-time signal by default, not a
+# pre-scan blocker (scanning is a read-only fetch of public pages; attribution
+# is confirmed at the human review/publish gate). Set true to restore the spec
+# §3.1 behavior of refusing to scan any candidate whose URL is not human-verified.
+require_verified_url: false
+
+# Website resolution. The resolution chain is: manual override -> Wikipedia ->
+# FEC committee -> search backup. The search backup runs only for candidates the
+# free sources miss. Two backends (BILLABLE):
+#   - Serper.dev (Google) + a cheap LLM judge — used when SERPER_KEY is set.
+#     ~$0.001 search + ~$0.001 judge per candidate; ~84% recall on a held-out
+#     state vs ~15% for Wikipedia alone. This is the preferred backend.
+#   - Claude's web_search tool — the fallback when no SERPER_KEY (~$0.07 each).
+# Set false to disable, or use `--no-search` on discover/resolve for one run.
+enable_search_backup: true
+
+# Crawler (phase 2)
+crawl_depth: 2
+# Per-class fetch budget per site: ordinary pages, high-value (media-kit-style)
+# pages, and PDFs each get this many fetches (hard total = 3x). High-value pages
+# are fetched first, but no class is unbounded — a giant blog under /news/ can
+# no longer make a site's crawl unbounded.
+max_pages_per_site: 150
+common_paths:
+  - /media
+  - /media-kit
+  - /mediakit
+  - /press
+  - /messaging
+  - /newsroom
+  - /news
+  - /resources
+  - /toolkit
+
+# robots.txt posture — see ROBOTS_POLICY.md. "respect" is the default;
+# "override" fetches anyway (logged); per-domain entries take precedence.
+robots_policy:
+  default: respect
+  # Per-domain overrides (crawl a specific host despite a blocking robots.txt)
+  # are deliberate, logged, per-site decisions. They are deployment-specific and
+  # belong in the untracked config.local.yaml, not here:
+  #   robots_policy:
+  #     per_domain:
+  #       example.com: override
+  per_domain: {}
+
+# Scan cadence (phase 7 / scheduler). Window in days before a candidate's
+# primary during which we scan daily; otherwise weekly.
+scan_cadence:
+  daily_window_days: 21
+  default_interval_days: 7
+
+# Politeness. Set a REAL contact address in config.local.yaml (untracked)
+# before running live crawls — the honest, reachable User-Agent is part of the
+# crawler posture (ROBOTS_POLICY.md), and it should identify YOU, not this repo.
+user_agent: "RedBoxTracker/0.1 (+research; contact: set-your-email@example.com)"
+rate_limit:
+  default_per_domain_rps: 0.5   # requests/sec/domain
+  default_min_delay_seconds: 2.0
+
+# Classifier (phase 3). Model strings are "provider/model"; an unprefixed name
+# means Anthropic. Supported prefixes: fireworks/ (Fireworks.ai serverless,
+# needs FIREWORKS_API_KEY), openai/ (needs OPENAI_API_KEY).
+#
+# These are sensible starting defaults, NOT the production deployment's choices.
+# Production model selection (and the tuned classifier prompt — see
+# redbox/classifier.py) is deliberately not published: publishing the exact
+# classifier stack would let campaigns adversarially test evasions against it.
+# Validate your own choices with scripts/eval_classifier_models.py against the
+# labeled fixtures, then set them in config.local.yaml (untracked).
+models:
+  first_pass: claude-haiku-4-5
+  escalation: claude-sonnet-4-6
+  search: claude-sonnet-4-6        # Claude web_search backup (fallback when no SERPER_KEY)
+  judge: claude-haiku-4-5          # picks the candidate's site from Serper results
+  max_tokens: 1024
+  chunk_chars: 40000           # chars per classification chunk (Haiku window ~200k;
+                               # larger -> most pages are a single LLM call)
+  concurrency: 8               # chunks classified concurrently within one page
+  # Global cap on concurrent chunk-classification LLM calls across ALL scan-all
+  # workers (one shared pool). Without it, multi-chunk pages fan out to
+  # workers x concurrency in-flight calls; this bounds that. Defaults to
+  # `concurrency` when unset.
+  classify_pool_size: 12
+  # Input-tokens/min ceiling, metered PER MODEL (keys must match the model
+  # strings above, including any provider prefix). A process-wide token bucket
+  # per model gates classification calls across scan-all workers so sustained
+  # throughput doesn't trigger 429s. `tokens_per_minute` (scalar) applies to
+  # BOTH first-pass and escalation as independent buckets;
+  # `tokens_per_minute_by_model` overrides per model and is the accurate way to
+  # set them. 0/unset disables. Provider limits are sliding windows, so leave
+  # real headroom.
+  tokens_per_minute: 300000
+  tokens_per_minute_by_model:
+    claude-haiku-4-5: 300000   # WELL under the ~450k Haiku ceiling
+    claude-sonnet-4-6: 150000  # escalation; Sonnet's per-min ceiling is lower
+
+confidence_thresholds:
+  # First-pass results within this band of the decision boundary escalate.
+  escalate_below: 0.75
+  # Minimum confidence for an auto "no_guidance_detected" to be trusted.
+  negative_floor: 0.6
+
+# Approximate model pricing (USD per MILLION input tokens) for the `scan-all`
+# cost PREFLIGHT only. These drive the dry-run estimate; they are NOT
+# billing-accurate — verify current prices at docs.claude.com and override here.
+# Output tokens (<= max_tokens per classification) are a small fixed share and
+# are omitted from the estimate.
+pricing:
+  claude-haiku-4-5: 1.0
+  claude-sonnet-4-6: 3.0
+
+# Storage
+database_path: data/redbox.sqlite
+artifacts_dir: data/artifacts
+fec_cache_dir: data/.fec_cache
+# Resolution cache: URL-resolution results (Wikipedia/committee/search) keyed by
+# candidate so a rerun re-uses them instead of re-searching. `resolve --force`
+# re-resolves and refreshes it; `resolve --no-cache` bypasses it entirely.
+resolve_cache_dir: data/.resolve_cache
+
+# Evidence screenshots are captured as PNG by the browser, then transcoded to
+# WebP on disk (typically ~70-90% smaller for text-heavy page captures).
+screenshot:
+  lossless: true   # bit-exact archival record; still far smaller than PNG.
+                   # set false + a quality below for an even smaller lossy WebP.
+  quality: 80      # used when lossless is false (1-100).
+
+# Publisher (phase 6). site_url is the canonical public origin; when set, the
+# --approved-only build emits sitemap.xml + robots.txt and adds canonical /
+# OpenGraph tags to every page. Local review builds never use it.
+publish:
+  site_url: https://redboxwatch.org
+  pages_project: redboxwatch     # Cloudflare Pages project for `redbox deploy`

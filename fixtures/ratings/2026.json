@@ -1,0 +1,7 @@
+[
+  {"office": "H", "state": "NC", "district": "01", "rating": "Toss-up", "party_favored": "D", "source": "sabato-fixture"},
+  {"office": "H", "state": "TX", "district": "28", "rating": "Lean", "party_favored": "D", "source": "sabato-fixture"},
+  {"office": "S", "state": "NC", "district": "00", "rating": "Lean", "party_favored": "R", "source": "sabato-fixture"},
+  {"office": "H", "state": "CA", "district": "13", "rating": "Tilt", "party_favored": "D", "source": "sabato-fixture"},
+  {"office": "H", "state": "NY", "district": "17", "rating": "Likely", "party_favored": "D", "source": "sabato-fixture"}
+]
