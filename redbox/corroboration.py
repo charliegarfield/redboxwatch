@@ -95,11 +95,26 @@ def pull_and_store_ie(conn: sqlite3.Connection, fec, *, candidate_id: str,
     return len(rows)
 
 
+# Human review gates every published claim, so it gates corroboration too: a
+# detection whose LATEST review is 'reject' must not date guidance_first_detected
+# (the timeline the publisher prints) or pull FEC data. Latest-review-wins,
+# same convention as the publisher and review console.
+_NOT_REJECTED_JOIN = """
+    LEFT JOIN (SELECT detection_id, action, ROW_NUMBER() OVER (
+                   PARTITION BY detection_id
+                   ORDER BY reviewed_at DESC, review_id DESC) rn
+               FROM reviews) r
+      ON r.detection_id = d.detection_id AND r.rn = 1"""
+
+
 def _earliest_positive(conn: sqlite3.Connection, candidate_id: str):
     return conn.execute(
-        """SELECT detection_id, classified_at FROM detections
-           WHERE candidate_id=? AND classification IN ('red_box_guidance','ambiguous')
-           ORDER BY classified_at ASC LIMIT 1""", (candidate_id,)).fetchone()
+        f"""SELECT d.detection_id, d.classified_at FROM detections d
+            {_NOT_REJECTED_JOIN}
+            WHERE d.candidate_id=?
+              AND d.classification IN ('red_box_guidance','ambiguous')
+              AND COALESCE(r.action,'') != 'reject'
+            ORDER BY d.classified_at ASC LIMIT 1""", (candidate_id,)).fetchone()
 
 
 def compute(conn: sqlite3.Connection, candidate_id: str, *, cycle: int) -> Corroboration:
@@ -171,6 +186,9 @@ def run(conn: sqlite3.Connection, fec, *, candidate_id: str, cycle: int,
 
 
 def candidates_with_positive(conn: sqlite3.Connection) -> list[str]:
+    """Candidates with a positive/ambiguous detection not rejected by review."""
     return [r[0] for r in conn.execute(
-        """SELECT DISTINCT candidate_id FROM detections
-           WHERE classification IN ('red_box_guidance','ambiguous')""").fetchall()]
+        f"""SELECT DISTINCT d.candidate_id FROM detections d
+            {_NOT_REJECTED_JOIN}
+            WHERE d.classification IN ('red_box_guidance','ambiguous')
+              AND COALESCE(r.action,'') != 'reject'""").fetchall()]

@@ -486,3 +486,83 @@ def test_discover_does_not_resolve_and_rediscover_preserves_url(cfg, tmp_path):
     assert row[1] == "wikipedia"
     assert row[2] == 1
     conn.close()
+
+
+def test_race_phase_honors_district_overrides():
+    # A postponed district stays in its primary phase after the statewide
+    # date passes; the rest of the state moves to the general phase.
+    from datetime import date
+
+    from redbox.discovery import Discovery
+
+    dates = {"AL": "2026-05-19", "AL:H:01": "2026-08-11", "LA": "2026-05-16",
+             "LA:H": "2026-11-03"}
+    today = date(2026, 7, 28)
+    phase = Discovery._race_phase
+    assert phase("AL", "H", "01", today, dates) == "primary"   # postponed CD
+    assert phase("AL", "H", "03", today, dates) == "general"   # voted 5/19
+    assert phase("AL", "S", "00", today, dates) == "general"
+    assert phase("LA", "H", "04", today, dates) == "primary"   # pushed to Nov
+    assert phase("LA", "S", "00", today, dates) == "general"
+    assert phase("ZZ", "H", "01", today, dates) == "primary"   # unknown state
+
+
+def test_dfl_and_dem_share_one_primary_bucket(cfg):
+    # The FEC codes MN candidates as both DEM and DFL, but they run in the
+    # SAME primary. Raw party codes once split them into parallel buckets:
+    # each side read as uncontested, and a lone DFL filer facing funded DEM
+    # opponents was crowned a sole "funded presumptive nominee" (the live
+    # MN-Sen shape: Flanagan/DFL vs Craig/DEM, both heavily funded).
+    candidates = [
+        _cand("S1", "FLANAGAN, MARGARET", "S", "MN", "00", "DFL"),
+        _cand("S2", "CRAIG, ANGIE", "S", "MN", "00", "DEM"),
+    ]
+    receipts = {"S1": 6_000_000, "S2": 11_900_000}
+    entries = {e.candidate.candidate_id: e for e in
+               _discovery(cfg, candidates, receipts).build_universe(offices=["S"])}
+    assert "contested_primary" in entries["S1"].reasons
+    assert "contested_primary" in entries["S2"].reasons
+    assert all("funded_nominee" not in e.reasons for e in entries.values())
+
+
+def test_feed_call_crosswalks_to_dfl_coded_row():
+    # A civicAPI race reporting party 'Democratic-Farmer-Labor' must land in
+    # the same bucket as an FEC row coded 'DFL' (and as 'DEM' opponents) —
+    # two independent normalizers once disagreed and MN races could never
+    # crosswalk (the DB side bucketed 'DFL' verbatim).
+    from redbox.nominees import CivicAPIFeed, NomineeResolver
+
+    rows = [
+        {"candidate_id": "S1", "name": "FLANAGAN, MARGARET", "office": "S",
+         "state": "MN", "district": "00", "party": "DFL"},
+        {"candidate_id": "S2", "name": "CRAIG, ANGIE", "office": "S",
+         "state": "MN", "district": "00", "party": "DEM"},
+    ]
+    races = [{"type": "Senate", "province": "MN", "district": "MN",
+              "election_type": "Primary", "election_date": "2026-08-11T05:00:00.000Z",
+              "candidates": [{"name": "Margaret Flanagan",
+                              "party": "Democratic-Farmer-Labor", "winner": True}]}]
+    feed = CivicAPIFeed(cycle=2026, get=lambda p: {"races": races, "count": 1})
+    result = NomineeResolver(2026, overrides_path=None, feed=feed).resolve(
+        rows, states={"MN"})
+    assert result.candidate_ids() == {"S1"}
+
+
+def test_presidential_filers_excluded_from_all_populations_in_midterm(cfg_baseline):
+    # Presidential committees file continuously, so cumulative receipts read
+    # as current-cycle money — in a midterm there IS no presidential race,
+    # and P records must not enter ANY population (contested_primary /
+    # contested_general once let them in: every P filer shares one
+    # state='00' bucket, so two junk-party filers read as a contested
+    # cross-party general).
+    candidates = [
+        _cand("P1", "HOPEFUL, HARRY", "P", "00", "00", "REP"),
+        _cand("P2", "WISHFUL, WANDA", "P", "00", "00", "REP"),
+        _cand("P3", "NOVEL, NED", "P", "00", "00", "NNE"),
+        _cand("H1", "REAL, RITA", "H", "TX", "01", "DEM", ici="I"),
+    ]
+    receipts = {"P1": 5_000_000, "P2": 2_000_000, "P3": 25_000_000, "H1": 500_000}
+    entries = {e.candidate.candidate_id: e for e in
+               _discovery(cfg_baseline, candidates, receipts).build_universe(
+                   offices=["H", "S", "P"])}
+    assert set(entries) == {"H1"}

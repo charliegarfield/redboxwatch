@@ -31,6 +31,13 @@ MEDIA_PATHS = (
     "/news", "/resources", "/toolkit", "/kit", "/comms", "/communications",
 )
 
+# The crawler's high-priority paths: everything that always classifies, plus
+# variants worth *fetching* eagerly even though they usually alias into one of
+# the above. Kept HERE, next to MEDIA_PATHS, so the two lists can't silently
+# drift apart again (they had: /supporter was crawled eagerly but not
+# always-classified; /communications the reverse).
+HIGH_VALUE_PATHS = MEDIA_PATHS + ("/supporter",)
+
 # URL substrings that are essentially never a red box (and have a clear purpose).
 BOILERPLATE_PATHS = (
     "/donate", "/contribute", "/chip-in", "/volunteer", "/privacy", "/terms",

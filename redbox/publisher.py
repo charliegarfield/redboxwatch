@@ -27,7 +27,8 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .util import now_iso, sha256_text
+from .pipeline import usable_scan_sql
+from .util import STATE_NAMES, now_iso, sha256_text
 
 POSITIVE_LABEL = "Posted public messaging guidance consistent with red-boxing"
 AMBIGUOUS_LABEL = "Possible messaging guidance — under review"
@@ -56,9 +57,54 @@ class CandidateView:
     review: dict | None
     corroboration: dict | None = None
     changes: list[dict] = field(default_factory=list)
+    # One entry per distinct page BODY carrying red-box/ambiguous guidance that
+    # survived (or awaits) review: {detection, evidence, archive, review,
+    # approved, pending, alias_urls, gone_since}. Template-alias URLs serving
+    # the same body are collapsed into one exhibit (primary URL + alias_urls).
+    # exhibits[0] is always the same detection as ``detection`` when the
+    # candidate's status is positive. ``gone_since`` is the date the guidance
+    # stopped appearing on every URL that served it (None while live).
+    exhibits: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
+# Detection ranking, shared by the per-candidate and per-URL picks (and by the
+# Python-side sort that keeps them consistent). Review state first — an
+# approved positive IS the published record and outranks any unreviewed
+# re-detection; a rejected flag sinks below everything reviewable — then the
+# original severity/confidence/id ordering.
+_POSITIVE_CLASSES = ("red_box_guidance", "ambiguous")
+
+_RANK_ORDER_SQL = """
+    CASE WHEN d.classification IN ('red_box_guidance','ambiguous')
+              AND r.action = 'approve' THEN 2
+         WHEN d.classification IN ('red_box_guidance','ambiguous')
+              AND (r.action IS NULL OR r.action = 'needs_more') THEN 1
+         ELSE 0 END DESC,
+    CASE d.classification
+         WHEN 'red_box_guidance' THEN 2 WHEN 'ambiguous' THEN 1 ELSE 0 END DESC,
+    d.confidence DESC, d.detection_id DESC"""
+
+_LATEST_REVIEW_JOIN = """
+    LEFT JOIN (SELECT detection_id, action FROM (
+                 SELECT detection_id, action, ROW_NUMBER() OVER (
+                     PARTITION BY detection_id
+                     ORDER BY reviewed_at DESC, review_id DESC) rn
+                 FROM reviews) WHERE rn = 1) r ON r.detection_id = d.detection_id"""
+
+_SEVERITY = {"red_box_guidance": 2, "ambiguous": 1}
+
+
+def _rank_key(d: dict):
+    """Python mirror of _RANK_ORDER_SQL (ascending sort -> best first)."""
+    positive = d["classification"] in _POSITIVE_CLASSES
+    action = d.get("review_action")
+    tier = (2 if positive and action == "approve"
+            else 1 if positive and action in (None, "needs_more") else 0)
+    return (-tier, -_SEVERITY.get(d["classification"], 0),
+            -(d.get("confidence") or 0), -(d.get("detection_id") or 0))
+
+
 def _gather(conn: sqlite3.Connection) -> list[CandidateView]:
     """Assemble one view per candidate using a fixed set of aggregate queries.
 
@@ -77,23 +123,133 @@ def _gather(conn: sqlite3.Connection) -> list[CandidateView]:
             "FROM scans GROUP BY candidate_id")
     }
 
-    # Highest-severity detection per candidate (one window-function query). Same
-    # ordering as before: red_box > ambiguous > none, then confidence; the final
-    # detection_id tiebreak makes the pick deterministic.
+    # Representative detection per candidate (one window-function query).
+    # Review state ranks ABOVE severity and confidence: an approved finding is
+    # the candidate's published state and must not be displaced by a newer,
+    # higher-confidence but unreviewed re-detection of the same box (which
+    # would flip the status to pending and silently unpublish the finding on
+    # the next --approved-only deploy), nor by a rejected false positive.
+    # Within a review tier the old ordering holds: red_box > ambiguous > none,
+    # then confidence, then detection_id for a deterministic pick.
     top_det_by_cid: dict[str, dict] = {}
     for r in conn.execute(
-        """SELECT * FROM (
-              SELECT d.*, s.url AS page_url,
+        f"""SELECT * FROM (
+              SELECT d.*, s.url AS page_url, r.action AS review_action,
                      ROW_NUMBER() OVER (
                        PARTITION BY d.candidate_id
-                       ORDER BY CASE d.classification
-                           WHEN 'red_box_guidance' THEN 2 WHEN 'ambiguous' THEN 1 ELSE 0 END DESC,
-                           d.confidence DESC, d.detection_id DESC) AS rn
+                       ORDER BY {_RANK_ORDER_SQL}) AS rn
               FROM detections d JOIN scans s USING(scan_id)
+              {_LATEST_REVIEW_JOIN}
            ) WHERE rn = 1"""):
         d = dict(r)
         d.pop("rn", None)
         top_det_by_cid[d["candidate_id"]] = d
+
+    # Every page URL still carrying reviewable guidance (one window query):
+    # the top detection per (candidate, url) under the same ranking. A page's
+    # approved detection outranks a newer pending re-detection of the same box,
+    # so a re-scan never duplicates an exhibit; a URL whose flag was rejected
+    # (and never approved) is excluded. This is what lets a candidate with red
+    # boxes on TWO pages show both, each with its own archived evidence.
+    exhibit_dets_by_cid: dict[str, list[dict]] = {}
+    for r in conn.execute(
+        f"""SELECT * FROM (
+              SELECT d.*, s.url AS page_url, s.text_hash AS page_text_hash,
+                     r.action AS review_action,
+                     MIN(CASE WHEN d.classification IN ('red_box_guidance','ambiguous')
+                              THEN d.classified_at END) OVER (
+                       PARTITION BY d.candidate_id, s.url) AS first_detected_at,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY d.candidate_id, s.url
+                       ORDER BY {_RANK_ORDER_SQL}) AS rn
+              FROM detections d JOIN scans s USING(scan_id)
+              {_LATEST_REVIEW_JOIN}
+           ) WHERE rn = 1
+             AND classification IN ('red_box_guidance','ambiguous')
+             AND (review_action IS NULL OR review_action != 'reject')"""):
+        d = dict(r)
+        d.pop("rn", None)
+        exhibit_dets_by_cid.setdefault(d["candidate_id"], []).append(d)
+    # Collapse template aliases: the pipeline dedupes identical bodies within
+    # one scan run, but catch-all routes re-detected across runs (/media,
+    # /media-kit, /press all serving the same page) accumulate one detection
+    # per URL. One exhibit per distinct body — best-ranked URL is primary, the
+    # rest are listed as aliases — matches the review console's grouping and
+    # keeps a ten-alias site from rendering as ten red boxes.
+    for cid_key, dets in exhibit_dets_by_cid.items():
+        dets.sort(key=_rank_key)
+        by_hash: dict[str, dict] = {}
+        for d in dets:
+            h = d["page_text_hash"]
+            if h in by_hash:
+                prim = by_hash[h]
+                prim.setdefault("alias_urls", []).append(d["page_url"])
+                fd, pfd = d.get("first_detected_at"), prim.get("first_detected_at")
+                if fd and (not pfd or fd < pfd):
+                    prim["first_detected_at"] = fd
+            else:
+                by_hash[h] = d
+        exhibit_dets_by_cid[cid_key] = list(by_hash.values())
+
+    # Current live state of each exhibit URL (one query): the latest USABLE
+    # scan of the URL — error/challenge fetches say nothing about the page, so
+    # a 403 bot-block must not read as a removal — with its classification
+    # resolved through text_hash (unchanged re-scans carry no detection row of
+    # their own — same convention as the pipeline's change diffing). The
+    # per-body verdict uses the SAME review-aware ranking as everything else:
+    # legacy scans classified one body under several URLs and the classifier
+    # sometimes contradicted itself, and an unreviewed no-guidance verdict
+    # must not overrule the approved detection of the identical body (that
+    # read as a phantom "removal"). A latest usable scan whose body no longer
+    # ranks positive means the guidance has come down; the finding stays on
+    # the ledger but the page says so, dated.
+    gone_by_cid_url: dict[tuple[str, str], str] = {}
+    last_usable_scan: dict[tuple[str, str], int] = {}
+    for r in conn.execute(
+        f"""SELECT l.candidate_id, l.url, l.fetched_at, l.scan_id,
+                   top.classification AS current_class
+            FROM (SELECT * FROM (
+                    SELECT s.*, ROW_NUMBER() OVER (
+                        PARTITION BY s.candidate_id, s.url
+                        ORDER BY s.scan_id DESC) rn
+                    FROM scans s
+                    WHERE (s.candidate_id, s.url) IN (
+                        SELECT DISTINCT sd.candidate_id, sd.url
+                        FROM detections dd JOIN scans sd ON sd.scan_id = dd.scan_id
+                        WHERE dd.classification IN ('red_box_guidance','ambiguous'))
+                      AND {usable_scan_sql('s')}
+                  ) WHERE rn = 1) l
+            LEFT JOIN (SELECT * FROM (
+                    SELECT d.candidate_id AS tcand, s.text_hash AS thash,
+                           d.classification,
+                           ROW_NUMBER() OVER (
+                             PARTITION BY d.candidate_id, s.text_hash
+                             ORDER BY {_RANK_ORDER_SQL}) trn
+                    FROM detections d JOIN scans s USING(scan_id)
+                    {_LATEST_REVIEW_JOIN}
+                  ) WHERE trn = 1) top
+              ON top.tcand = l.candidate_id AND top.thash = l.text_hash"""):
+        last_usable_scan[(r["candidate_id"], r["url"])] = r["scan_id"]
+        if r["current_class"] not in ("red_box_guidance", "ambiguous"):
+            gone_by_cid_url[(r["candidate_id"], r["url"])] = (r["fetched_at"] or "")[:10]
+    # A change event recorded after the last usable scan is the newer word on
+    # the URL's state: a confirmed-disappearance take_down (two consecutive
+    # 404s) has no usable scan of its own, and a later put_up supersedes an
+    # older gone verdict.
+    for r in conn.execute(
+        """SELECT candidate_id, url, event_type, new_scan_id, detected_at
+           FROM (SELECT *, ROW_NUMBER() OVER (
+                     PARTITION BY candidate_id, url ORDER BY change_id DESC) rn
+                 FROM change_events) WHERE rn = 1"""):
+        key = (r["candidate_id"], r["url"])
+        # Events with no new_scan_id (legacy/synthetic rows) can't be ordered
+        # against scans; treat them as older than any usable scan.
+        if (r["new_scan_id"] or 0) <= last_usable_scan.get(key, 0):
+            continue
+        if r["event_type"] == "take_down":
+            gone_by_cid_url[key] = (r["detected_at"] or "")[:10]
+        else:
+            gone_by_cid_url.pop(key, None)
 
     # Latest review / archive per detection (one query each; both small tables).
     review_by_det: dict[int, dict] = {}
@@ -120,11 +276,32 @@ def _gather(conn: sqlite3.Connection) -> list[CandidateView]:
               FROM corroboration) WHERE rn = 1"""):
         corr_by_cid[r["candidate_id"]] = dict(r)
 
+    # For 'modified' events, judge whether the quoted guidance itself changed
+    # or only the page around it (one query over the modified events; the
+    # comparison is _guidance_unchanged). "Guidance changed" fires on any
+    # text-hash change, so without this a news-item edit on a red-box page
+    # reads the same as a rewritten box.
+    mod_same: dict[int, bool | None] = {}
+    for r in conn.execute(
+        """SELECT ce.change_id, ps.raw_text AS prev_text, ns.raw_text AS new_text,
+                  (SELECT evidence FROM detections dp WHERE dp.scan_id = ce.prev_scan_id
+                   ORDER BY dp.detection_id DESC LIMIT 1) AS prev_ev,
+                  (SELECT evidence FROM detections dn WHERE dn.scan_id = ce.new_scan_id
+                   ORDER BY dn.detection_id DESC LIMIT 1) AS new_ev
+           FROM change_events ce
+           LEFT JOIN scans ps ON ps.scan_id = ce.prev_scan_id
+           LEFT JOIN scans ns ON ns.scan_id = ce.new_scan_id
+           WHERE ce.event_type = 'modified'"""):
+        mod_same[r["change_id"]] = _guidance_unchanged(
+            r["prev_ev"], r["new_ev"], r["prev_text"], r["new_text"])
+
     # All change events, bucketed by candidate in memory (one ordered query).
     changes_by_cid: dict[str, list[dict]] = {}
     for r in conn.execute(
         "SELECT * FROM change_events ORDER BY candidate_id, detected_at DESC"):
-        changes_by_cid.setdefault(r["candidate_id"], []).append(dict(r))
+        ch = dict(r)
+        ch["guidance_same"] = mod_same.get(ch["change_id"])
+        changes_by_cid.setdefault(ch["candidate_id"], []).append(ch)
 
     views: list[CandidateView] = []
     # inactive = withdrawn/superseded candidacy (FEC flag or human wrong-race
@@ -152,10 +329,27 @@ def _gather(conn: sqlite3.Connection) -> list[CandidateView]:
         if det:
             review = review_by_det.get(det["detection_id"])
             archive = archive_by_det.get(det["detection_id"])
-            try:
-                evidence = json.loads(det.get("evidence") or "[]")
-            except json.JSONDecodeError:
-                evidence = []
+            evidence = _parse_evidence(det)
+        exhibits = []
+        for d in exhibit_dets_by_cid.get(cid, []):
+            # Gone only when EVERY URL serving this body has stopped carrying
+            # it (a page that moved to an alias is still up); dated by the most
+            # recent check.
+            urls = [d.get("page_url")] + d.get("alias_urls", [])
+            gone = [gone_by_cid_url.get((cid, u)) for u in urls]
+            gone_since = max(gone) if all(gone) else None
+            exhibits.append({
+                "detection": d,
+                "evidence": _parse_evidence(d),
+                "archive": archive_by_det.get(d["detection_id"]),
+                "review": review_by_det.get(d["detection_id"]),
+                "approved": d.get("review_action") == "approve",
+                "pending": d.get("review_action") != "approve",
+                "alias_urls": d.get("alias_urls", []),
+                "gone_since": gone_since,
+                "timeline": _exhibit_timeline(
+                    d, changes_by_cid.get(cid, []), urls, gone_since),
+            })
         status, label = _status(det, review, last, scan_count, candidate=dict(c))
         views.append(CandidateView(
             row=dict(c), status=status, label=label,
@@ -163,8 +357,87 @@ def _gather(conn: sqlite3.Connection) -> list[CandidateView]:
             scan_count=scan_count, last_scanned=last, review=review,
             corroboration=corr_by_cid.get(cid),
             changes=changes_by_cid.get(cid, []),
+            exhibits=exhibits,
         ))
     return views
+
+
+def _parse_evidence(det: dict) -> list[dict]:
+    try:
+        return json.loads(det.get("evidence") or "[]")
+    except json.JSONDecodeError:
+        return []
+
+
+def _norm_span(s: str | None) -> str:
+    import re as _re
+    return _re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+
+def _quote_set(evidence_json: str | None) -> set[str]:
+    """Normalized quoted spans from a detection's evidence JSON. Trailing
+    ellipses (classifier truncation) are stripped so containment checks work."""
+    try:
+        ev = json.loads(evidence_json or "[]")
+    except json.JSONDecodeError:
+        return set()
+    return {_norm_span(q.get("quote")).rstrip(".…")
+            for q in ev if q.get("quote")}
+
+
+def _guidance_unchanged(prev_ev, new_ev, prev_text, new_text) -> bool | None:
+    """Did a 'modified' page keep the same quoted guidance?
+
+    True  -> the quoted spans are the same on both sides (the page changed
+             around them: a news item, a timestamp).
+    False -> the guidance spans themselves changed.
+    None  -> not enough recorded evidence to say (label stays generic).
+
+    Quote sets can differ merely because the classifier excerpted differently
+    on the re-run, so unequal sets fall back to cross-containment: if every
+    span quoted on either side appears verbatim in BOTH page texts, the
+    guidance is the same.
+    """
+    pq, nq = _quote_set(prev_ev), _quote_set(new_ev)
+    if pq and nq:
+        if pq == nq:
+            return True
+        pt, nt = _norm_span(prev_text), _norm_span(new_text)
+        return all(q in nt for q in pq) and all(q in pt for q in nq)
+    if nq and prev_text:
+        return all(q in _norm_span(prev_text) for q in nq)
+    return None
+
+
+# Timeline entry kinds, in same-day display order: appearance first, then
+# content changes, then removal.
+_TL_RANK = {"detected": 0, "put_up": 0, "updated": 1, "revised": 2,
+            "changed": 2, "take_down": 3, "gone": 3}
+
+
+def _exhibit_timeline(det: dict, changes: list[dict], urls: list[str],
+                      gone_since: str | None) -> list[tuple[str, str]]:
+    """Chronological (day, kind) entries for one exhibit's URL group: first
+    detection, then posted / page-updated / guidance-revised / removed events.
+    Alias URLs report the same underlying change, so same-day same-kind events
+    collapse to one entry. A removal the event log never captured (or that is
+    only visible from scan state) still appears, dated from the last check."""
+    entries: set[tuple[str, str]] = set()
+    for ch in changes:
+        if ch.get("url") not in urls:
+            continue
+        day = (ch.get("detected_at") or "")[:10]
+        kind = ch["event_type"]
+        if kind == "modified":
+            same = ch.get("guidance_same")
+            kind = "updated" if same else ("revised" if same is False else "changed")
+        entries.add((day, kind))
+    first = (det.get("first_detected_at") or det.get("classified_at") or "")[:10]
+    if first and (first, "put_up") not in entries:
+        entries.add((first, "detected"))
+    if gone_since and not any(k == "take_down" for _, k in entries):
+        entries.add((gone_since, "gone"))
+    return sorted(entries, key=lambda e: (e[0], _TL_RANK.get(e[1], 9)))
 
 
 def _status(det, review, last, scan_count, candidate=None):
@@ -239,31 +512,57 @@ def build_site(conn: sqlite3.Connection, out_dir: Path, *, approved_only: bool =
     out_dir = Path(out_dir)
     (out_dir / "evidence").mkdir(parents=True, exist_ok=True)
     views = _gather(conn)
+    # The full universe: counts, the tracked-nationwide total, and the
+    # coverage-gap disclosure are computed over this even in public builds —
+    # filtering first silently shrank the published universe number and
+    # dropped the gap paragraph entirely (an approved-only build counted zero
+    # no_url/blocked/failed candidates, contradicting the methodology page).
+    all_views = views
     if approved_only:
-        views = [v for v in views if v.status in ("positive_published", "negative")]
+        # Public build keeps findings, dated negatives, and the no-allegation
+        # coverage-gap statuses (their pages ARE the gap disclosure). Pending
+        # and rejected detections are unpublished allegations — never render
+        # them or their candidates' pages publicly.
+        public = ("positive_published", "negative", "no_url",
+                  "blocked_by_robots", "fetch_failed", "not_scanned")
+        views = [v for v in views if v.status in public]
+        # A pending exhibit is an unpublished allegation even when the
+        # candidate has a separate approved finding — never render it.
+        for v in views:
+            v.exhibits = [e for e in v.exhibits if e["approved"]]
 
     # Copy evidence screenshots + archived PDFs into the site, rewrite to
     # relative paths.
+    kept_evidence: set[str] = set()
     for v in views:
-        if not v.archive:
-            continue
-        for key, rel_key in (("screenshot_path", "screenshot_rel"),
-                             ("pdf_path", "pdf_rel")):
-            if v.archive.get(key):
-                src = Path(v.archive[key])
-                if src.exists():
-                    dst = out_dir / "evidence" / src.name
-                    shutil.copy2(src, dst)
-                    v.archive[rel_key] = f"evidence/{src.name}"
+        for archive in {id(a): a for a in ([v.archive] + [e["archive"] for e in v.exhibits])
+                        if a}.values():
+            for key, rel_key in (("screenshot_path", "screenshot_rel"),
+                                 ("pdf_path", "pdf_rel")):
+                if archive.get(key):
+                    src = Path(archive[key])
+                    if src.exists():
+                        dst = out_dir / "evidence" / src.name
+                        shutil.copy2(src, dst)
+                        archive[rel_key] = f"evidence/{src.name}"
+                        kept_evidence.add(src.name)
+    # Sweep evidence this build no longer references. Without this the
+    # directory is append-only across builds, and the screenshot of a since-
+    # rejected (or pending, in a public build) detection stays deployed and
+    # publicly fetchable long after the page that showed it is gone.
+    for p in (out_dir / "evidence").iterdir():
+        if p.is_file() and p.name not in kept_evidence:
+            p.unlink()
 
     # Per-candidate pages (natural order is irrelevant; each is standalone).
     for v in views:
-        (out_dir / f"{v.row['candidate_id']}.html").write_text(_render_candidate(v))
+        (out_dir / f"{v.row['candidate_id']}.html").write_text(
+            _render_candidate(v, public=approved_only))
 
-    # Index, paginated. Counts/coverage are global (over every candidate); only
-    # the table rows are sliced per page.
+    # Index, paginated. Counts/coverage are global (over the FULL universe,
+    # not the rendered subset); only the table rows are sliced per page.
     counts: dict[str, int] = {}
-    for v in views:
+    for v in all_views:
         counts[v.status] = counts.get(v.status, 0) + 1
     index_views = sorted(views, key=_index_sort_key)
     size = max(1, int(page_size))
@@ -271,7 +570,7 @@ def build_site(conn: sqlite3.Connection, out_dir: Path, *, approved_only: bool =
     for pno, page in enumerate(pages, start=1):
         fname = "index.html" if pno == 1 else f"index-{pno}.html"
         (out_dir / fname).write_text(_render_index(
-            page, approved_only, counts=counts, all_views=index_views,
+            page, approved_only, counts=counts, all_views=all_views,
             page_no=pno, n_pages=len(pages)))
     # Full row set as one fragment; the index JS fetches it on first filter
     # interaction so name/status/state filters search every page, not just the
@@ -316,11 +615,18 @@ def _write_feeds(out_dir: Path, views: list[CandidateView]) -> None:
     recent — the index stays the full ledger. Neither file is in the sitemap,
     and neither ends in .html, so the stale-page cleanup never touches them.
     """
+    import hashlib
     from datetime import datetime, timezone
     from email.utils import format_datetime
 
     def _approved_at(v: CandidateView) -> str:
-        return ((v.review or {}).get("reviewed_at")
+        # Latest approval across the candidate's exhibits, so an update
+        # re-dates (and re-sorts) the item; fall back to the representative
+        # detection for degenerate rows.
+        dates = [(e["review"] or {}).get("reviewed_at") or ""
+                 for e in v.exhibits if e.get("approved")]
+        return (max(dates, default="")
+                or (v.review or {}).get("reviewed_at")
                 or (v.detection or {}).get("classified_at") or "")
 
     def _parse_iso(ts: str) -> datetime | None:
@@ -340,19 +646,44 @@ def _write_feeds(out_dir: Path, views: list[CandidateView]) -> None:
     for v in findings:
         cid = v.row["candidate_id"]
         url = _canonical(cid)
+        # One item per candidate, keyed by the SET of approved exhibits:
+        # approving a new distinct box changes the fingerprint and the item
+        # re-announces (feed readers/Bluesky see an update), while a
+        # re-detection of a known box (same URL/body, fresh detection_id)
+        # folds into its exhibit and stays silent — the double-announce the
+        # bare-candidate guid was introduced to prevent.
+        approved_ex = [e for e in v.exhibits if e.get("approved")]
+        sig = (hashlib.sha1("|".join(sorted(
+                   e["detection"].get("page_url") or "" for e in approved_ex))
+               .encode()).hexdigest()[:8] if approved_ex else "0")
+        guid = f"{cid}#{sig}"
+        n = len(approved_ex)
         title = (f"{_display_name(v.row['name'])} ({_seat_compact(v.row)}) "
-                 "— red-box guidance found")
-        parts = [v.label]
-        page = (v.detection or {}).get("page_url")
-        if page:
-            parts.append(f"Guidance page: {page}")
-        quote = next((e.get("quote") for e in v.evidence if e.get("quote")), None)
+                 "— red-box guidance found" + (f" ({n} exhibits)" if n > 1 else ""))
+        if n > 1:
+            # An update should showcase what's new: the most recently
+            # approved exhibit, not the top-ranked (usually oldest) one.
+            newest = max(approved_ex, key=lambda e: (
+                (e["review"] or {}).get("reviewed_at")
+                or e["detection"].get("first_detected_at") or ""))
+            page = newest["detection"].get("page_url")
+            quote = next((q.get("quote") for q in newest["evidence"]
+                          if q.get("quote")), None)
+            parts = [v.label]
+            if page:
+                parts.append(f"Newest guidance page: {page}")
+        else:
+            parts = [v.label]
+            page = (v.detection or {}).get("page_url")
+            if page:
+                parts.append(f"Guidance page: {page}")
+            quote = next((e.get("quote") for e in v.evidence
+                          if e.get("quote")), None)
         if quote:
             parts.append(f"Quoted span: “{quote}”")
         desc = " · ".join(parts)
         dt = _parse_iso(_approved_at(v))
         pub = f"<pubDate>{format_datetime(dt)}</pubDate>" if dt else ""
-        guid = f"{cid}/{(v.detection or {}).get('detection_id', 0)}"
         items_xml.append(
             f"<item><title>{_h(title)}</title><link>{_h(url)}</link>"
             f'<guid isPermaLink="false">{_h(guid)}</guid>{pub}'
@@ -573,7 +904,7 @@ _STATE_GRID = {
     "AK": (1, 1), "ME": (1, 11),
     "VT": (2, 10), "NH": (2, 11),
     "WA": (3, 1), "ID": (3, 2), "MT": (3, 3), "ND": (3, 4), "MN": (3, 5),
-    "IL": (3, 6), "WI": (3, 7), "MI": (3, 9), "NY": (3, 10), "MA": (3, 11),
+    "IL": (3, 6), "WI": (3, 7), "MI": (3, 8), "NY": (3, 10), "MA": (3, 11),
     "OR": (4, 1), "NV": (4, 2), "WY": (4, 3), "SD": (4, 4), "IA": (4, 5),
     "IN": (4, 6), "OH": (4, 7), "PA": (4, 8), "NJ": (4, 9), "CT": (4, 10), "RI": (4, 11),
     "CA": (5, 1), "UT": (5, 2), "CO": (5, 3), "NE": (5, 4), "MO": (5, 5),
@@ -582,24 +913,6 @@ _STATE_GRID = {
     "NC": (6, 7), "SC": (6, 8), "DC": (6, 9),
     "OK": (7, 4), "LA": (7, 5), "MS": (7, 6), "AL": (7, 7), "GA": (7, 8),
     "HI": (8, 1), "TX": (8, 4), "FL": (8, 9),
-}
-
-STATE_NAMES = {
-    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
-    "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
-    "DC": "District of Columbia", "FL": "Florida", "GA": "Georgia", "HI": "Hawaii",
-    "ID": "Idaho", "IL": "Illinois", "IN": "Indiana", "IA": "Iowa",
-    "KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine",
-    "MD": "Maryland", "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota",
-    "MS": "Mississippi", "MO": "Missouri", "MT": "Montana", "NE": "Nebraska",
-    "NV": "Nevada", "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico",
-    "NY": "New York", "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio",
-    "OK": "Oklahoma", "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island",
-    "SC": "South Carolina", "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas",
-    "UT": "Utah", "VT": "Vermont", "VA": "Virginia", "WA": "Washington",
-    "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming",
-    "AS": "American Samoa", "GU": "Guam", "MP": "Northern Mariana Islands",
-    "PR": "Puerto Rico", "VI": "U.S. Virgin Islands",
 }
 
 _OFFICE_WORD = {"H": "House", "S": "Senate", "P": "President"}
@@ -774,29 +1087,10 @@ def _display_name(name: str) -> str:
     return _re.sub(r"[A-Za-z]+", cap_run, name or "")
 
 
-# Honorifics, ranks, and degrees the FEC sometimes appends to the given name
-# ("SANFORD, MARSHALL HON", "ROCHFORD, ROBERT CAPT") — dropped in prose.
-# Generational suffixes move after the surname.
-_NAME_HONORIFICS = {"HON", "MR", "MRS", "MS", "MISS", "DR", "REV",
-                    "CAPT", "CAPTAIN", "COL", "COLONEL", "MAJ", "MAJOR",
-                    "SGT", "LT", "GEN", "CDR", "ADM",
-                    "MD", "PHD", "ESQ", "JD", "DDS", "DO", "RN"}
-_NAME_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V", "VI", "VII"}
-
-
-def _name_prose(name: str) -> str:
-    """FEC 'LAST, FIRST MIDDLE [HON]' -> 'First Middle Last' for titles and
-    meta descriptions, where ledger-style 'Last, First' reads as jargon."""
-    disp = _display_name(name)
-    if "," not in disp:
-        return disp
-    last, _, rest = disp.partition(",")
-    # Some FEC names carry a second comma before the suffix ("CARL, JERRY LEE, JR").
-    toks = [t for t in rest.replace(",", " ").split()
-            if t.upper().rstrip(".") not in _NAME_HONORIFICS]
-    suffix = [t for t in toks if t.upper().rstrip(".") in _NAME_SUFFIXES]
-    given = [t for t in toks if t not in suffix]
-    return " ".join(given + [last.strip()] + suffix).strip()
+# prose name == display name: _display_name already reorders 'LAST, FIRST',
+# strips titles, and re-seats suffixes, always returning a comma-free string —
+# the second reordering pass this alias used to carry was unreachable.
+_name_prose = _display_name
 
 
 def _ordinal(n: int) -> str:
@@ -979,10 +1273,10 @@ def _index_row(v: CandidateView) -> str:
         ie = f"${float(v.corroboration['supporting_total']):,.0f}"
     return f"""<tr data-status="{v.status}" data-state="{_h(c.get('state'))}"
         data-office="{_h(c.get('office'))}" data-party="{_h(c.get('party'))}">
-      <td class="cand"><a href="{_h(c['candidate_id'])}.html">{_h(c.get('name'))}</a></td>
+      <td class="cand"><a href="{_h(c['candidate_id'])}.html">{_h(_display_name(c.get('name')))}</a></td>
       <td class="seat">{_h(c.get('office'))}-{_h(c.get('state'))}{('-' + _h(c.get('district'))) if c.get('district') else ''}</td>
       <td class="party">{_h(c.get('party'))}</td>
-      <td><span class="status {pill_cls}">{pill_txt}</span></td>
+      <td><a class="status {pill_cls}" href="{_h(c['candidate_id'])}.html">{pill_txt}</a></td>
       <td class="num conf">{conf}</td>
       <td class="num ie ie-col">{ie}</td>
       <td class="num pages">{v.scan_count}</td>
@@ -994,7 +1288,7 @@ def _state_opts(views):
     return "".join(f'<option value="{_h(s)}">{_h(s)}</option>' for s in states)
 
 
-def _render_candidate(v: CandidateView) -> str:
+def _render_candidate(v: CandidateView, *, public: bool = False) -> str:
     c = v.row
     pill_txt, pill_cls = STATUS_PILL.get(v.status, ("—", "pill-muted"))
     seat = f"{_h(c.get('office'))}-{_h(c.get('state'))}" + (f"-{_h(c.get('district'))}" if c.get("district") else "")
@@ -1030,47 +1324,23 @@ def _render_candidate(v: CandidateView) -> str:
     </dl>"""
 
     detail = ""
-    if v.detection and v.status != "negative":
-        d = v.detection
-        ev = "".join(
-            f'<li><blockquote>{_h(e.get("quote"))}</blockquote><span class="why">{_h(e.get("why"))}</span></li>'
-            for e in v.evidence)
-        exhibit = ""
-        if v.archive:
-            is_pdf = bool(v.archive.get("pdf_rel"))
-            cap_bits = []
-            if is_pdf:
-                cap_bits.append(f'<a href="{_h(v.archive["pdf_rel"])}" rel="noopener">Archived PDF (original)</a>')
-            if v.archive.get("wayback_url"):
-                cap_bits.append(f'<a href="{_h(v.archive["wayback_url"])}" rel="noopener">Wayback snapshot</a>')
-            if v.archive.get("html_path"):
-                cap_bits.append("Raw HTML preserved")
-            caption = " &#183; ".join(cap_bits)
-            if v.archive.get("screenshot_rel"):
-                rel = _h(v.archive["screenshot_rel"])
-                if is_pdf:
-                    alt = f"Rendered pages of the archived PDF from {_h(d.get('page_url'))}"
-                    what = f"Pages rendered from the PDF at {_h(d.get('page_url'))}"
-                else:
-                    alt = f"Archived screenshot of {_h(d.get('page_url'))}"
-                    what = f"Full-page screenshot of {_h(d.get('page_url'))}"
-                exhibit = f"""<figure class="exhibit">
-              <a class="exhibit-frame" href="{rel}"><img src="{rel}" alt="{alt}"></a>
-              <figcaption><span class="exhibit-label">Archived at detection</span>{what}{(' &#183; ' + caption) if caption else ''}</figcaption>
-            </figure>"""
-            elif caption:
-                exhibit = f'<p class="evlinks"><span class="exhibit-label">Archived at detection</span>{caption}</p>'
-        detail = f"""
-        <section class="detection">
-          <h2 class="section-head"><span class="redbox"></span>{_h(v.label)}</h2>
-          <p class="srcline">Detected on <a href="{_h(d.get('page_url'))}" rel="nofollow noopener">{_h(d.get('page_url'))}</a>
-             &ensp;&#183;&ensp;classifier confidence {float(d.get('confidence') or 0):.2f}&ensp;&#183;&ensp;model {_h(d.get('model'))}{' (escalated)' if d.get('escalated') else ''}</p>
-          <p class="rationale">{_h(d.get('rationale'))}</p>
-          <h3 class="evidence-head"><span class="redbox"></span>Quoted evidence — verbatim spans from the page</h3>
-          <ul class="evidence">{ev}</ul>
-          {exhibit}
-          {_render_page_text(v)}
-        </section>"""
+    if v.exhibits:
+        # One section per distinct page still carrying guidance (spec-order:
+        # the candidate's representative detection leads; further red boxes on
+        # other pages follow as their own exhibits).
+        detail = "".join(
+            _render_exhibit(e, first=(i == 0),
+                            label_override=(v.label if i == 0 else None))
+            for i, e in enumerate(v.exhibits))
+    elif v.detection and v.status != "negative":
+        # No renderable exhibit (e.g. every flag was rejected): show the
+        # representative detection under the status label, as before.
+        detail = _render_exhibit(
+            {"detection": v.detection, "evidence": v.evidence,
+             "archive": v.archive, "review": v.review, "approved": False,
+             "pending": False, "alias_urls": [], "gone_since": None,
+             "timeline": []},
+            first=True, label_override=v.label)
     elif v.status == "negative":
         detail = f"""<section class="detection">
           <h2 class="section-head section-head-quiet">{_h(v.label)}</h2>
@@ -1109,7 +1379,7 @@ def _render_candidate(v: CandidateView) -> str:
     <p class="crumb"><a href="index.html">&#8592; Back to the index</a></p>
     <p class="kicker">{_h(kicker_status)} <span class="redbox"></span> {_h(office)} &#183; {_h(state_name)} <span class="redbox"></span> {_h(party)}</p>
     <h1 class="headline headline-cand">{_h(_display_name(c.get('name')))} <span class="finding-tag {pill_cls}">{pill_txt}</span></h1>
-    {banner}{meta}{_render_changes(v)}{detail}{_render_corroboration(v)}
+    {banner}{meta}{'' if public else _render_changes(v)}{detail}{_render_corroboration(v)}
     </article>"""
 
     prose = _name_prose(c.get("name"))
@@ -1117,9 +1387,15 @@ def _render_candidate(v: CandidateView) -> str:
     race = _race_phrase(c)
     sup = float(v.corroboration.get("supporting_total") or 0) if v.corroboration else 0
     if v.status == "positive_published":
+        # Past tense once every guidance-carrying page has come down: the
+        # finding stays on the ledger, but "carries" would overstate the
+        # present. The page body says the same via per-exhibit notes.
+        gone_all = bool(v.exhibits) and all(e["gone_since"] for e in v.exhibits)
         title = f"Red-Boxing Detected: {prose} ({seat_short})"
-        desc = (f"{prose}'s campaign website carries a red box — messaging cues "
+        verb = "carried" if gone_all else "carries"
+        desc = (f"{prose}'s campaign website {verb} a red box — messaging cues "
                 f"that tell super PACs what ads to run."
+                + (" The guidance has since been removed." if gone_all else "")
                 + (f" {_money_compact(sup)} in aligned outside spending is on "
                    f"file." if sup >= 10_000 else "")
                 + " See the archived evidence.")
@@ -1148,14 +1424,96 @@ def _render_candidate(v: CandidateView) -> str:
                    og_type="article")
 
 
-def _render_page_text(v: CandidateView) -> str:
+def _exhibit_label(e: dict) -> str:
+    """Per-exhibit §3.7a label, mirroring _status's label choices."""
+    if e["detection"].get("classification") == "ambiguous":
+        return AMBIGUOUS_CONFIRMED_LABEL if e["approved"] else AMBIGUOUS_LABEL
+    return POSITIVE_LABEL
+
+
+def _render_exhibit(e: dict, *, first: bool, label_override: str | None = None) -> str:
+    """One detection section: label, source line, rationale, quoted evidence,
+    archived exhibit, page text. Repeated per distinct guidance-carrying page —
+    a candidate with red boxes on two pages gets two of these."""
+    d = e["detection"]
+    archive = e["archive"]
+    ev = "".join(
+        f'<li><blockquote>{_h(q.get("quote"))}</blockquote><span class="why">{_h(q.get("why"))}</span></li>'
+        for q in e["evidence"])
+    exhibit = ""
+    if archive:
+        is_pdf = bool(archive.get("pdf_rel"))
+        cap_bits = []
+        if is_pdf:
+            cap_bits.append(f'<a href="{_h(archive["pdf_rel"])}" rel="noopener">Archived PDF (original)</a>')
+        if archive.get("wayback_url"):
+            cap_bits.append(f'<a href="{_h(archive["wayback_url"])}" rel="noopener">Wayback snapshot</a>')
+        if archive.get("html_path"):
+            cap_bits.append("Raw HTML preserved")
+        caption = " &#183; ".join(cap_bits)
+        if archive.get("screenshot_rel"):
+            rel = _h(archive["screenshot_rel"])
+            if is_pdf:
+                alt = f"Rendered pages of the archived PDF from {_h(d.get('page_url'))}"
+                what = f"Pages rendered from the PDF at {_h(d.get('page_url'))}"
+            else:
+                alt = f"Archived screenshot of {_h(d.get('page_url'))}"
+                what = f"Full-page screenshot of {_h(d.get('page_url'))}"
+            exhibit = f"""<figure class="exhibit">
+          <a class="exhibit-frame" href="{rel}"><img src="{rel}" alt="{alt}"></a>
+          <figcaption><span class="exhibit-label">Archived at detection</span>{what}{(' &#183; ' + caption) if caption else ''}</figcaption>
+        </figure>"""
+        elif caption:
+            exhibit = f'<p class="evlinks"><span class="exhibit-label">Archived at detection</span>{caption}</p>'
+
+    also = "" if first else '<p class="exhibit-more">Additional page with guidance</p>'
+    timeline = ""
+    if e.get("timeline"):
+        items = "".join(
+            f'<li class="tl-{kind}"><span class="tl-l">{_TL_LABEL.get(kind, kind)}</span>'
+            f'<span class="tl-d">{_h(_pretty_date(day))}</span></li>'
+            for day, kind in e["timeline"])
+        timeline = f'<ol class="tl" aria-label="Detection timeline">{items}</ol>'
+    aliases = ""
+    if e.get("alias_urls"):
+        shown = e["alias_urls"][:6]
+        more = len(e["alias_urls"]) - len(shown)
+        links = ", ".join(f'<a href="{_h(u)}" rel="nofollow noopener">{_h(u)}</a>'
+                          for u in shown) + (f" and {more} more" if more > 0 else "")
+        aliases = (f'<p class="srcline alias-line">The same page body is also served at '
+                   f'{links}.</p>')
+    pending_tag = ("&ensp;&#183;&ensp;<strong>pending human review — not published</strong>"
+                   if e.get("pending") else "")
+    gone = ""
+    if e.get("gone_since"):
+        gone = (f'<div class="gone-note"><strong>No longer present.</strong> When this '
+                f'page was last checked, on {_h(_pretty_date(e["gone_since"]))}, this '
+                f'guidance was not found. The finding remains on the ledger and the '
+                f'archived evidence below is preserved — guidance taken down after '
+                f'drawing notice is itself part of the record.</div>')
+    label = label_override if label_override is not None else _exhibit_label(e)
+    return f"""
+    <section class="detection">
+      {also}<h2 class="section-head"><span class="redbox"></span>{_h(label)}</h2>
+      <p class="srcline">Detected on <a href="{_h(d.get('page_url'))}" rel="nofollow noopener">{_h(d.get('page_url'))}</a>
+         &ensp;&#183;&ensp;classifier confidence {float(d.get('confidence') or 0):.2f}&ensp;&#183;&ensp;model {_h(d.get('model'))}{' (escalated)' if d.get('escalated') else ''}{pending_tag}</p>
+      {timeline}{aliases}{gone}
+      <p class="rationale">{_h(d.get('rationale'))}</p>
+      <h3 class="evidence-head"><span class="redbox"></span>Quoted evidence — verbatim spans from the page</h3>
+      <ul class="evidence">{ev}</ul>
+      {exhibit}
+      {_render_page_text(archive)}
+    </section>"""
+
+
+def _render_page_text(archive: dict | None) -> str:
     """Collapsed plain text of the archived page, from the archiver's extracted-
     text file. The screenshot can be obscured by a cookie banner or pop-up, and
     an image is opaque to screen readers — the text is the accessible record."""
-    if not (v.archive and v.archive.get("text_path")):
+    if not (archive and archive.get("text_path")):
         return ""
     try:
-        txt = Path(v.archive["text_path"]).read_text(errors="replace").strip()
+        txt = Path(archive["text_path"]).read_text(errors="replace").strip()
     except OSError:
         return ""
     if not txt:
@@ -1166,19 +1524,47 @@ def _render_page_text(v: CandidateView) -> str:
     </details>"""
 
 
+# Short labels for the per-exhibit timeline strip.
+_TL_LABEL = {
+    "detected": "First detected",
+    "put_up": "Guidance posted",
+    "updated": "Page updated",
+    "revised": "Guidance revised",
+    "changed": "Guidance changed",
+    "take_down": "Guidance removed",
+    "gone": "No longer present",
+}
+
 _CHANGE_LABEL = {
     "take_down": ("Guidance removed", "Messaging guidance previously detected on this page was no longer present on re-scan."),
     "put_up": ("Guidance posted", "Messaging guidance appeared on this page that was not present on the prior scan."),
     "modified": ("Guidance changed", "Previously-detected guidance on this page changed between scans."),
+    # 'modified' refined by whether the quoted spans themselves changed:
+    "updated": ("Page updated", "The page's text changed between scans; the quoted guidance spans are identical."),
+    "revised": ("Guidance revised", "The quoted guidance spans on this page changed between scans."),
 }
 
 
+def _change_key(ch: dict) -> str:
+    """Event key for labeling: 'modified' refines to updated/revised when the
+    quote comparison could tell (guidance_same True/False)."""
+    if ch["event_type"] != "modified":
+        return ch["event_type"]
+    same = ch.get("guidance_same")
+    return "updated" if same else ("revised" if same is False else "modified")
+
+
 def _render_changes(v: CandidateView) -> str:
+    """Raw per-URL event log — review builds only. Public pages carry the
+    review-gated per-exhibit timelines instead: this list is built from raw
+    classifier transitions, so it can name URLs whose detections are pending
+    or were rejected, which must never surface on a public page."""
     if not v.changes:
         return ""
     items = []
     for ch in v.changes:
-        title, desc = _CHANGE_LABEL.get(ch["event_type"], (ch["event_type"], ""))
+        key = _change_key(ch)
+        title, desc = _CHANGE_LABEL.get(key, (key, ""))
         cls = "chg-down" if ch["event_type"] == "take_down" else (
             "chg-up" if ch["event_type"] == "put_up" else "chg-mod")
         items.append(
@@ -1187,10 +1573,10 @@ def _render_changes(v: CandidateView) -> str:
             f'<span class="chg-url">{_h(ch.get("url"))}</span></li>')
     return f"""
     <section class="changes">
-      <h2 class="section-head"><span class="redbox"></span>Change history</h2>
-      <p class="srcline">Put-up / take-down events detected across re-scans. A box
-         removed after it draws attention is itself a recorded signal — the archived
-         evidence is preserved regardless.</p>
+      <h2 class="section-head"><span class="redbox"></span>Change history <span class="review-only-tag">review console only</span></h2>
+      <p class="srcline">Raw put-up / take-down event log across re-scans, all URLs —
+         including detections still pending or rejected on review. Public pages show
+         only the reviewed, per-exhibit timeline.</p>
       <ul class="changelog">{''.join(items)}</ul>
     </section>"""
 
@@ -1340,7 +1726,7 @@ def _render_about() -> str:
     red-boxing is unlawful (it is not), but because it is public, deliberate, and easy to
     miss unless someone points at it.</p>
     <h2 class="section-head"><span class="redbox"></span>Who&#8217;s behind it</h2>
-    <p class="rationale">Charlie is 22 and a recent college graduate. He believes technology can make
+    <p class="rationale">Charlie is a recent college graduate. He believes technology can make
     democracy more transparent. Red Box Watch is unaffiliated with any campaign, party,
     or PAC.</p>
     <h2 class="section-head"><span class="redbox"></span>Open source</h2>
@@ -1440,6 +1826,10 @@ CSS = """
   --display:"Fraunces","Iowan Old Style","Times New Roman",serif;
   --text:"Source Serif 4",Georgia,serif;
   --grot:"Libre Franklin","Helvetica Neue",Arial,sans-serif;
+  /* Aliases used by the exhibit timeline + review console. Undefined, these
+     were invalid-at-computed-value-time: borders fell back to currentColor
+     (ink instead of hairline) and the timeline connector gradient dropped. */
+  --line:var(--hair);--accent:var(--red);--pos:var(--red);
 }
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
@@ -1492,6 +1882,20 @@ code{font-size:.85em;background:var(--paper-bright);border:1px solid var(--hair)
 .review-banner{margin:1.6rem 0 0;padding:1rem 1.3rem;border-top:1px solid var(--amber);border-bottom:1px solid var(--amber);font-style:italic;font-size:.97rem;color:var(--ink-soft)}
 .ended-banner{margin:1.6rem 0 0;padding:1rem 1.3rem;border-top:1px solid var(--line);border-bottom:1px solid var(--line);font-style:italic;font-size:.97rem;color:var(--ink-soft)}
 .review-banner strong{font-style:normal;color:var(--amber)}
+.gone-note{margin:1.2rem 0 0;padding:.6rem 1.1rem;border-left:3px solid var(--ink-faint);font-size:.94rem;font-style:italic;color:var(--ink-soft)}
+.gone-note strong{font-style:normal;color:var(--ink)}
+.tl{margin:1.15rem 0 0;padding:.65rem 0 .7rem;list-style:none;display:flex;flex-wrap:wrap;align-items:center;gap:.5rem 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.tl li{display:flex;align-items:center;gap:.6em;font-family:var(--grot);font-size:.72rem;letter-spacing:.07em;text-transform:uppercase;white-space:nowrap}
+.tl li::before{content:"";width:9px;height:9px;flex:none;background:var(--red-deep)}
+.tl li+li{margin-left:1.1rem;padding-left:1.35rem;background:linear-gradient(var(--line),var(--line)) no-repeat left center/.7rem 1px}
+.tl .tl-l{font-weight:700;color:var(--ink)}
+.tl .tl-d{color:var(--ink-faint);font-feature-settings:"tnum"}
+.tl li.tl-updated::before{background:transparent;border:1px solid var(--ink-faint)}
+.tl li.tl-revised::before,.tl li.tl-changed::before{background:var(--amber)}
+.tl li.tl-take_down::before,.tl li.tl-gone::before{background:transparent;border:2px solid var(--red-deep)}
+.tl li.tl-take_down .tl-l,.tl li.tl-gone .tl-l{color:var(--red-deep)}
+.review-only-tag{font-family:var(--grot);font-size:.62rem;font-weight:400;letter-spacing:.12em;color:var(--ink-faint);border:1px solid var(--line);padding:.15em .6em;margin-left:.8em;vertical-align:middle}
+.exhibit-more{margin:3rem 0 -1.4rem;font-size:.78rem;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-faint)}
 .coverage{margin:1.4rem 0 0;font-family:var(--grot);font-size:.8rem;line-height:1.75;color:var(--ink-soft)}
 .coverage strong{color:var(--ink)}
 
@@ -1583,6 +1987,8 @@ code{font-size:.85em;background:var(--paper-bright);border:1px solid var(--hair)
 
 /* status marks — small squares echoing the brand */
 .status{font-size:.66rem;font-weight:700;letter-spacing:.11em;text-transform:uppercase;white-space:nowrap}
+a.status{text-decoration:none}
+a.status:hover{text-decoration:underline;text-decoration-color:var(--red)}
 .status::before{content:"";display:inline-block;width:.75em;height:.75em;margin-right:.6em;vertical-align:-.02em}
 .status.pill-pos{color:var(--red-deep)}
 .status.pill-pos::before{background:var(--red)}

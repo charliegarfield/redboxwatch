@@ -233,11 +233,12 @@ def test_flag_primary_losers_marks_only_called_races(tmp_path):
     conn = _loser_db(tmp_path)
     feed = _FakeFeed([RaceCall("TX", "H", "1", "DEM", "Yolanda Prince", source="fake")])
     resolver = NomineeResolver(2026, overrides_path=None, feed=feed)
-    lost, cleared, unresolved = flag_primary_losers(
+    lost, cleared, unresolved, feed_failed = flag_primary_losers(
         conn, resolver, states={"TX"}, ts="2026-07-16T00:00:00+00:00")
     assert [c["candidate_id"] for c in lost] == ["T2"]     # Kolman lost
     assert cleared == 0
     assert unresolved == 1                                 # TX-02 REP uncalled
+    assert feed_failed == set()
     flags = {r[0]: r[1] for r in conn.execute("SELECT candidate_id, inactive FROM candidates")}
     assert flags["T2"] == 3
     # winner, unresolved race, uncontested, and out-of-scope NY all untouched
@@ -253,9 +254,54 @@ def test_flag_primary_losers_self_heals_when_race_unresolves(tmp_path):
     flag_primary_losers(conn, resolver, states={"TX"}, ts="t1")
     # Feed data regresses (race no longer called) -> the mark is cleared.
     empty = NomineeResolver(2026, overrides_path=None, feed=_FakeFeed([]))
-    lost, cleared, _ = flag_primary_losers(conn, empty, states={"TX"}, ts="t2")
+    lost, cleared, _, _ = flag_primary_losers(conn, empty, states={"TX"}, ts="t2")
     assert lost == [] and cleared == 1
     assert conn.execute("SELECT inactive FROM candidates WHERE candidate_id='T2'").fetchone()[0] is None
+    conn.close()
+
+
+def test_flag_primary_losers_keeps_marks_through_feed_outage(tmp_path):
+    # A feed OUTAGE (fetch raises) is "no information", not "race unresolved":
+    # marks made from earlier feed data must survive, unlike the genuine
+    # regression in the self-heal test above (feed answers with no calls).
+    from redbox.nominees import NomineeResolver, flag_primary_losers
+    conn = _loser_db(tmp_path)
+    feed = _FakeFeed([RaceCall("TX", "H", "1", "DEM", "Yolanda Prince", source="fake")])
+    resolver = NomineeResolver(2026, overrides_path=None, feed=feed)
+    flag_primary_losers(conn, resolver, states={"TX"}, ts="t1")
+
+    class _DownFeed:
+        name = "down"
+
+        def calls(self, state=None):
+            raise ConnectionError("origin unreachable")
+
+    down = NomineeResolver(2026, overrides_path=None, feed=_DownFeed())
+    lost, cleared, _, feed_failed = flag_primary_losers(
+        conn, down, states={"TX"}, ts="t2")
+    assert lost == [] and cleared == 0
+    assert feed_failed == {"TX"}
+    assert conn.execute("SELECT inactive FROM candidates "
+                        "WHERE candidate_id='T2'").fetchone()[0] == 3
+    conn.close()
+
+
+def test_flag_primary_losers_no_feed_run_keeps_feed_marks(tmp_path):
+    # --no-feed (resolver.feed is None) must not clear marks that only the
+    # feed can re-substantiate.
+    from redbox.nominees import NomineeResolver, flag_primary_losers
+    conn = _loser_db(tmp_path)
+    feed = _FakeFeed([RaceCall("TX", "H", "1", "DEM", "Yolanda Prince", source="fake")])
+    resolver = NomineeResolver(2026, overrides_path=None, feed=feed)
+    flag_primary_losers(conn, resolver, states={"TX"}, ts="t1")
+
+    feedless = NomineeResolver(2026, overrides_path=None, feed=None)
+    lost, cleared, _, feed_failed = flag_primary_losers(
+        conn, feedless, states={"TX"}, ts="t2")
+    assert lost == [] and cleared == 0
+    assert feed_failed == {"TX"}
+    assert conn.execute("SELECT inactive FROM candidates "
+                        "WHERE candidate_id='T2'").fetchone()[0] == 3
     conn.close()
 
 
@@ -275,8 +321,77 @@ def test_flag_primary_losers_never_touches_top_two_states(tmp_path):
     conn.commit()
     feed = _FakeFeed([RaceCall("CA", "H", "11", "DEM", "Wanda Winner", source="fake")])
     resolver = NomineeResolver(2026, overrides_path=None, feed=feed)
-    lost, cleared, unresolved = flag_primary_losers(
+    lost, cleared, unresolved, _ = flag_primary_losers(
         conn, resolver, states={"CA"}, ts="t")
     assert lost == [] and cleared == 0 and unresolved == 0
     assert conn.execute("SELECT COUNT(*) FROM candidates WHERE inactive=3").fetchone()[0] == 0
+    conn.close()
+
+
+def test_civicapi_pagination_terminates_on_broken_offset():
+    # A server that ignores `offset` (same full page forever) must raise
+    # rather than loop forever inside mark-primary-losers.
+    import pytest
+
+    page = [{"type": "House of Representatives", "province": "TX", "district": "TX-01",
+             "election_type": "Primary", "election_date": "2026-03-03T05:00:00.000Z",
+             "candidates": [{"name": "W", "party": "Democratic", "winner": True}]}] * 100
+    feed = CivicAPIFeed(cycle=2026, page_size=100,
+                        get=lambda p: _civic_page(page, count=0))
+    with pytest.raises(RuntimeError):
+        feed.calls(state="TX")
+
+
+def test_flag_primary_losers_never_touches_alaska(tmp_path):
+    # AK is top-FOUR with a ranked-choice general: several same-party
+    # candidates advance, so per-party loser marking is structurally wrong.
+    from redbox.db import init_db
+    from redbox.nominees import NomineeResolver, flag_primary_losers
+    conn = init_db(tmp_path / "db.sqlite")
+    conn.executemany(
+        """INSERT INTO candidates (candidate_id,name,office,state,district,party,
+           cycle,universe_reason,url_verified,receipts,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,2026,'contested_primary',0,100000,'t','t')""",
+        [("A1", "FIRST, FRAN", "H", "AK", "00", "REP"),
+         ("A2", "FOURTH, FAYE", "H", "AK", "00", "REP")])
+    conn.commit()
+    feed = _FakeFeed([RaceCall("AK", "H", "00", "REP", "Fran First", source="fake")])
+    resolver = NomineeResolver(2026, overrides_path=None, feed=feed)
+    lost, cleared, unresolved, _ = flag_primary_losers(
+        conn, resolver, states={"AK"}, ts="t")
+    assert lost == []
+    assert conn.execute("SELECT COUNT(*) FROM candidates WHERE inactive=3").fetchone()[0] == 0
+    conn.close()
+
+
+def test_flag_primary_losers_excludes_postponed_races(tmp_path):
+    # AL statewide primary has passed but CDs 1,2,6,7 were moved to a later
+    # date: a feed still carrying the voided earlier result must not mark
+    # losers in the postponed districts, while districts that DID vote are
+    # swept normally.
+    from redbox.db import init_db
+    from redbox.nominees import NomineeResolver, flag_primary_losers
+    conn = init_db(tmp_path / "db.sqlite")
+    conn.executemany(
+        """INSERT INTO candidates (candidate_id,name,office,state,district,party,
+           cycle,universe_reason,url_verified,receipts,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,2026,'contested_primary',0,100000,'t','t')""",
+        [("L1", "POSTPONED, PAT", "H", "AL", "01", "DEM"),
+         ("L2", "POSTPONED, PAM", "H", "AL", "01", "DEM"),
+         ("L3", "VOTED, VERA", "H", "AL", "03", "DEM"),
+         ("L4", "VOTED, VAL", "H", "AL", "03", "DEM")])
+    conn.commit()
+    feed = _FakeFeed([
+        RaceCall("AL", "H", "1", "DEM", "Pat Postponed", source="fake"),  # voided result
+        RaceCall("AL", "H", "3", "DEM", "Vera Voted", source="fake"),
+    ])
+    resolver = NomineeResolver(2026, overrides_path=None, feed=feed)
+    lost, cleared, unresolved, _ = flag_primary_losers(
+        conn, resolver, states={"AL"}, ts="t",
+        exclude={("H", "AL", "01"), ("H", "AL", "02"),
+                 ("H", "AL", "06"), ("H", "AL", "07")})
+    assert [c["candidate_id"] for c in lost] == ["L4"]
+    marks = {r[0] for r in conn.execute(
+        "SELECT candidate_id FROM candidates WHERE inactive=3")}
+    assert marks == {"L4"}               # nobody in the postponed CD-01
     conn.close()

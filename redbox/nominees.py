@@ -42,14 +42,8 @@ _SUFFIXES = {"JR", "SR", "II", "III", "IV", "V"}
 
 
 # --- normalization: make FEC and feed values comparable in a race bucket -------
-def norm_party(p: str | None) -> str:
-    """Canonical party for bucketing: 'Democratic'/'DEM'/'D' -> 'DEM', etc."""
-    s = (p or "").strip().upper()
-    if s.startswith("DEM") or s == "D":
-        return "DEM"
-    if s.startswith("REP") or s.startswith("GOP") or s == "R":
-        return "REP"
-    return s[:3]
+# One canonical normalizer shared with discovery grouping — see util.norm_party.
+from .util import norm_party  # noqa: F401  (re-exported: tests/callers import it here)
 
 
 def norm_district(office: str | None, district: Any) -> str:
@@ -128,6 +122,9 @@ class NomineeResult:
     nominees: dict[str, Nominee] = field(default_factory=dict)   # candidate_id -> Nominee
     # contested race buckets (>=2 funded candidates) with no resolved nominee:
     unresolved: list[tuple[str, str, str, str]] = field(default_factory=list)
+    # states whose feed fetch RAISED (outage), as opposed to answering with no
+    # calls — downstream must treat these as "no information", not "no nominee":
+    feed_failed_states: set[str] = field(default_factory=set)
 
     def candidate_ids(self) -> set[str]:
         return set(self.nominees)
@@ -245,6 +242,7 @@ class NomineeResolver:
                 try:
                     calls = self.feed.calls(state=st)
                 except Exception:
+                    result.feed_failed_states.add(st)
                     continue
                 for call in calls:
                     key = (call.office, call.state.upper(), call.district, call.party)
@@ -262,18 +260,22 @@ class NomineeResolver:
 
 # --- flagging primary losers on an existing universe ---------------------------
 
-# Top-two states: ALL candidates share one primary ballot and the top two
-# OVERALL advance, regardless of party — so the per-party nominee model is
-# structurally wrong there in both directions (a lone independent gets crowned
-# "nominee" despite being eliminated; the runner-up in a same-party November
-# matchup gets marked a "loser" despite being on the ballot). Never flag
-# losers in these states; their races need verified calls (manual overrides
-# or human review-console judgment) instead.
-TOP_TWO_STATES = {"CA", "WA"}
+# All-candidate-primary states: everyone shares one primary ballot and the
+# top finishers OVERALL advance, regardless of party — so the per-party
+# nominee model is structurally wrong there in both directions (a lone
+# independent gets crowned "nominee" despite being eliminated; the runner-up
+# in a same-party November matchup gets marked a "loser" despite being on the
+# ballot). CA/WA are top-two; AK has been top-FOUR with a ranked-choice
+# general since 2022 (the 2024 repeal measure failed), which is the same
+# problem with four advancers. Never flag losers in these states; their races
+# need verified calls (manual overrides or human review-console judgment).
+TOP_TWO_STATES = {"AK", "CA", "WA"}
 
 
 def flag_primary_losers(conn, resolver: "NomineeResolver", *,
-                        states: Iterable[str], ts: str) -> tuple[list[dict], int, int]:
+                        states: Iterable[str], ts: str,
+                        exclude: Iterable[tuple] = (),
+                        ) -> tuple[list[dict], int, int, set[str]]:
     """Mark primary losers (candidates.inactive=3) among a DB's active rows.
 
     For each race bucket in ``states`` where ``resolver`` affirmatively names a
@@ -281,19 +283,41 @@ def flag_primary_losers(conn, resolver: "NomineeResolver", *,
     buckets are untouched — a feed coverage gap must not invent losers. Rows
     already at inactive=3 are re-checked each run: cleared if their race no
     longer resolves (or now resolves to them), so the flag self-heals as feed
-    data improves. Top-two states are excluded outright (see TOP_TWO_STATES).
-    Returns (newly_lost_rows, n_cleared, n_unresolved)."""
+    data improves. A state whose feed fetch FAILED (or a run with no feed at
+    all) is "no information", not "no nominee": existing marks there are kept
+    unless the race affirmatively resolves. Top-two states are excluded
+    outright (see TOP_TWO_STATES).
+
+    ``exclude`` is a set of ``(office, STATE, district_or_None)`` races whose
+    primary has NOT yet happened even though the state's statewide date has
+    passed (per-district postponements — e.g. AL CDs moved by proclamation,
+    LA's House primary pushed to November). Their candidates are dropped from
+    consideration entirely: a feed that still carries a voided earlier result
+    must not mark losers in a race that hasn't voted.
+
+    Returns (newly_lost_rows, n_cleared, n_unresolved, feed_failed_states)."""
     states = sorted({s.upper() for s in states} - TOP_TWO_STATES)
     if not states:
-        return [], 0, 0
+        return [], 0, 0, set()
+    exclude = {(o, (s or "").upper(), d) for o, s, d in exclude}
+
+    def _excluded(c) -> bool:
+        for off, st, dd in exclude:
+            if (c.get("office") == off and (c.get("state") or "").upper() == st
+                    and (dd is None or c.get("district") == dd)):
+                return True
+        return False
+
     rows = [dict(r) for r in conn.execute(
         f"""SELECT * FROM candidates
             WHERE COALESCE(inactive,0) IN (0, 3)
               AND state IN ({','.join('?' * len(states))})""", states)]
+    rows = [c for c in rows if not _excluded(c)]
     result = resolver.resolve(rows, states=states)
     nominee_ids = result.candidate_ids()
     resolved_keys = {_bucket_key(n.office, n.state, n.district, n.party)
                      for n in result.nominees.values()}
+    no_feed_info = set(states) if resolver.feed is None else result.feed_failed_states
     lost: list[dict] = []
     cleared = 0
     for c in rows:
@@ -304,12 +328,14 @@ def flag_primary_losers(conn, resolver: "NomineeResolver", *,
                 conn.execute("UPDATE candidates SET inactive=3, updated_at=? "
                              "WHERE candidate_id=?", (ts, c["candidate_id"]))
                 lost.append(c)
-        elif c.get("inactive") == 3:
+        elif c.get("inactive") == 3 and (
+                key in resolved_keys                      # now resolves to them
+                or (c.get("state") or "").upper() not in no_feed_info):
             conn.execute("UPDATE candidates SET inactive=NULL, updated_at=? "
                          "WHERE candidate_id=?", (ts, c["candidate_id"]))
             cleared += 1
     conn.commit()
-    return lost, cleared, len(result.unresolved)
+    return lost, cleared, len(result.unresolved), no_feed_info
 
 
 # --- civicAPI results feed adapter --------------------------------------------
@@ -352,10 +378,14 @@ class CivicAPIFeed:
         r.raise_for_status()
         return r.json()
 
+    # No state has anywhere near this many races; a server that ignores
+    # `offset` (or reports a bogus `count`) must not loop forever.
+    MAX_PAGES = 50
+
     def _pages(self, state: str) -> Iterable[dict]:
         """Yield each race object for a state, paginating province=<code>."""
         offset = 0
-        while True:
+        for _ in range(self.MAX_PAGES):
             data = self._get({"province": state.upper(), "country": "US",
                               "limit": self.page_size, "offset": offset})
             races = data.get("races", []) or []
@@ -365,6 +395,9 @@ class CivicAPIFeed:
             offset += len(races)
             if offset >= int(data.get("count", 0) or 0) and len(races) < self.page_size:
                 return
+        raise RuntimeError(
+            f"civicAPI pagination did not terminate for {state} "
+            f"(> {self.MAX_PAGES} pages) — endpoint ignoring offset?")
 
     def calls(self, state: str | None = None) -> list[RaceCall]:
         if not state:

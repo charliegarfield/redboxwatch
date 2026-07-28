@@ -1,53 +1,400 @@
 [
-  {"state": "AL", "primary_date": "2026-05-19", "filing_deadline": "2026-01-23", "source": "fec+greenpapers", "confidence": "high", "note": "Statewide congressional primary 2026-05-19 for CDs 3,4,5; CDs 1,2,6,7 moved to 2026-08-11 by gubernatorial proclamation. Runoff 6/16."},
-  {"state": "AK", "primary_date": "2026-08-18", "filing_deadline": "2026-06-01", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "AZ", "primary_date": "2026-07-21", "filing_deadline": "2026-03-23", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "AR", "primary_date": "2026-03-03", "filing_deadline": "2025-11-11", "source": "fec+greenpapers", "confidence": "high", "note": "Runoff 3/31."},
-  {"state": "CA", "primary_date": "2026-06-02", "filing_deadline": "2026-03-06", "source": "fec+greenpapers", "confidence": "high", "note": "Top-two primary."},
-  {"state": "CO", "primary_date": "2026-06-30", "filing_deadline": "2026-03-18", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "CT", "primary_date": "2026-08-11", "filing_deadline": "2026-06-09", "source": "fec+greenpapers", "confidence": "high", "note": "Parties hold nominating conventions (May 11/15) before primary."},
-  {"state": "DE", "primary_date": "2026-09-15", "filing_deadline": "2026-07-14", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "DC", "primary_date": "2026-06-16", "filing_deadline": "2026-03-18", "source": "fec+fvap+greenpapers", "confidence": "high", "note": "Delegate race only."},
-  {"state": "FL", "primary_date": "2026-08-18", "filing_deadline": "2026-04-24", "source": "fec", "confidence": "high", "note": "Primary date high (4 sources); filing deadline medium - FEC shows 4/24, Green Papers shows a June qualifying week."},
-  {"state": "GA", "primary_date": "2026-05-19", "filing_deadline": "2026-03-06", "source": "fec+greenpapers", "confidence": "high", "note": "Runoff 6/16."},
-  {"state": "HI", "primary_date": "2026-08-08", "filing_deadline": "2026-06-02", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "ID", "primary_date": "2026-05-19", "filing_deadline": "2026-02-27", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "IL", "primary_date": "2026-03-17", "filing_deadline": "2025-11-03", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "IN", "primary_date": "2026-05-05", "filing_deadline": "2026-02-06", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "IA", "primary_date": "2026-06-02", "filing_deadline": "2026-03-13", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "KS", "primary_date": "2026-08-04", "filing_deadline": "2026-06-01", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "KY", "primary_date": "2026-05-19", "filing_deadline": "2026-01-09", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "LA", "primary_date": "2026-05-16", "filing_deadline": "2026-01-14", "source": "fec+greenpapers", "confidence": "medium", "note": "5/16 is the U.S. Senate primary; U.S. House primary postponed to 2026-11-03 (general) per Louisiana v. Callais. Senate filing deadline 1/14; House filing 8/7."},
-  {"state": "ME", "primary_date": "2026-06-09", "filing_deadline": "2026-03-16", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "MD", "primary_date": "2026-06-23", "filing_deadline": "2026-02-24", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "MA", "primary_date": "2026-09-01", "filing_deadline": "2026-06-02", "source": "fec", "confidence": "high", "note": "Primary date high (4 sources); filing deadline medium - FEC shows 6/2, Green Papers shows 5/5."},
-  {"state": "MI", "primary_date": "2026-08-04", "filing_deadline": "2026-04-21", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "MN", "primary_date": "2026-08-11", "filing_deadline": "2026-06-02", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "MS", "primary_date": "2026-03-10", "filing_deadline": "2025-12-26", "source": "fec+greenpapers", "confidence": "high", "note": "Runoff 4/7."},
-  {"state": "MO", "primary_date": "2026-08-04", "filing_deadline": "2026-03-31", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "MT", "primary_date": "2026-06-02", "filing_deadline": "2026-03-04", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "NE", "primary_date": "2026-05-12", "filing_deadline": "2026-03-02", "source": "fec+greenpapers", "confidence": "high", "note": "Incumbent filing deadline 2/17; all others 3/2."},
-  {"state": "NV", "primary_date": "2026-06-09", "filing_deadline": "2026-03-13", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "NH", "primary_date": "2026-09-08", "filing_deadline": "2026-06-12", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "NJ", "primary_date": "2026-06-02", "filing_deadline": "2026-03-23", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "NM", "primary_date": "2026-06-02", "filing_deadline": "2026-02-03", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "NY", "primary_date": "2026-06-23", "filing_deadline": "2026-04-06", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "NC", "primary_date": "2026-03-03", "filing_deadline": "2025-12-19", "source": "fec+greenpapers+ncsbe", "confidence": "high", "note": "Filing window 12/1-12/19/2025. Runoff (second primary) 5/12."},
-  {"state": "ND", "primary_date": "2026-06-09", "filing_deadline": "2026-04-06", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "OH", "primary_date": "2026-05-05", "filing_deadline": "2026-02-04", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "OK", "primary_date": "2026-06-16", "filing_deadline": "2026-04-03", "source": "fec+greenpapers", "confidence": "high", "note": "Runoff 8/25."},
-  {"state": "OR", "primary_date": "2026-05-19", "filing_deadline": "2026-03-10", "source": "fec+greenpapers", "confidence": "high", "note": "Incumbent filing deadline 3/3; all others 3/10."},
-  {"state": "PA", "primary_date": "2026-05-19", "filing_deadline": "2026-03-10", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "RI", "primary_date": "2026-09-09", "filing_deadline": "2026-06-24", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "SC", "primary_date": "2026-06-09", "filing_deadline": "2026-03-30", "source": "fec+greenpapers", "confidence": "high", "note": "Runoff 6/23."},
-  {"state": "SD", "primary_date": "2026-06-02", "filing_deadline": "2026-03-31", "source": "fec+greenpapers", "confidence": "high", "note": "Runoff 7/28."},
-  {"state": "TN", "primary_date": "2026-08-06", "filing_deadline": "2026-03-10", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "TX", "primary_date": "2026-03-03", "filing_deadline": "2025-12-08", "source": "fec+greenpapers", "confidence": "high", "note": "Runoff 5/26."},
-  {"state": "UT", "primary_date": "2026-06-23", "filing_deadline": "2026-03-13", "source": "fec+greenpapers", "confidence": "high", "note": "Parties also nominate via convention before primary."},
-  {"state": "VT", "primary_date": "2026-08-11", "filing_deadline": "2026-05-28", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "VA", "primary_date": "2026-08-04", "filing_deadline": "2026-05-26", "source": "fec+greenpapers", "confidence": "medium", "note": "House filing deadline 5/26; Senate filing deadline 4/2. Parties may nominate by convention instead of primary."},
-  {"state": "WA", "primary_date": "2026-08-04", "filing_deadline": "2026-05-08", "source": "fec+greenpapers", "confidence": "high", "note": "Top-two primary."},
-  {"state": "WV", "primary_date": "2026-05-12", "filing_deadline": "2026-01-31", "source": "fec+greenpapers", "confidence": "high"},
-  {"state": "WI", "primary_date": "2026-08-11", "filing_deadline": "2026-06-01", "source": "fec+greenpapers", "confidence": "high", "note": "8/11 is the partisan congressional primary; WI's 2/17 spring primary is for nonpartisan/judicial offices."},
-  {"state": "WY", "primary_date": "2026-08-18", "filing_deadline": "2026-05-29", "source": "fec+greenpapers", "confidence": "high"}
+  {
+    "state": "AL",
+    "primary_date": "2026-05-19",
+    "filing_deadline": "2026-01-23",
+    "source": "fec+greenpapers",
+    "confidence": "high",
+    "note": "Statewide congressional primary 2026-05-19 for CDs 3,4,5; CDs 1,2,6,7 moved to 2026-08-11 by gubernatorial proclamation. Runoff 6/16.",
+    "overrides": [
+      {
+        "office": "H",
+        "districts": [
+          "01",
+          "02",
+          "06",
+          "07"
+        ],
+        "primary_date": "2026-08-11",
+        "note": "CDs 1,2,6,7 moved to 2026-08-11 by gubernatorial proclamation."
+      }
+    ]
+  },
+  {
+    "state": "AK",
+    "primary_date": "2026-08-18",
+    "filing_deadline": "2026-06-01",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "AZ",
+    "primary_date": "2026-07-21",
+    "filing_deadline": "2026-03-23",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "AR",
+    "primary_date": "2026-03-03",
+    "filing_deadline": "2025-11-11",
+    "source": "fec+greenpapers",
+    "confidence": "high",
+    "note": "Runoff 3/31."
+  },
+  {
+    "state": "CA",
+    "primary_date": "2026-06-02",
+    "filing_deadline": "2026-03-06",
+    "source": "fec+greenpapers",
+    "confidence": "high",
+    "note": "Top-two primary."
+  },
+  {
+    "state": "CO",
+    "primary_date": "2026-06-30",
+    "filing_deadline": "2026-03-18",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "CT",
+    "primary_date": "2026-08-11",
+    "filing_deadline": "2026-06-09",
+    "source": "fec+greenpapers",
+    "confidence": "high",
+    "note": "Parties hold nominating conventions (May 11/15) before primary."
+  },
+  {
+    "state": "DE",
+    "primary_date": "2026-09-15",
+    "filing_deadline": "2026-07-14",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "DC",
+    "primary_date": "2026-06-16",
+    "filing_deadline": "2026-03-18",
+    "source": "fec+fvap+greenpapers",
+    "confidence": "high",
+    "note": "Delegate race only."
+  },
+  {
+    "state": "FL",
+    "primary_date": "2026-08-18",
+    "filing_deadline": "2026-04-24",
+    "source": "fec",
+    "confidence": "high",
+    "note": "Primary date high (4 sources); filing deadline medium - FEC shows 4/24, Green Papers shows a June qualifying week."
+  },
+  {
+    "state": "GA",
+    "primary_date": "2026-05-19",
+    "filing_deadline": "2026-03-06",
+    "source": "fec+greenpapers",
+    "confidence": "high",
+    "note": "Runoff 6/16."
+  },
+  {
+    "state": "HI",
+    "primary_date": "2026-08-08",
+    "filing_deadline": "2026-06-02",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "ID",
+    "primary_date": "2026-05-19",
+    "filing_deadline": "2026-02-27",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "IL",
+    "primary_date": "2026-03-17",
+    "filing_deadline": "2025-11-03",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "IN",
+    "primary_date": "2026-05-05",
+    "filing_deadline": "2026-02-06",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "IA",
+    "primary_date": "2026-06-02",
+    "filing_deadline": "2026-03-13",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "KS",
+    "primary_date": "2026-08-04",
+    "filing_deadline": "2026-06-01",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "KY",
+    "primary_date": "2026-05-19",
+    "filing_deadline": "2026-01-09",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "LA",
+    "primary_date": "2026-05-16",
+    "filing_deadline": "2026-01-14",
+    "source": "fec+greenpapers",
+    "confidence": "medium",
+    "note": "5/16 is the U.S. Senate primary; U.S. House primary postponed to 2026-11-03 (general) per Louisiana v. Callais. Senate filing deadline 1/14; House filing 8/7.",
+    "overrides": [
+      {
+        "office": "H",
+        "primary_date": "2026-11-03",
+        "note": "House primary postponed to 2026-11-03 per Louisiana v. Callais."
+      }
+    ]
+  },
+  {
+    "state": "ME",
+    "primary_date": "2026-06-09",
+    "filing_deadline": "2026-03-16",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "MD",
+    "primary_date": "2026-06-23",
+    "filing_deadline": "2026-02-24",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "MA",
+    "primary_date": "2026-09-01",
+    "filing_deadline": "2026-06-02",
+    "source": "fec",
+    "confidence": "high",
+    "note": "Primary date high (4 sources); filing deadline medium - FEC shows 6/2, Green Papers shows 5/5."
+  },
+  {
+    "state": "MI",
+    "primary_date": "2026-08-04",
+    "filing_deadline": "2026-04-21",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "MN",
+    "primary_date": "2026-08-11",
+    "filing_deadline": "2026-06-02",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "MS",
+    "primary_date": "2026-03-10",
+    "filing_deadline": "2025-12-26",
+    "source": "fec+greenpapers",
+    "confidence": "high",
+    "note": "Runoff 4/7."
+  },
+  {
+    "state": "MO",
+    "primary_date": "2026-08-04",
+    "filing_deadline": "2026-03-31",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "MT",
+    "primary_date": "2026-06-02",
+    "filing_deadline": "2026-03-04",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "NE",
+    "primary_date": "2026-05-12",
+    "filing_deadline": "2026-03-02",
+    "source": "fec+greenpapers",
+    "confidence": "high",
+    "note": "Incumbent filing deadline 2/17; all others 3/2."
+  },
+  {
+    "state": "NV",
+    "primary_date": "2026-06-09",
+    "filing_deadline": "2026-03-13",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "NH",
+    "primary_date": "2026-09-08",
+    "filing_deadline": "2026-06-12",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "NJ",
+    "primary_date": "2026-06-02",
+    "filing_deadline": "2026-03-23",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "NM",
+    "primary_date": "2026-06-02",
+    "filing_deadline": "2026-02-03",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "NY",
+    "primary_date": "2026-06-23",
+    "filing_deadline": "2026-04-06",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "NC",
+    "primary_date": "2026-03-03",
+    "filing_deadline": "2025-12-19",
+    "source": "fec+greenpapers+ncsbe",
+    "confidence": "high",
+    "note": "Filing window 12/1-12/19/2025. Runoff (second primary) 5/12."
+  },
+  {
+    "state": "ND",
+    "primary_date": "2026-06-09",
+    "filing_deadline": "2026-04-06",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "OH",
+    "primary_date": "2026-05-05",
+    "filing_deadline": "2026-02-04",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "OK",
+    "primary_date": "2026-06-16",
+    "filing_deadline": "2026-04-03",
+    "source": "fec+greenpapers",
+    "confidence": "high",
+    "note": "Runoff 8/25."
+  },
+  {
+    "state": "OR",
+    "primary_date": "2026-05-19",
+    "filing_deadline": "2026-03-10",
+    "source": "fec+greenpapers",
+    "confidence": "high",
+    "note": "Incumbent filing deadline 3/3; all others 3/10."
+  },
+  {
+    "state": "PA",
+    "primary_date": "2026-05-19",
+    "filing_deadline": "2026-03-10",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "RI",
+    "primary_date": "2026-09-09",
+    "filing_deadline": "2026-06-24",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "SC",
+    "primary_date": "2026-06-09",
+    "filing_deadline": "2026-03-30",
+    "source": "fec+greenpapers",
+    "confidence": "high",
+    "note": "Runoff 6/23."
+  },
+  {
+    "state": "SD",
+    "primary_date": "2026-06-02",
+    "filing_deadline": "2026-03-31",
+    "source": "fec+greenpapers",
+    "confidence": "high",
+    "note": "Runoff 7/28."
+  },
+  {
+    "state": "TN",
+    "primary_date": "2026-08-06",
+    "filing_deadline": "2026-03-10",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "TX",
+    "primary_date": "2026-03-03",
+    "filing_deadline": "2025-12-08",
+    "source": "fec+greenpapers",
+    "confidence": "high",
+    "note": "Runoff 5/26."
+  },
+  {
+    "state": "UT",
+    "primary_date": "2026-06-23",
+    "filing_deadline": "2026-03-13",
+    "source": "fec+greenpapers",
+    "confidence": "high",
+    "note": "Parties also nominate via convention before primary."
+  },
+  {
+    "state": "VT",
+    "primary_date": "2026-08-11",
+    "filing_deadline": "2026-05-28",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "VA",
+    "primary_date": "2026-08-04",
+    "filing_deadline": "2026-05-26",
+    "source": "fec+greenpapers",
+    "confidence": "medium",
+    "note": "House filing deadline 5/26; Senate filing deadline 4/2. Parties may nominate by convention instead of primary."
+  },
+  {
+    "state": "WA",
+    "primary_date": "2026-08-04",
+    "filing_deadline": "2026-05-08",
+    "source": "fec+greenpapers",
+    "confidence": "high",
+    "note": "Top-two primary."
+  },
+  {
+    "state": "WV",
+    "primary_date": "2026-05-12",
+    "filing_deadline": "2026-01-31",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  },
+  {
+    "state": "WI",
+    "primary_date": "2026-08-11",
+    "filing_deadline": "2026-06-01",
+    "source": "fec+greenpapers",
+    "confidence": "high",
+    "note": "8/11 is the partisan congressional primary; WI's 2/17 spring primary is for nonpartisan/judicial offices."
+  },
+  {
+    "state": "WY",
+    "primary_date": "2026-08-18",
+    "filing_deadline": "2026-05-29",
+    "source": "fec+greenpapers",
+    "confidence": "high"
+  }
 ]

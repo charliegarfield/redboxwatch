@@ -47,18 +47,12 @@ from .config import Config
 from .fec import FECClient
 from .ratings.base import RaceRating, RatingAdapter
 from .util import now_iso
-from .website import ResolvedURL, WebsiteResolver
 
-# State-affiliate party codes folded into their national party for the
-# contested-general cross-party test (MN Democratic-Farmer-Labor, ND
-# Democratic-Nonpartisan League). Without this, DFL vs DEM would read as a
-# cross-party general contest.
-_PARTY_ALIASES = {"DFL": "DEM", "DNL": "DEM"}
-
-
-def _norm_party(party: str | None) -> str:
-    p = (party or "").strip().upper()
-    return _PARTY_ALIASES.get(p, p)
+# Canonical party normalization is shared with nominees/feed crosswalk (see
+# util.norm_party): state-affiliate codes fold into their national party (MN
+# DFL, ND D-NPL). Without it, DFL vs DEM read as a cross-party general
+# contest AND as two separate primaries.
+from .util import norm_party as _norm_party
 
 
 @dataclass
@@ -72,11 +66,14 @@ class FundedCandidate:
 
     @property
     def group_key(self) -> tuple[str, str, str, str]:
+        # Party is NORMALIZED: a MN race codes its candidates as both DEM and
+        # DFL, and they share one primary — raw codes split them into
+        # parallel buckets (each side then read as uncontested).
         return (
             self.raw.get("office", ""),
             self.raw.get("state", "") or "",
             str(self.raw.get("district", "") or ""),
-            self.raw.get("party", "") or "",
+            _norm_party(self.raw.get("party", "")),
         )
 
     @property
@@ -93,7 +90,6 @@ class UniverseEntry:
     candidate: FundedCandidate
     reasons: set[str] = field(default_factory=set)
     rating: str | None = None
-    url: ResolvedURL | None = None
     # For general/full modes: how this candidate was confirmed the nominee
     # (uncontested | feed:<name> | manual) — surfaced for the review gate so a
     # feed-resolved nominee is visibly less certain than a manual/uncontested one.
@@ -106,17 +102,23 @@ class Discovery:
         config: Config,
         fec: FECClient,
         rating_adapter: RatingAdapter | None = None,
-        resolver: WebsiteResolver | None = None,
+        resolver: object | None = None,
         weball_path: str | Path | None = None,
+        use_cache: bool = True,
     ) -> None:
         self.cfg = config
         self.fec = fec
         self.ratings = rating_adapter
-        self.resolver = resolver or WebsiteResolver(
-            fec_client=fec, user_agent=config.user_agent)
+        # `resolver` is accepted (and ignored) for backward compatibility:
+        # discovery deliberately does NOT resolve URLs — that's `resolve`'s
+        # job — and the eagerly-constructed WebsiteResolver was never read.
+        del resolver
         # If a FEC bulk 'weball' file is given (and exists), discovery reads
         # candidates + receipts from it — no per-candidate API calls.
         self.weball_path = Path(weball_path) if weball_path else None
+        # API-path only: `discover --no-cache` bypasses the FEC disk cache
+        # (the flag existed but was silently ignored before).
+        self.use_cache = use_cache
 
     # ------------------------------------------------------------------
     def _funded_candidates(
@@ -159,14 +161,16 @@ class Discovery:
         for office in offices:
             for state in state_list:
                 for cand in self.fec.candidates(
-                    election_year=year, office=office, state=state, extra=extra
+                    election_year=year, office=office, state=state, extra=extra,
+                    use_cache=self.use_cache,
                 ):
                     cid = cand.get("candidate_id")
                     if not cid or cid in seen:
                         continue
                     seen.add(cid)
                     try:
-                        totals = self.fec.candidate_totals(cid, cycle=year)
+                        totals = self.fec.candidate_totals(
+                            cid, cycle=year, use_cache=self.use_cache)
                     except Exception as e:
                         # One candidate's totals failing (after the client's own
                         # retries) must not abort discovery for everyone else.
@@ -265,10 +269,11 @@ class Discovery:
         the ``include_incumbents`` rule is off."""
         if not self.cfg.include_incumbents:
             return set()
+        # (Offices not on this cycle's ballot are already gated out of
+        # `funded` in build_universe.)
         return {
             fc.candidate_id for fc in funded
             if (fc.raw.get("incumbent_challenge") or "").upper() == "I"
-            and self._office_on_ballot(fc.raw.get("office", ""))
         }
 
     def _funded_presumptive_nominees(self, funded: list[FundedCandidate]) -> set[str]:
@@ -286,7 +291,6 @@ class Discovery:
         return {
             members[0].candidate_id for members in groups.values()
             if len(members) == 1 and members[0].receipts >= self.cfg.receipts_floor
-            and self._office_on_ballot(members[0].raw.get("office", ""))
         }
 
     def _competitive_overlay(
@@ -316,19 +320,26 @@ class Discovery:
         return out
 
     @staticmethod
-    def _race_phase(state: str, today: "date | None",
+    def _race_phase(state: str, office: str, district: str, today: "date | None",
                     primary_dates: dict[str, str] | None) -> str:
-        """'general' if this state's primary is already past, else 'primary'.
+        """'general' if this RACE's primary is already past, else 'primary'.
 
         Used by ``full`` mode so each race is scanned for its CURRENT phase —
         states primary on different dates (March–September), so on any given day
         some races are pre-primary (scan the contested field) and others are
-        post-primary (scan the nominee). Unknown date -> 'primary' (conservative:
-        we don't assume a primary we can't date has happened)."""
+        post-primary (scan the nominee). ``primary_dates`` may carry override
+        keys ('AL:H', 'AL:H:01') for races moved off the statewide date; the
+        most specific key wins, so a postponed district stays in its primary
+        phase while the rest of the state moves on. Unknown date -> 'primary'
+        (conservative: we don't assume a primary we can't date has happened)."""
         if not today or not primary_dates:
             return "primary"
-        d = _as_date(primary_dates.get((state or "").upper()))
-        return "general" if (d and today > d) else "primary"
+        st = (state or "").upper()
+        for key in (f"{st}:{office}:{district}", f"{st}:{office}", st):
+            if key in primary_dates:
+                d = _as_date(primary_dates[key])
+                return "general" if (d and today > d) else "primary"
+        return "primary"
 
     # ------------------------------------------------------------------
     def build_universe(
@@ -357,6 +368,13 @@ class Discovery:
         # record's money must not make its old district look contested and pull
         # real candidates into the universe on its strength.
         funded = self._drop_inactive(funded)
+        # Gate offices with no election this cycle (P in a midterm) before ANY
+        # population is built. Presidential committees file continuously, so
+        # their cumulative receipts read as current-cycle money — gating only
+        # the baseline populations let them ride in through contested_primary
+        # and contested_general (every P filer shares one state='00' bucket).
+        funded = [fc for fc in funded
+                  if self._office_on_ballot(fc.raw.get("office", ""))]
         contested = self._contested_primaries(funded)
         competitive = self._competitive_overlay(funded)
         contested_general = self._contested_generals(funded)
@@ -397,7 +415,9 @@ class Discovery:
             if mode == "general":
                 reasons = {"nominee"} if nominee else set()
             elif mode == "full":
-                if self._race_phase(fc.raw.get("state", ""), today, primary_dates) == "general":
+                if self._race_phase(fc.raw.get("state", ""), fc.raw.get("office", ""),
+                                    fc.raw.get("district", ""), today,
+                                    primary_dates) == "general":
                     reasons = {"nominee"} if nominee else set()
                 else:
                     reasons = primary_reasons(cid)
@@ -460,13 +480,14 @@ class Discovery:
         rows = []
         for e in entries:
             c = e.candidate.raw
-            url = e.url or ResolvedURL(None, "none", False)
+            # URL columns are seeded empty on insert; `resolve` owns them (and
+            # the ON CONFLICT clause below never touches them on re-discover).
             rows.append(
                 (
                     c["candidate_id"], c.get("name"), c.get("office"), c.get("state"),
                     str(c.get("district") or ""), c.get("party"), self.cfg.election_year,
-                    self.reason_label(e.reasons), None, url.url, url.source,
-                    int(url.verified), e.candidate.receipts, e.rating,
+                    self.reason_label(e.reasons), None, None, "none",
+                    0, e.candidate.receipts, e.rating,
                     e.nominee_source, ts, ts,
                 )
             )
@@ -499,19 +520,18 @@ class Discovery:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("w", newline="") as fh:
             w = csv.writer(fh)
+            # No URL columns: discovery never resolves URLs (they were three
+            # permanently-empty columns); the DB is the URL source of truth.
             w.writerow([
                 "candidate_id", "name", "office", "state", "district", "party",
                 "universe_reason", "nominee_source", "rating", "receipts",
-                "website_url", "url_source", "url_verified",
             ])
             for e in entries:
                 c = e.candidate.raw
-                url = e.url or ResolvedURL(None, "none", False)
                 w.writerow([
                     c["candidate_id"], c.get("name"), c.get("office"), c.get("state"),
                     str(c.get("district") or ""), c.get("party"),
                     Discovery.reason_label(e.reasons), e.nominee_source or "",
-                    e.rating or "", f"{e.candidate.receipts:.0f}", url.url or "",
-                    url.source, "yes" if url.verified else "no",
+                    e.rating or "", f"{e.candidate.receipts:.0f}",
                 ])
         return path

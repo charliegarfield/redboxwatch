@@ -1,5 +1,13 @@
 # Nationwide-scale findings
 
+> **Status: frozen audit log** (moved from repo-root `SCALE_NOTES.md`,
+> 2026-07-28). This is a dated record of the 2026-06 scale audit and its
+> fixes, kept for history. Its `file:line` references have drifted with the
+> code and its remaining "TODO" items were either fixed in the 2026-07-28
+> hardening pass (sequential resolution, publisher evidence re-copy,
+> Playwright teardown-guard class of issues) or superseded — do not treat
+> this document as live engineering state.
+
 Audit done 2026-06-02 (three static passes + a live run on 7 unseen New Jersey
 House candidates). NY today is ~62 candidates / ~5,800 pages; "nationwide" means
 ~2,000–5,000 candidates and ~200,000+ pages, scanned concurrently.

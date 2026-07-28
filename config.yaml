@@ -4,6 +4,10 @@
 
 election_year: 2026
 
+# FEC bulk candidate-summary file used by `discover` when present (fetched by
+# `fetch-fec` / `discover --fetch`); falls back to the openFEC API otherwise.
+weball_path: data/webl26.txt
+
 # Drop "paper candidates": require this much in FEC-reported receipts.
 receipts_floor: 50000
 
@@ -109,8 +113,7 @@ scan_cadence:
 # crawler posture (ROBOTS_POLICY.md), and it should identify YOU, not this repo.
 user_agent: "RedBoxTracker/0.1 (+research; contact: set-your-email@example.com)"
 rate_limit:
-  default_per_domain_rps: 0.5   # requests/sec/domain
-  default_min_delay_seconds: 2.0
+  default_min_delay_seconds: 2.0   # min seconds between requests to one domain
 
 # Classifier (phase 3). Model strings are "provider/model"; an unprefixed name
 # means Anthropic. Supported prefixes: fireworks/ (Fireworks.ai serverless,
@@ -152,8 +155,6 @@ models:
 confidence_thresholds:
   # First-pass results within this band of the decision boundary escalate.
   escalate_below: 0.75
-  # Minimum confidence for an auto "no_guidance_detected" to be trusted.
-  negative_floor: 0.6
 
 # Approximate model pricing (USD per MILLION input tokens) for the `scan-all`
 # cost PREFLIGHT only. These drive the dry-run estimate; they are NOT
@@ -186,3 +187,4 @@ screenshot:
 publish:
   site_url: https://redboxwatch.org
   pages_project: redboxwatch     # Cloudflare Pages project for `redbox deploy`
+  page_size: 500                 # index rows per page (index-2.html… beyond it)

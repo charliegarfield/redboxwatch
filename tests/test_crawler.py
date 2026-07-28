@@ -223,3 +223,55 @@ def test_classifier_text_unions_hidden_dom():
     assert "Visible line" in text
     assert "Hidden directive line" in text
     assert r.text_hash  # stable hash present
+
+
+def test_relative_links_resolve_against_the_page_not_the_seed():
+    # href="article-1" on /news/2026/ means /news/2026/article-1. Resolving
+    # against the site seed produced site-root 404s and never crawled the
+    # real page.
+    c = _crawler(None)
+    pages, _ = c._extract_links(
+        "https://x.example/news/2026/",
+        '<a href="article-1">a</a><a href="/about">b</a>',
+        site_url="https://x.example")
+    assert "https://x.example/news/2026/article-1" in pages
+    assert "https://x.example/about" in pages
+
+
+def test_extract_links_honors_base_href():
+    c = _crawler(None)
+    pages, _ = c._extract_links(
+        "https://x.example/news/2026/",
+        '<head><base href="https://x.example/docs/"></head>'
+        '<a href="kit">a</a>',
+        site_url="https://x.example")
+    assert pages == ["https://x.example/docs/kit"]
+
+
+def test_crawl_resolves_links_from_the_fetched_page(tmp_path):
+    # End-to-end: a depth-1 page under /news/ links relatively to a sibling;
+    # the crawler must fetch the sibling, not a phantom site-root URL.
+    class SiteFetcher:
+        fetched = []
+
+        def fetch(self, url, *, screenshot=True):
+            self.fetched.append(url)
+            html = {
+                "https://x.example": '<a href="/news/2026/">news</a>',
+                "https://x.example/news/2026": '<a href="article-1">art</a>',
+                "https://x.example/news/2026/article-1": "story",
+            }.get(url.rstrip("/") or url, "")
+            status = 200 if html else 404
+            return FetchResult(url=url, final_url=url, status=status,
+                               content_type="text/html", render_mode="browser",
+                               html=html, visible_text=html, dom_text=html)
+
+    rp = RobotsPolicy(default="respect")
+    rp._parser = lambda scheme, domain: None
+    crawler = Crawler(SiteFetcher(), robots=rp, rate_limiter=DomainRateLimiter(0.0),
+                      common_paths=[], crawl_depth=2)
+    crawler.sitemap_urls = lambda base: []
+    results = list(crawler.crawl_site("https://x.example"))
+    urls = [r.url for r in results]
+    assert "https://x.example/news/2026/article-1" in urls
+    assert "https://x.example/article-1" not in urls

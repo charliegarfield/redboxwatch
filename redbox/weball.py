@@ -25,9 +25,6 @@ from pathlib import Path
 from typing import Iterator
 
 # Default location alongside the cache. Override via config `weball_path`.
-DEFAULT_WEBALL = Path("data/webl26.txt")
-
-OFFICE_FROM_ID = {"H": "H", "S": "S", "P": "P"}
 
 
 @dataclass
@@ -55,7 +52,8 @@ class WeballRow:
 
 
 def _office(candidate_id: str) -> str:
-    return OFFICE_FROM_ID.get(candidate_id[:1].upper(), "")
+    c = candidate_id[:1].upper()
+    return c if c in "HSP" else ""
 
 
 def parse_weball(path: str | Path) -> Iterator[WeballRow]:
@@ -106,3 +104,76 @@ def load_funded(
             continue
         out.append(row)
     return out
+
+
+# ---------------------------------------------------------------------------
+BULK_URL_TEMPLATE = "https://www.fec.gov/files/bulk-downloads/{cycle}/webl{yy}.zip"
+
+
+def fetch_weball(dest: str | Path, *, cycle: int = 2026,
+                 url: str | None = None, timeout: int = 120) -> dict:
+    """Download the FEC bulk candidate-summary zip and install it at ``dest``.
+
+    The zip holds a single ``webl{yy}.txt``. The current file (if any) is kept
+    as ``<dest>.old-YYYYMMDD`` (dated by ITS download day, so the name says how
+    stale it was) before the new one is moved into place atomically. The new
+    file must parse and hold at least 1000 candidate rows — a truncated or
+    reshaped download never replaces a working file.
+
+    Returns {"rows": n, "backup": path-or-None, "url": url}.
+    """
+    import io
+    import os
+    import tempfile
+    import urllib.request
+    import zipfile
+    from datetime import date, datetime
+
+    dest = Path(dest)
+    yy = str(cycle)[-2:]
+    url = url or BULK_URL_TEMPLATE.format(cycle=cycle, yy=yy)
+    member = f"webl{yy}.txt"
+
+    req = urllib.request.Request(url, headers={"User-Agent": "redboxfinder/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        blob = resp.read()
+    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+        names = zf.namelist()
+        pick = member if member in names else next(
+            (n for n in names if n.lower().endswith(".txt")), None)
+        if pick is None:
+            raise RuntimeError(f"no .txt member in {url} (members: {names})")
+        data = zf.read(pick)
+
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=dest.parent, prefix=".webl-incoming-")
+    try:
+        with os.fdopen(tmp_fd, "wb") as fh:
+            fh.write(data)
+        rows = sum(1 for _ in parse_weball(tmp_path))
+        if rows < 1000:
+            raise RuntimeError(
+                f"downloaded file parses to only {rows} candidate rows — "
+                f"refusing to replace {dest}")
+        # mkstemp files are 0600; the installed file must be readable like a
+        # normal data file (a fetch under cron/another uid otherwise leaves
+        # discover with a PermissionError).
+        os.chmod(tmp_path, 0o644)
+        backup = None
+        if dest.exists():
+            stamp = date.fromtimestamp(dest.stat().st_mtime).strftime("%Y%m%d")
+            backup = dest.with_name(f"{dest.name}.old-{stamp}")
+            # Never clobber an earlier same-day backup — "keeps the previous
+            # file" must hold per run, not per day.
+            n = 1
+            while backup.exists():
+                n += 1
+                backup = dest.with_name(f"{dest.name}.old-{stamp}.{n}")
+            os.replace(dest, backup)
+        os.replace(tmp_path, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
+    return {"rows": rows, "backup": str(backup) if backup else None, "url": url}

@@ -145,9 +145,14 @@ class AnthropicLLM:
             from .ratelimit_tokens import estimate_input_tokens
             # Meter against THIS model's bucket — first-pass and escalation have
             # separate org ceilings (a no-op for a single-bucket limiter).
+            # Metered with the FULL config string (an 'anthropic/' prefix
+            # included): limiter buckets are keyed by config model names, and
+            # metering the bare wire name silently missed the bucket, running
+            # the scan unthrottled. Same convention as OpenAICompatLLM.
             self._rate_limiter.acquire(estimate_input_tokens(text), model=model)
+        wire_model = model.split("/", 1)[1] if model.startswith("anthropic/") else model
         resp = self._client.messages.create(
-            model=model,
+            model=wire_model,
             max_tokens=self.max_tokens,
             temperature=0,
             system=[{
@@ -285,8 +290,8 @@ class RouterLLM:
         if backend is None:
             raise ValueError(f"no LLM backend configured for provider {provider!r} "
                              f"(model {model!r}) — is its API key set?")
-        if provider == "anthropic" and "/" in model:
-            model = model.split("/", 1)[1]     # AnthropicLLM expects bare names
+        # The full prefixed string goes through: every backend meters with the
+        # config-aligned name and strips the prefix itself for the wire.
         return backend.classify_chunk(text, model=model)
 
 

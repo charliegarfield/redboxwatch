@@ -18,7 +18,13 @@ from .ratings.fixture import FixtureRatingAdapter
 
 def _make_rating_adapter(cfg):
     # Only the offline fixture adapter ships with the repo; add live adapters
-    # (spec §3.1B) behind cfg.rating_source when you have licensed access.
+    # (spec §3.1B) here when you have licensed access. cfg.rating_source is
+    # actually consulted, so a typo'd/unsupported value fails loudly instead
+    # of silently falling back to the fixture.
+    source = cfg.rating_source
+    if source != "fixture":
+        raise ValueError(f"rating_source {source!r} is not supported — only "
+                         f"'fixture' ships with the repo")
     return FixtureRatingAdapter()
 
 
@@ -71,7 +77,7 @@ def _estimate_scan_cost(conn, n_candidates: int, cfg) -> str:
            FROM detections d JOIN scans s USING(scan_id)""").fetchone()
     if row and row["dets"] and row["cands"]:
         pages_per_cand = row["dets"] / row["cands"]
-        avg_tokens = estimate_input_tokens("x" * int(row["avg_len"] or 0))
+        avg_tokens = estimate_input_tokens("", chars=int(row["avg_len"] or 0))
         esc_rate = row["esc_rate"] or 0.0
         basis = (f"from {row['dets']:,} classified pages across "
                  f"{row['cands']} scanned candidate(s) in this DB")
@@ -107,12 +113,23 @@ def _build_nominee_resolver(cfg, *, use_feed: bool = True):
 
 
 def _primary_dates() -> dict[str, str]:
-    """state -> ISO primary date, from the calendar fixture (for full mode)."""
+    """Primary dates from the calendar fixture, most-specific keys included.
+
+    Keys: 'AL' (statewide), 'AL:H' (office override), 'AL:H:01' (district
+    override) — the override keys carry races moved off the statewide date.
+    Consumers look up most-specific-first (see discovery._race_phase)."""
     import json
 
     from .scheduler import CALENDAR_FIXTURE
 
-    return {r["state"]: r["primary_date"] for r in json.loads(CALENDAR_FIXTURE.read_text())}
+    out: dict[str, str] = {}
+    for r in json.loads(CALENDAR_FIXTURE.read_text()):
+        out[r["state"]] = r["primary_date"]
+        for o in r.get("overrides", []):
+            for dd in (o.get("districts") or [None]):
+                key = f"{r['state']}:{o['office']}" + (f":{dd}" if dd else "")
+                out[key] = o.get("primary_date")
+    return out
 
 
 def _build_archiver(cfg, push_wayback: bool):
@@ -136,7 +153,32 @@ def cmd_initdb(args, cfg) -> int:
     return 0
 
 
+def cmd_fetch_fec(args, cfg) -> int:
+    """Download the FEC bulk candidate file and install it at weball_path.
+
+    Keeps the previous file as ``<name>.old-YYYYMMDD`` (dated by its own
+    download day). A truncated/unparseable download never replaces a working
+    file, so this is safe to run unconditionally before ``discover``.
+    """
+    from .weball import fetch_weball
+
+    try:
+        info = fetch_weball(cfg.weball_path,
+                            cycle=getattr(args, "cycle", None) or cfg.election_year)
+    except Exception as e:
+        print(f"FEC bulk download failed: {e}")
+        return 1
+    print(f"Fetched {info['url']}")
+    print(f"Installed {cfg.weball_path} ({info['rows']:,} candidate rows)"
+          + (f"; kept previous file as {info['backup']}" if info['backup'] else ""))
+    return 0
+
+
 def cmd_discover(args, cfg) -> int:
+    if getattr(args, "fetch", False):
+        rc = cmd_fetch_fec(args, cfg)
+        if rc != 0:
+            print("Continuing discover with the existing bulk file.")
     states = [s.strip().upper() for s in args.states.split(",")] if args.states else None
     offices = [o.strip().upper() for o in args.offices.split(",")] if args.offices else ["H", "S", "P"]
 
@@ -155,6 +197,7 @@ def cmd_discover(args, cfg) -> int:
         fec=fec,
         rating_adapter=_make_rating_adapter(cfg),
         weball_path=weball,
+        use_cache=not getattr(args, "no_cache", False),
     )
     district = getattr(args, "district", None)
     mode = (getattr(args, "mode", None) or cfg.scan_mode).lower()
@@ -187,6 +230,13 @@ def cmd_discover(args, cfg) -> int:
 
     conn = init_db(cfg.database_path)
     n = discovery.persist(conn, entries)
+    # Newly discovered rows are inserted with primary_date NULL, and the
+    # scheduler degrades unknown-date candidates to an unprioritized cadence —
+    # so refresh the calendar in the same run instead of relying on a manual
+    # `calendar` invocation that's easy to forget.
+    from .scheduler import backfill_primary_dates, load_calendar
+    load_calendar(conn, cycle=cfg.election_year)
+    n_dates = backfill_primary_dates(conn, cycle=cfg.election_year)
     conn.close()
 
     csv_path = cfg.repo_root / "data" / f"candidate_universe_{cfg.election_year}.csv"
@@ -202,6 +252,7 @@ def cmd_discover(args, cfg) -> int:
     if nominees:
         print(f"  nominees: {nominees} (by source: {dict(by_src)})")
     print(f"  persisted {n} rows to {cfg.database_path}")
+    print(f"  calendar refreshed: primary_date set on {n_dates} candidate(s)")
     print(f"  wrote {csv_path}")
     print("  next: run `resolve` to backfill campaign URLs "
           "(Wikipedia + optional web search), then `scan-all`.")
@@ -279,8 +330,18 @@ def cmd_mark_primary_losers(args, cfg) -> int:
     from .util import now_iso
 
     today = date.fromisoformat(args.today) if args.today else date.today()
-    past = {st for st, d in _primary_dates().items()
-            if d and date.fromisoformat(d[:10]) < today}
+    dates = _primary_dates()
+    past = {k for k, d in dates.items() if ":" not in k
+            and d and date.fromisoformat(d[:10]) < today}
+    # Races moved off their state's statewide date (override keys 'ST:H' /
+    # 'ST:H:01') that have NOT voted yet: exclude them from the sweep — a
+    # feed still carrying a voided earlier result must not mark losers in a
+    # race that hasn't happened.
+    not_yet: set[tuple] = set()
+    for k, d in dates.items():
+        if ":" in k and (not d or date.fromisoformat(d[:10]) >= today):
+            parts = k.split(":")                 # ST:OFFICE[:DISTRICT]
+            not_yet.add((parts[1], parts[0], parts[2] if len(parts) > 2 else None))
     if not past:
         print("No state's primary is in the past — nothing to do.")
         return 0
@@ -296,8 +357,12 @@ def cmd_mark_primary_losers(args, cfg) -> int:
               f"those races via overrides or the review console)")
     print(f"{len(past)} state(s) past their primary as of {today} "
           f"(feed: {feed_name or 'none — override + uncontested only'})")
-    lost, cleared, unresolved = flag_primary_losers(
-        conn, resolver, states=past, ts=now_iso())
+    excl = sorted((o, s, d) for o, s, d in not_yet if s in past)
+    if excl:
+        pretty = ", ".join(f"{s}-{o}" + (f"-{d}" if d else "") for o, s, d in excl)
+        print(f"(excluding postponed race(s) not yet voted: {pretty})")
+    lost, cleared, unresolved, feed_failed = flag_primary_losers(
+        conn, resolver, states=past, ts=now_iso(), exclude=not_yet)
     for c in lost:
         print(f"  lost primary: {c['candidate_id']} {c['name']} "
               f"({c.get('office')}-{c.get('state')}-{c.get('district')})")
@@ -306,6 +371,10 @@ def cmd_mark_primary_losers(args, cfg) -> int:
     conn.close()
     print(f"\n{len(lost)} newly marked lost-primary, {cleared} cleared; "
           f"{n_total} total inactive=3.")
+    if feed_failed and feed_name:
+        print(f"WARNING: feed fetch FAILED for {len(feed_failed)} state(s) "
+              f"({', '.join(sorted(feed_failed))}) — existing marks there were "
+              f"KEPT (an outage is not evidence); re-run once the feed is back.")
     if unresolved:
         print(f"{unresolved} contested race(s) unresolved by the feed — their "
               f"candidates were LEFT IN (coverage gap, not evidence of loss). "
@@ -509,16 +578,38 @@ def cmd_scan_all(args, cfg) -> int:
     # set to 'scanned' | 'robots_blocked' | 'fetch_failed'), so an interrupted
     # nationwide run resumes where it left off instead of re-crawling everything.
     # --rescan re-attempts all matching candidates (incl. prior failures).
-    if not args.rescan:
+    # --due instead takes the scheduler's cadence-due set, which already encodes
+    # "needs a scan now" from the scans table — the scan_status restart filter
+    # would wrongly exclude previously-scanned candidates, so it doesn't apply.
+    due_rank: dict | None = None
+    if args.due:
+        from .scheduler import due_candidates
+        # Same cadence config as `schedule` — the two must agree on the due set.
+        cad = cfg.get("scan_cadence", {}) or {}
+        due_rank = {d.candidate["candidate_id"]: i for i, d in enumerate(
+            due_candidates(conn,
+                           daily_window_days=cad.get("daily_window_days", 21),
+                           default_interval_days=cad.get("default_interval_days", 7),
+                           require_verified=cfg.require_verified_url))}
+    elif not args.rescan:
         where.append("scan_status IS NULL")
     rows = [dict(r) for r in conn.execute(
         f"SELECT * FROM candidates WHERE {' AND '.join(where)} ORDER BY state, district, name",
         params).fetchall()]
-    # How many already-done candidates we're skipping (for an honest summary).
-    skip_where = ["website_url IS NOT NULL", "scan_status IS NOT NULL"]
+    if due_rank is not None:
+        # Soonest-primary-first, matching the scheduler's priority order.
+        rows = sorted((r for r in rows if r["candidate_id"] in due_rank),
+                      key=lambda r: due_rank[r["candidate_id"]])
+    # How many already-done candidates we're skipping (for an honest summary) —
+    # under the SAME filters as the selection query, or the count disagrees
+    # with what the run would actually have picked.
+    skip_where = ["website_url IS NOT NULL", "scan_status IS NOT NULL",
+                  "COALESCE(inactive,0) = 0"]
     skip_params: list = []
     if args.state:
         skip_where.append("state = ?"); skip_params.append(args.state.upper())
+    if cfg.require_verified_url:
+        skip_where.append("url_verified = 1")
     already = conn.execute(
         f"SELECT COUNT(*) FROM candidates WHERE {' AND '.join(skip_where)}",
         skip_params).fetchone()[0]
@@ -526,6 +617,9 @@ def cmd_scan_all(args, cfg) -> int:
     conn.close()
 
     if not rows:
+        if args.due:
+            print("No candidates are due for a scan under the cadence rules.")
+            return 0
         if already and not args.rescan:
             print(f"Nothing to scan — all {already} candidate(s) with a URL are "
                   f"already attempted. Use --rescan to re-scan them.")
@@ -533,10 +627,12 @@ def cmd_scan_all(args, cfg) -> int:
         print("No scannable candidates (need a resolved website_url"
               + (" and url_verified" if cfg.require_verified_url else "") + ").")
         return 0
-    if already and not args.rescan:
+    if already and not args.rescan and not args.due:
         print(f"(skipping {already} already-attempted candidate(s); --rescan to redo them)")
 
     scope = f"state={args.state.upper()}" if args.state else "ALL states"
+    if args.due:
+        scope += ", due set"
     print(f"{len(rows)} candidate(s) to scan [{scope}], {args.workers} concurrent.")
     print(cost_summary)
     if not args.authorize:
@@ -583,9 +679,12 @@ def cmd_scan_all(args, cfg) -> int:
                 pos += o.positives; amb += o.ambiguous
                 flag = " ⚑ POSITIVE" if o.positives else (" ? ambiguous" if o.ambiguous else "")
                 dd = f", {o.deduped} deduped" if o.deduped else ""
+                ff = f" {o.pages_failed}f" if o.pages_failed else ""
+                ch = (f" [{o.put_ups} put-up/{o.take_downs} take-down]"
+                      if (o.put_ups or o.take_downs) else "")
                 print(f"  ✓ {c['candidate_id']} {c['name'][:30]:30s} "
-                      f"{o.pages_scanned}p {o.positives}+/{o.ambiguous}? "
-                      f"({o.prefiltered} prefiltered{dd}){flag}")
+                      f"{o.pages_scanned}p{ff} {o.positives}+/{o.ambiguous}? "
+                      f"({o.prefiltered} prefiltered{dd}){ch}{flag}")
         except KeyboardInterrupt:
             # Without this, the executors' context exit is shutdown(wait=True)
             # WITHOUT cancel_futures — every queued candidate would still run
@@ -615,13 +714,6 @@ def cmd_scan(args, cfg) -> int:
     (set require_verified_url in config.yaml to restore the spec §3.1 gate).
     Wayback pushes require --push-wayback.
     """
-    from .archiver import Archiver
-    from .classifier import Classifier, build_llm
-    from .crawler import Crawler, PlaywrightFetcher
-    from .pipeline import scan_candidate
-    from .ratelimit import DomainRateLimiter
-    from .robots import RobotsPolicy
-
     conn = init_db(cfg.database_path)
     row = conn.execute(
         "SELECT * FROM candidates WHERE candidate_id=?", (args.candidate,)
@@ -651,49 +743,23 @@ def cmd_scan(args, cfg) -> int:
               f"to proceed (add --push-wayback to also archive to the Wayback Machine).")
         return 0
 
-    robots_cfg = cfg.get("robots_policy", {}) or {}
-    rl = cfg.get("rate_limit", {}) or {}
-    fetcher_cm = PlaywrightFetcher(user_agent=cfg.user_agent)
-    models = cfg.models
-    with fetcher_cm as fetcher:
-        crawler = Crawler(
-            fetcher,
-            robots=RobotsPolicy(
-                default=robots_cfg.get("default", "respect"),
-                per_domain=robots_cfg.get("per_domain", {}),
-                user_agent=cfg.user_agent,
-            ),
-            rate_limiter=DomainRateLimiter(rl.get("default_min_delay_seconds", 2.0)),
-            common_paths=cfg.common_paths,
-            crawl_depth=cfg.crawl_depth,
-            user_agent=cfg.user_agent,
-            max_pages=cfg.get("max_pages_per_site", 150),
-        )
-        classifier = Classifier(
-            build_llm(
-                first_pass=models.get("first_pass", "claude-haiku-4-5"),
-                escalation=models.get("escalation", "claude-sonnet-4-6"),
-                anthropic_api_key=cfg.anthropic_api_key,
-                openai_api_key=cfg.openai_api_key,
-                fireworks_api_key=cfg.fireworks_api_key,
-                max_tokens=models.get("max_tokens", 1024)),
-            first_pass_model=models.get("first_pass", "claude-haiku-4-5"),
-            escalation_model=models.get("escalation", "claude-sonnet-4-6"),
-            chunk_chars=models.get("chunk_chars", 40000),
-            escalate_below=(cfg.get("confidence_thresholds", {}) or {}).get("escalate_below", 0.75),
-            concurrency=models.get("concurrency", 8),
-        )
-        archiver = _build_archiver(cfg, args.push_wayback)
-        outcome = scan_candidate(conn, candidate, crawler=crawler,
-                                 classifier=classifier, archiver=archiver,
-                                 require_verified=cfg.require_verified_url)
     conn.close()
-    print(f"Scanned {outcome.candidate_id}: {outcome.pages_scanned} pages, "
+    # Same stack (and, crucially, the same token-rate limiter) as a scan-all
+    # worker — the single-candidate path was building its own duplicate stack
+    # and had drifted to running completely unmetered.
+    outcome = _scan_one_candidate(candidate, cfg, push_wayback=args.push_wayback,
+                                  rate_limiter=_build_token_limiter(cfg))
+    failed = (f" ({outcome.pages_failed} failed/blocked fetches)"
+              if outcome.pages_failed else "")
+    print(f"Scanned {outcome.candidate_id}: {outcome.pages_scanned} pages{failed}, "
           f"{outcome.detections} classified "
           f"({outcome.positives} positive, {outcome.ambiguous} ambiguous), "
           f"{outcome.prefiltered} skipped by pre-filter, "
           f"{outcome.deduped} template-alias duplicates deduped, "
           f"{outcome.archived} archived.")
+    if outcome.put_ups or outcome.take_downs:
+        print(f"  Change events: {outcome.put_ups} put-up, "
+              f"{outcome.take_downs} take-down.")
     if outcome.positives or outcome.ambiguous:
         print("  Positives/ambiguous are archived and await human review before "
               "any publication (spec §3.7).")
@@ -735,7 +801,12 @@ def cmd_schedule(args, cfg) -> int:
           f"{' as of '+args.today if args.today else ''}:\n")
     for d in due:
         c = d.candidate
-        dtp = f"{d.days_to_primary}d to primary" if d.days_to_primary is not None else "no primary date"
+        if d.days_to_general is not None:
+            dtp = f"{d.days_to_general}d to general"
+        elif d.days_to_primary is not None:
+            dtp = f"{d.days_to_primary}d to primary"
+        else:
+            dtp = "no primary date"
         print(f"  [{d.cadence:6}] {c['name']} ({c['candidate_id']}) "
               f"{c.get('state')}-{c.get('district')} · {dtp} · {d.reason}")
     print("\nScan one:  python -m redbox scan --candidate <ID> --authorize")
@@ -785,15 +856,22 @@ def cmd_review(args, cfg) -> int:
 
     conn = init_db(cfg.database_path)
     if args.list or not args.detection:
+        # Latest review wins — the same convention as the web console and the
+        # publisher. (Joining ANY review row re-listed already-decided
+        # detections whose history was needs_more -> approve/reject.)
         pend = conn.execute(
             """SELECT d.detection_id, d.candidate_id, c.name, d.classification,
                       d.confidence, s.url, s.text_hash
                FROM detections d JOIN candidates c USING(candidate_id)
                JOIN scans s USING(scan_id)
-               LEFT JOIN reviews r ON r.detection_id=d.detection_id
+               LEFT JOIN (SELECT detection_id, action, ROW_NUMBER() OVER (
+                              PARTITION BY detection_id
+                              ORDER BY reviewed_at DESC, review_id DESC) rn
+                          FROM reviews) r
+                 ON r.detection_id = d.detection_id AND r.rn = 1
                WHERE d.classification IN ('red_box_guidance','ambiguous')
                  AND (r.action IS NULL OR r.action='needs_more')
-               GROUP BY d.detection_id ORDER BY d.confidence DESC""").fetchall()
+               ORDER BY d.confidence DESC""").fetchall()
         if not pend:
             print("No detections pending review.")
         else:
@@ -889,9 +967,14 @@ def cmd_publish(args, cfg) -> int:
     print(f"Built {mode} site → {index}")
     print(f"Open it:  open {index}")
     if args.serve:
-        import http.server, socketserver, functools, os
-        os.chdir(out)
-        handler = functools.partial(http.server.SimpleHTTPRequestHandler)
+        import functools
+        import http.server
+        import socketserver
+
+        # directory= instead of chdir: the old chdir leaked, breaking any
+        # longer-lived caller (tests, a wrapping process) after --serve.
+        handler = functools.partial(http.server.SimpleHTTPRequestHandler,
+                                    directory=str(out))
         with socketserver.TCPServer(("127.0.0.1", args.port), handler) as httpd:
             print(f"Serving at http://127.0.0.1:{args.port}/  (Ctrl-C to stop)")
             try:
@@ -982,21 +1065,48 @@ def cmd_backfill_pdf_evidence(args, cfg) -> int:
     return 0
 
 
-def _clean_stale_pages(site: "Path") -> list[str]:
+def _clean_stale_pages(site: "Path", site_url: str) -> list[str]:
     """Delete site *.html files absent from the freshly built sitemap.
 
     The sitemap lists extensionless clean URLs; map each back to its .html
-    file. Only .html is ever deleted: evidence/, feeds, index-data.json are
-    untouched, and 404.html is deliberately sitemap-absent but must survive
-    (its presence is what disables the Pages soft-200 SPA fallback).
+    file by stripping the configured site_url prefix (so http://, custom
+    ports, and path-prefixed deployments all resolve — a hardcoded origin
+    pattern once matched nothing for those and would have deleted every page
+    as "stale"). Only .html is ever deleted: evidence/, feeds,
+    index-data.json are untouched, and 404.html is deliberately
+    sitemap-absent but must survive (its presence is what disables the Pages
+    soft-200 SPA fallback).
+
+    Raises ValueError instead of sweeping when the sitemap is missing/empty
+    or the sweep would delete most of the site — both mean something is
+    wrong upstream, and mass-deleting the freshly built pages must never be
+    the failure mode.
     """
     import re
 
-    listed = set(re.findall(r"<loc>https://[^/<]+/([^<]*)</loc>",
-                            (site / "sitemap.xml").read_text()))
-    listed = {("index.html" if u == "" else u + ".html") for u in listed}
-    stale = sorted(p.name for p in site.glob("*.html")
-                   if p.name not in listed and p.name != "404.html")
+    sitemap = site / "sitemap.xml"
+    if not sitemap.exists():
+        raise ValueError("sitemap.xml missing from the fresh build — not sweeping")
+    base = site_url.rstrip("/")
+    listed = set()
+    for loc in re.findall(r"<loc>([^<]*)</loc>", sitemap.read_text()):
+        if loc == base:
+            rel = ""
+        elif loc.startswith(base + "/"):
+            rel = loc[len(base) + 1:]
+        else:
+            continue                     # foreign origin: not ours to map
+        listed.add("index.html" if rel == "" else rel + ".html")
+    if not listed:
+        raise ValueError(
+            f"sitemap.xml lists no pages under {base} — not sweeping "
+            "(check publish.site_url matches the built sitemap)")
+    pages = [p.name for p in site.glob("*.html") if p.name != "404.html"]
+    stale = sorted(n for n in pages if n not in listed)
+    if pages and len(stale) > max(10, len(pages) // 2):
+        raise ValueError(
+            f"sweep would delete {len(stale)} of {len(pages)} pages — refusing "
+            "(sitemap/site_url mismatch?)")
     for name in stale:
         (site / name).unlink()
     return stale
@@ -1033,7 +1143,11 @@ def cmd_deploy(args, cfg) -> int:
     build_site(conn, out, approved_only=True,
                page_size=pub_cfg.get("page_size", 500), site_url=site_url)
     conn.close()
-    stale = _clean_stale_pages(out)
+    try:
+        stale = _clean_stale_pages(out, site_url)
+    except ValueError as e:
+        print(f"Stale-page sweep aborted: {e}. Nothing deployed.")
+        return 1
     print(f"Built public site ({len(list(out.glob('*.html')))} pages); "
           f"removed {len(stale)} stale: {', '.join(stale) or 'none'}")
     if args.dry_run:
@@ -1074,6 +1188,12 @@ def cmd_vacuum(args, cfg) -> int:
     db_path = Path(cfg.database_path)
     before = db_path.stat().st_size if db_path.exists() else 0
     conn = init_db(db_path)
+    # Fresh databases no longer create the deprecated column at all.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(scans)")}
+    if "raw_html" not in cols:
+        print("No raw_html column (fresh schema) — nothing to reclaim.")
+        conn.close()
+        return 0
     row = conn.execute(
         "SELECT COUNT(*), COALESCE(SUM(LENGTH(raw_html)),0) FROM scans WHERE raw_html IS NOT NULL"
     ).fetchone()
@@ -1097,6 +1217,38 @@ def cmd_vacuum(args, cfg) -> int:
     return 0
 
 
+def cmd_backfill_changes(args, cfg) -> int:
+    """Replay scan history and insert change events the old diff logic dropped.
+
+    Offline and idempotent: reads only scans/detections already in the DB,
+    never refetches, and skips anything already recorded. Dry-run by default.
+    """
+    from .pipeline import backfill_change_events
+
+    conn = init_db(cfg.database_path)
+    result = backfill_change_events(conn, apply=args.apply)
+    names = {r["candidate_id"]: r["name"]
+             for r in conn.execute("SELECT candidate_id, name FROM candidates")}
+
+    def _show(events):
+        for ev in events:
+            print(f"  {ev['detected_at'][:10]}  {ev['event_type']:<9}  "
+                  f"{names.get(ev['candidate_id'], ev['candidate_id']):<28}  {ev['url']}")
+
+    missing, spurious = result["missing"], result["spurious"]
+    if missing:
+        print("Missing (the fixed rules would have recorded these):")
+        _show(missing)
+    if spurious:
+        print("Spurious (recorded from an error/blocked fetch, not a page change):")
+        _show(spurious)
+    verb = ("applied" if args.apply
+            else "found — re-run with --apply to insert/delete")
+    print(f"{len(missing)} missing, {len(spurious)} spurious change event(s) {verb}.")
+    conn.close()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="redbox", description="Red-Boxing Tracker")
     parser.add_argument("--config", default=None, help="path to config.yaml")
@@ -1104,7 +1256,15 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("initdb", help="create the database schema")
 
+    ff = sub.add_parser("fetch-fec",
+                        help="download the FEC bulk candidate file into data/ "
+                             "(keeps the old one as .old-YYYYMMDD)")
+    ff.add_argument("--cycle", type=int, default=None,
+                    help="election cycle, e.g. 2026 (default: config election_year)")
+
     d = sub.add_parser("discover", help="build the candidate universe (phase 1)")
+    d.add_argument("--fetch", action="store_true",
+                   help="first re-download the FEC bulk file (fetch-fec)")
     d.add_argument("--states", default=None, help="comma list, e.g. NC,TX (default: all)")
     d.add_argument("--offices", default="H,S,P", help="comma list of H,S,P")
     d.add_argument("--district", default=None, help="two-digit district, e.g. 12 (requires a single state)")
@@ -1152,6 +1312,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="also push positives to the Internet Archive")
     sa.add_argument("--rescan", action="store_true",
                     help="re-scan candidates already attempted (default: skip them)")
+    sa.add_argument("--due", action="store_true",
+                    help="limit to candidates due under the cadence rules "
+                         "(see `schedule`; re-scans them even if already attempted)")
 
     sub.add_parser("calendar", help="load per-state primary calendar (phase 7)")
 
@@ -1188,6 +1351,11 @@ def main(argv: list[str] | None = None) -> int:
     bf.add_argument("--force", action="store_true",
                     help="archive even if the PDF's text no longer matches the detection")
 
+    bc = sub.add_parser("backfill-changes",
+                        help="reconstruct put-up/take-down history the pre-fix diff missed")
+    bc.add_argument("--apply", action="store_true",
+                    help="insert the reconstructed events (default: dry-run listing)")
+
     dp = sub.add_parser("deploy",
                         help="test + publish --approved-only + stale-page sweep + Cloudflare Pages deploy")
     dp.add_argument("--dry-run", action="store_true",
@@ -1206,6 +1374,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "initdb":
         return cmd_initdb(args, cfg)
+    if args.command == "fetch-fec":
+        return cmd_fetch_fec(args, cfg)
     if args.command == "discover":
         return cmd_discover(args, cfg)
     if args.command == "mark-inactive":
@@ -1232,6 +1402,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_vacuum(args, cfg)
     if args.command == "backfill-pdf-evidence":
         return cmd_backfill_pdf_evidence(args, cfg)
+    if args.command == "backfill-changes":
+        return cmd_backfill_changes(args, cfg)
     if args.command == "publish":
         return cmd_publish(args, cfg)
     if args.command == "deploy":

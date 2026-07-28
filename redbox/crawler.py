@@ -22,6 +22,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from bs4 import BeautifulSoup
 
+from . import prefilter
 from .pdf import extract_pdf_text
 from .ratelimit import DomainRateLimiter
 from .robots import RobotsPolicy
@@ -41,6 +42,10 @@ class FetchResult:
     screenshot_png: bytes | None = None
     pdf_bytes: bytes | None = None   # raw document (pdf pages) for archiving
     discovered_via: str = ""
+    # 'respect' | 'override' — how robots.txt was applied to this fetch.
+    # Persisted on the scans row so collection of any page is auditable
+    # (ROBOTS_POLICY.md).
+    robots_posture: str | None = None
     fetched_at: str = field(default_factory=now_iso)
 
     @property
@@ -214,10 +219,9 @@ class Crawler:
         self.max_pages = max_pages
 
     # Paths fetched ahead of (and budgeted separately from) ordinary pages —
-    # red boxes live here.
-    _HIGH_VALUE = ("/media", "/media-kit", "/mediakit", "/press", "/messaging",
-                   "/newsroom", "/news", "/resources", "/toolkit", "/kit",
-                   "/supporter", "/comms")
+    # red boxes live here. Single source shared with the prefilter's
+    # always-classify list (prefilter.HIGH_VALUE_PATHS).
+    _HIGH_VALUE = prefilter.HIGH_VALUE_PATHS
 
     def _is_high_value(self, url: str) -> bool:
         u = url.lower()
@@ -246,6 +250,9 @@ class Crawler:
         """Candidate sitemap URLs: robots.txt Sitemap: directives + common names."""
         locs: list[str] = []
         try:
+            # Throttled like every other request to the host — enumeration
+            # used to fire 1 + N sitemap fetches with no delay at all.
+            self.rate.wait(base_url)
             r = httpx.get(urljoin(base_url, "/robots.txt"),
                           headers={"User-Agent": self.user_agent},
                           follow_redirects=True, timeout=15.0)
@@ -276,6 +283,7 @@ class Crawler:
 
     def _get_text(self, url: str) -> str | None:
         try:
+            self.rate.wait(url)
             r = httpx.get(url, headers={"User-Agent": self.user_agent},
                           follow_redirects=True, timeout=20.0)
             return r.text if r.status_code < 400 and r.text.strip() else None
@@ -337,19 +345,30 @@ class Crawler:
                   ".zip", ".gz", ".tar", ".dmg", ".exe", ".ics", ".xml", ".rss",
                   ".json", ".woff", ".woff2", ".ttf", ".eot")
 
-    def _extract_links(self, base_url: str, html: str) -> tuple[list[str], list[str]]:
+    def _extract_links(self, page_url: str, html: str, *,
+                       site_url: str | None = None) -> tuple[list[str], list[str]]:
         """Return (same-domain page links, same-domain PDF links) from rendered HTML.
 
-        Both pages AND PDFs must be same-domain: a campaign site often links to
-        off-domain documents (a Senator's .gov letter, a House committee PDF), and
-        fetching those would misattribute someone else's content to this candidate.
-        Asset links (images/media/feeds) are dropped — never page content.
+        Relative hrefs resolve against ``page_url`` — the page they appear on
+        (honoring a ``<base href>`` tag) — NOT the site seed: a bare
+        ``href="article-1"`` on ``/news/2026/`` means ``/news/2026/article-1``,
+        and resolving it against the seed produced site-root 404s that burned
+        page budget while the real pages were never crawled.
+
+        Both pages AND PDFs must be on ``site_url``'s domain (defaults to
+        ``page_url``): a campaign site often links to off-domain documents (a
+        Senator's .gov letter, a House committee PDF), and fetching those
+        would misattribute someone else's content to this candidate. Asset
+        links (images/media/feeds) are dropped — never page content.
         """
+        site_url = site_url or page_url
         soup = BeautifulSoup(html, "lxml")
+        base_tag = soup.find("base", href=True)
+        resolve_base = urljoin(page_url, base_tag["href"]) if base_tag else page_url
         pages, pdfs = [], []
         for a in soup.find_all("a", href=True):
-            href = urljoin(base_url, a["href"]).split("#")[0]
-            if not self._same_domain(base_url, href):
+            href = urljoin(resolve_base, a["href"]).split("#")[0]
+            if not self._same_domain(site_url, href):
                 continue
             path = urlparse(href).path.lower()
             if path.endswith(".pdf"):
@@ -357,7 +376,11 @@ class Crawler:
             elif path.endswith(self._ASSET_EXT):
                 continue
             else:
-                pages.append(href.rstrip("/") or href)
+                # Keep the site's own form (trailing slash included): dedup is
+                # _canonical()'s job, and stripping the slash here broke
+                # relative resolution on the fetched page ('article-1' on
+                # /news/2026 resolves to /news/article-1).
+                pages.append(href)
         return pages, pdfs
 
     # --- orchestration ----------------------------------------------
@@ -412,6 +435,7 @@ class Crawler:
             except Exception:
                 continue
             res.discovered_via = via
+            res.robots_posture = posture
             if high:
                 high_fetched += 1
             else:
@@ -421,7 +445,10 @@ class Crawler:
             # processes (and we want to release) this page, so we read res.html
             # while we still have it.
             if res.html and depth < self.crawl_depth:
-                pages, pdfs = self._extract_links(base_url, res.html)
+                # Resolve against the fetched page (post-redirect), keep the
+                # same-domain test anchored to the site seed.
+                pages, pdfs = self._extract_links(res.final_url or url, res.html,
+                                                  site_url=base_url)
                 pdf_links.update(pdfs)
                 # Enqueue high-value links first so they survive the cap.
                 for p in sorted(pages, key=lambda x: 0 if self._is_high_value(x) else 1):
@@ -439,14 +466,16 @@ class Crawler:
             if self._canonical(pdf) in visited:
                 continue
             visited.add(self._canonical(pdf))
-            allowed, _ = self.robots.can_fetch(pdf)
+            allowed, pdf_posture = self.robots.can_fetch(pdf)
             if not allowed:
                 continue
-            self.rate.wait(pdf)
+            # Same politeness as page fetches: honor the host's Crawl-delay.
+            self.rate.wait(pdf, self.robots.crawl_delay(pdf))
             try:
                 res = fetch_pdf(pdf, user_agent=self.user_agent)
             except Exception:
                 continue
             res.discovered_via = "pdf_link"
+            res.robots_posture = pdf_posture
             pdfs_fetched += 1
             yield res

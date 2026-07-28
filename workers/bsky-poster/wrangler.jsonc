@@ -14,6 +14,9 @@
   "vars": {
     "FEED_URL": "https://redboxwatch.org/feed.json",
     "BSKY_HANDLE": "redboxwatch.bsky.social",
-    "MAX_POSTS_PER_RUN": "5"
+    "MAX_POSTS_PER_RUN": "5",
+    // A wall of "new" items is a guid migration, not news — absorb without
+    // posting when more than this arrive at once (see tick()).
+    "FLOOD_LIMIT": "15"
   }
 }

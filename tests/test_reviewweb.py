@@ -578,3 +578,89 @@ def test_url_queue_excludes_inactive(tmp_path):
     conn.close()
     _, _, body = get(app, "/urls")
     assert "NOSITE, NORA" not in body.decode()
+
+
+# ---------------------------------------------------------------------------
+# Cross-origin protection + durable overrides file
+
+def _post_env(app, path, body, extra):
+    environ = {
+        "REQUEST_METHOD": "POST", "PATH_INFO": path, "QUERY_STRING": "",
+        "CONTENT_LENGTH": str(len(body)), "wsgi.input": io.BytesIO(body),
+    }
+    environ.update(extra)
+    captured = {}
+
+    def start_response(status, headers):
+        captured["status"] = status
+
+    b"".join(app(environ, start_response))
+    return captured["status"]
+
+
+def test_cross_origin_post_is_rejected(tmp_path):
+    # A malicious page in the reviewer's browser can fire a form POST at
+    # http://127.0.0.1:<port> without any preflight; loopback binding alone
+    # doesn't stop it from approving detections. Origin/Host must be local.
+    app, det_id = _app(tmp_path)
+    body = b"action=approve&reviewer=evil"
+    status = _post_env(app, f"/detection/{det_id}", body,
+                       {"HTTP_ORIGIN": "https://evil.example",
+                        "HTTP_HOST": "127.0.0.1:8001"})
+    assert status.startswith("403")
+    import sqlite3 as _sq
+    conn = _sq.connect(app.db_path)
+    assert conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0] == 0
+
+    # DNS rebinding: attacker hostname resolving to 127.0.0.1 still carries
+    # its own Host header — rejected too.
+    status = _post_env(app, f"/detection/{det_id}", body,
+                       {"HTTP_HOST": "evil.example"})
+    assert status.startswith("403")
+    assert conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0] == 0
+    conn.close()
+
+
+def test_same_origin_post_is_accepted(tmp_path):
+    app, det_id = _app(tmp_path)
+    body = b"action=approve&reviewer=me"
+    status = _post_env(app, f"/detection/{det_id}", body,
+                       {"HTTP_ORIGIN": "http://127.0.0.1:8001",
+                        "HTTP_HOST": "127.0.0.1:8001"})
+    assert status.startswith("303")
+    import sqlite3 as _sq
+    conn = _sq.connect(app.db_path)
+    assert conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0] == 1
+    conn.close()
+
+
+def test_overrides_write_is_atomic_and_locked(tmp_path):
+    # Concurrent triage POSTs must not lose entries (read-modify-write on a
+    # threading server), and no partial file may ever land on disk.
+    import threading as _t
+
+    from redbox.db import init_db as _init
+    from redbox.reviewweb import record_found_url
+
+    db = tmp_path / "db.sqlite"
+    conn = _init(db)
+    for i in range(8):
+        conn.execute("""INSERT INTO candidates (candidate_id,name,created_at,updated_at)
+            VALUES (?,?,'t','t')""", (f"H{i}", f"C{i}"))
+    conn.commit()
+    conn.close()
+    overrides = tmp_path / "websites.json"
+
+    def triage(i):
+        c = _init(db)
+        record_found_url(c, f"H{i}", f"https://c{i}.example",
+                         reviewer="t", overrides_path=overrides)
+        c.close()
+
+    threads = [_t.Thread(target=triage, args=(i,)) for i in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    import json as _json
+    data = _json.loads(overrides.read_text())
+    assert len(data) == 8                       # nobody's entry was lost
+    assert not list(tmp_path.glob("websites.json.*"))   # no temp litter

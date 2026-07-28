@@ -48,6 +48,17 @@ async function tick(env) {
   const posted = new Set(stored);
   // Feed is newest-first; post oldest-first so the timeline reads naturally.
   const fresh = items.filter((i) => i.id && !posted.has(i.id)).reverse();
+  // A feed guid-scheme change makes every item look new at once (it happened:
+  // cid/detection_id -> cid re-posted the whole backfill over a weekend).
+  // Genuine news arrives a few items at a time; a wall of "new" is a
+  // migration — absorb it into state without posting, like the bootstrap.
+  const floodLimit = Number(env.FLOOD_LIMIT || "15");
+  if (fresh.length > floodLimit) {
+    for (const i of fresh) posted.add(i.id);
+    await env.STATE.put("posted-ids", JSON.stringify([...posted]));
+    console.log(JSON.stringify({ event: "migration-absorbed", count: fresh.length }));
+    return { absorbed: fresh.length, posted: 0 };
+  }
   const toPost = fresh.slice(0, Number(env.MAX_POSTS_PER_RUN || "5"));
   if (!toPost.length) return { posted: 0, pending: 0 };
 
@@ -57,31 +68,43 @@ async function tick(env) {
   });
 
   let count = 0;
+  let failed = 0;
   for (const item of toPost) {
-    await xrpc("com.atproto.repo.createRecord", session.accessJwt, {
-      repo: session.did,
-      collection: "app.bsky.feed.post",
-      record: {
-        $type: "app.bsky.feed.post",
-        text: item.title,
-        createdAt: new Date().toISOString(),
-        langs: ["en"],
-        embed: {
-          $type: "app.bsky.embed.external",
-          external: {
-            uri: item.url,
-            title: item.title,
-            description: clip(item.content_text || ""),
+    try {
+      await xrpc("com.atproto.repo.createRecord", session.accessJwt, {
+        repo: session.did,
+        collection: "app.bsky.feed.post",
+        record: {
+          $type: "app.bsky.feed.post",
+          // Bluesky rejects >300 graphemes; an overlong candidate title must
+          // clip, not throw (one bad item used to wedge the poster on it
+          // every hour, blocking everything queued behind it).
+          text: clip(item.title || ""),
+          createdAt: new Date().toISOString(),
+          langs: ["en"],
+          embed: {
+            $type: "app.bsky.embed.external",
+            external: {
+              uri: item.url,
+              title: item.title,
+              description: clip(item.content_text || ""),
+            },
           },
         },
-      },
-    });
-    posted.add(item.id);
-    await env.STATE.put("posted-ids", JSON.stringify([...posted]));
-    count += 1;
-    console.log(JSON.stringify({ event: "posted", id: item.id, title: item.title }));
+      });
+      posted.add(item.id);
+      await env.STATE.put("posted-ids", JSON.stringify([...posted]));
+      count += 1;
+      console.log(JSON.stringify({ event: "posted", id: item.id, title: item.title }));
+    } catch (err) {
+      // Leave the item un-recorded (it stays pending for the next run) and
+      // keep going: one rejected post must not abort the rest of the batch.
+      failed += 1;
+      console.log(JSON.stringify({ event: "post-failed", id: item.id,
+                                   message: String(err) }));
+    }
   }
-  return { posted: count, pending: fresh.length - count };
+  return { posted: count, failed, pending: fresh.length - count };
 }
 
 async function xrpc(method, jwt, body) {

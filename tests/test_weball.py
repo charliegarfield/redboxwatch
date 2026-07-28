@@ -84,3 +84,77 @@ def test_discovery_groups_from_weball(tmp_path):
     # Two funded same-party NY-12 candidates -> contested primary.
     assert ids == {"H6NY12001", "H6NY12002"}
     assert all("contested_primary" in e.reasons for e in entries)
+
+
+def test_fetch_weball_installs_and_backs_up(tmp_path):
+    # Serve a zip via file:// and confirm: install, row-count guard, dated backup.
+    import zipfile
+
+    import pytest
+
+    from redbox.weball import fetch_weball
+
+    rows = "\n".join(
+        f"H6NY12{i:03d}|DOE, JANE {i}|C|1|DEM|99999.0|" + "0|" * 12 + "NY|12|" + "0|" * 8 + "0"
+        for i in range(1200))
+    zpath = tmp_path / "webl26.zip"
+    with zipfile.ZipFile(zpath, "w") as zf:
+        zf.writestr("webl26.txt", rows)
+    dest = tmp_path / "data" / "webl26.txt"
+    dest.parent.mkdir()
+    dest.write_text("H0OLD00000|STALE, SUE|C|1|DEM|1.0|" + "0|" * 12 + "NY|12|" + "0|" * 8 + "0")
+
+    info = fetch_weball(dest, cycle=2026, url=zpath.as_uri())
+    assert info["rows"] == 1200
+    assert "DOE, JANE 5" in dest.read_text()
+    backups = list(dest.parent.glob("webl26.txt.old-*"))
+    assert len(backups) == 1 and "STALE, SUE" in backups[0].read_text()
+
+    # A truncated download must never replace a working file.
+    with zipfile.ZipFile(zpath, "w") as zf:
+        zf.writestr("webl26.txt", "H6NY12001|DOE, JANE|C|1|DEM|9.0|" + "0|" * 12 + "NY|12|" + "0|" * 8 + "0")
+    with pytest.raises(RuntimeError, match="refusing to replace"):
+        fetch_weball(dest, cycle=2026, url=zpath.as_uri())
+    assert "DOE, JANE 5" in dest.read_text()   # unchanged
+
+
+def test_fetch_weball_sets_readable_perms_and_unique_backups(tmp_path, monkeypatch):
+    # mkstemp files are 0600 — a fetch under cron/another uid then breaks
+    # discover with PermissionError. And two fetches the same day must not
+    # clobber the first backup.
+    import io
+    import zipfile
+
+    from redbox import weball
+
+    rows = "|".join(["H0XX00001", "DOE, JANE", "C"] + [""] * 15 + ["XX", "01"])
+    lines = "\n".join(
+        "|".join([f"H0XX{i:05d}", f"DOE, JANE {i}", "C", "", "REP", "120000"]
+                 + [""] * 12 + ["XX", "01"]) for i in range(1200))
+
+    def fake_urlopen(req, timeout=0):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("webl26.txt", lines)
+        buf.seek(0)
+        return io.BytesIO(buf.read())
+
+    class _Ctx:
+        def __init__(self, data): self._d = data
+        def __enter__(self): return self._d
+        def __exit__(self, *a): return False
+
+    import urllib.request as _ur
+    monkeypatch.setattr(_ur, "urlopen",
+                        lambda req, timeout=0: _Ctx(fake_urlopen(req)))
+    dest = tmp_path / "webl26.txt"
+    r1 = weball.fetch_weball(dest, cycle=2026)
+    assert r1["rows"] == 1200
+    import stat
+    assert stat.S_IMODE(dest.stat().st_mode) == 0o644
+
+    r2 = weball.fetch_weball(dest, cycle=2026)
+    r3 = weball.fetch_weball(dest, cycle=2026)
+    backups = sorted(p.name for p in tmp_path.glob("webl26.txt.old-*"))
+    assert len(backups) == 2                    # same-day backups both kept
+    assert r2["backup"] != r3["backup"]

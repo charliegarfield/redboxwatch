@@ -55,14 +55,13 @@ CREATE TABLE IF NOT EXISTS scans (
     http_status   INTEGER,
     content_type  TEXT,                         -- text/html | application/pdf | ...
     render_mode   TEXT,                         -- http | browser | pdf
-    raw_html      TEXT,                         -- DEPRECATED: no longer populated.
-                                                -- Full HTML lives on disk via the
-                                                -- archiver (spec §3.4). Kept NULL on
-                                                -- new rows; `redbox vacuum` reclaims
-                                                -- it from legacy rows. ~98% of old DB.
+    -- (Legacy DBs may carry a deprecated raw_html column — never populated
+    -- anymore; full HTML lives on disk via the archiver (spec §3.4) and
+    -- `redbox vacuum` reclaims the old rows. Fresh DBs don't create it.)
     raw_text      TEXT,                         -- extracted text the classifier saw
     text_hash     TEXT NOT NULL,                -- sha256 of extracted text
-    discovered_via TEXT                         -- sitemap | common_path | link_crawl | pdf_link
+    discovered_via TEXT,                        -- sitemap | common_path | link_crawl | pdf_link
+    robots_posture TEXT                         -- respect | override (ROBOTS_POLICY audit)
 );
 CREATE INDEX IF NOT EXISTS idx_scans_candidate ON scans(candidate_id);
 CREATE INDEX IF NOT EXISTS idx_scans_url_hash ON scans(url, text_hash);
@@ -159,20 +158,9 @@ CREATE TABLE IF NOT EXISTS change_events (
 );
 CREATE INDEX IF NOT EXISTS idx_change_candidate ON change_events(candidate_id);
 
--- Published, approved records (spec §3.8)
-CREATE TABLE IF NOT EXISTS publications (
-    publication_id INTEGER PRIMARY KEY,
-    candidate_id   TEXT NOT NULL REFERENCES candidates(candidate_id),
-    detection_id   INTEGER REFERENCES detections(detection_id),
-    status         TEXT NOT NULL,               -- positive_approved | negative
-    label          TEXT NOT NULL,               -- exact §3.7a language
-    snapshot_url   TEXT,
-    evidence       TEXT,                         -- JSON
-    detection_date TEXT,
-    take_down_date TEXT,
-    published_at   TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_pub_candidate ON publications(candidate_id);
+-- NOTE: the spec §3.8 `publications` table was never used — publish state
+-- lives entirely in `reviews` (latest review wins) and the built site.
+-- Fresh databases no longer create it; legacy DBs keep the empty table.
 """
 
 
@@ -218,6 +206,12 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
         # Raw document preserved when the detection source was a PDF; the
         # screenshot_path then holds a rasterization of its pages.
         "pdf_path": "TEXT",
+    },
+    "scans": {
+        # 'respect' | 'override': how robots.txt was applied to this fetch.
+        # ROBOTS_POLICY.md promises every override-collected page is
+        # auditable; NULL on rows predating the column.
+        "robots_posture": "TEXT",
     },
 }
 

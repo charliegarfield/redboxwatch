@@ -53,14 +53,17 @@ must not be exposed off-machine.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
+import tempfile
+import threading
 from http.cookies import SimpleCookie
 from pathlib import Path
 from urllib.parse import parse_qs, quote, quote_plus, unquote, urlsplit
 
 from .db import connect, init_db
-from .publisher import AMBIGUOUS_LABEL, CSS, POSITIVE_LABEL, _h
+from .publisher import AMBIGUOUS_LABEL, CSS, POSITIVE_LABEL, _FONTS, _h
 from .util import now_iso
 from .website import OVERRIDES_PATH
 
@@ -179,27 +182,49 @@ def normalize_url(raw: str) -> str | None:
     return u
 
 
+# One lock for the read-modify-write on the overrides file: the console runs
+# a THREADING server, and two concurrent triage POSTs interleaving the
+# read/write lost the earlier reviewer's URL (last writer wins).
+_OVERRIDES_LOCK = threading.Lock()
+
+
 def record_found_url(conn: sqlite3.Connection, candidate_id: str, url: str, *,
                      reviewer: str | None = None,
                      overrides_path: Path = OVERRIDES_PATH) -> None:
     """A human found the candidate's site: store it as manual/VERIFIED and
     append it to the overrides file, the durable home for human-curated URLs
     (a re-resolve or a rebuilt DB re-reads it; DB-only edits would not survive
-    that). The DB write makes the candidate scannable immediately."""
+    that). The DB write makes the candidate scannable immediately.
+
+    The file write is locked (threading server) and atomic (temp file +
+    os.replace): a crash mid-write must never truncate the canonical
+    human-curated store."""
     ts = now_iso()
     conn.execute(
         """UPDATE candidates SET website_url=?, url_source='manual',
                url_verified=1, updated_at=? WHERE candidate_id=?""",
         (url, ts, candidate_id))
     conn.commit()
-    overrides = (json.loads(overrides_path.read_text())
-                 if overrides_path.exists() else {})
-    overrides[candidate_id] = {
-        "url": url, "verified": True,
-        "note": f"found by {reviewer or 'reviewer'} via review console {ts[:10]}",
-    }
-    overrides_path.parent.mkdir(parents=True, exist_ok=True)
-    overrides_path.write_text(json.dumps(overrides, indent=2) + "\n")
+    with _OVERRIDES_LOCK:
+        overrides = (json.loads(overrides_path.read_text())
+                     if overrides_path.exists() else {})
+        overrides[candidate_id] = {
+            "url": url, "verified": True,
+            "note": f"found by {reviewer or 'reviewer'} via review console {ts[:10]}",
+        }
+        overrides_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=overrides_path.parent,
+                                   prefix=overrides_path.name + ".")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(overrides, indent=2) + "\n")
+            os.replace(tmp, overrides_path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 def record_no_site(conn: sqlite3.Connection, candidate_id: str) -> None:
@@ -280,7 +305,7 @@ def _page(title: str, body: str) -> str:
     return f"""<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_h(title)} · Review Console · Red-Boxing Tracker</title>
-<link rel="stylesheet" href="/styles.css"></head><body>
+{_FONTS}<link rel="stylesheet" href="/styles.css"></head><body>
 <header class="site-head"><div class="wrap">
   <a class="brand" href="/">Red-Boxing&nbsp;Tracker · Review&nbsp;Console</a>
   <nav><a href="/">Queue</a> <a href="/urls">Site&nbsp;URLs</a></nav>
@@ -719,10 +744,29 @@ class ReviewApp:
         return [body]
 
     # -- routing -----------------------------------------------------------
+    _LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+
     def _route(self, environ, conn) -> tuple[str, list[tuple[str, str]], bytes]:
         method = environ.get("REQUEST_METHOD", "GET")
         path = environ.get("PATH_INFO", "/")
         qs = parse_qs(environ.get("QUERY_STRING", ""))
+
+        if method == "POST":
+            # Loopback binding doesn't stop a malicious page in the
+            # reviewer's browser from firing a cross-origin form POST at
+            # http://127.0.0.1:<port>/ (a "simple request" — no preflight) and
+            # approving detections, nor a DNS-rebound hostname from reaching
+            # us. Browsers always send Origin on cross-origin POSTs and Host
+            # on everything; both must point at loopback. Non-browser clients
+            # (tests, curl) send no Origin and are unaffected.
+            host = urlsplit("//" + (environ.get("HTTP_HOST") or "")).hostname
+            origin = environ.get("HTTP_ORIGIN")
+            ohost = urlsplit(origin).hostname if origin else None
+            if (host and host.lower() not in self._LOCAL_HOSTS) or \
+                    (ohost and ohost.lower() not in self._LOCAL_HOSTS):
+                return ("403 Forbidden",
+                        [("Content-Type", "text/plain; charset=utf-8")],
+                        b"cross-origin POSTs are not accepted")
 
         if path == "/styles.css":
             return "200 OK", [("Content-Type", "text/css; charset=utf-8")], \

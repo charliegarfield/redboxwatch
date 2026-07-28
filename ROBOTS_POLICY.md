@@ -19,9 +19,11 @@ statement about a real person, we do **not** silently ignore robots. Instead:
 - `config.yaml -> robots_policy.default: respect | override`
 - `config.local.yaml -> robots_policy.per_domain: { "example.com": override }`
   (per-domain overrides are deployment-specific decisions and live in the
-  untracked local config, not the public repo)
-- Every `override` fetch is recorded on the `scans` row and emitted to the run
-  log, so the basis for collecting any given page is auditable.
+  untracked local config, not the public repo). Host matching is normalized:
+  an override for `example.com` also covers `www.example.com`.
+- Every fetch records its posture (`respect` | `override`) in the
+  `scans.robots_posture` column, so the basis for collecting any given page
+  is auditable after the fact.
 
 ## Why this shape
 
@@ -51,8 +53,11 @@ add the host to `robots_policy.per_domain` (in the untracked
 - **A real browser context** (Playwright/Chromium) is used for rendering, not to
   disguise the crawler — JS-rendered and hidden/unlinked content is part of the
   detection target (§3.3).
-- Conditional re-fetch via stored `text_hash` to avoid re-pulling unchanged
-  pages.
+- **A `robots.txt` answering 5xx reads as temporarily-disallow** (the host is
+  under stress), not as open season; a 404 means no policy and allows.
+- Re-fetched pages whose stored `text_hash` is unchanged are not re-classified
+  or re-archived. (The page itself is still fetched — the crawler does not
+  currently send conditional requests such as `If-None-Match`.)
 
 ## What we never do
 

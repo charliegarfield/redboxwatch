@@ -441,3 +441,358 @@ def test_unchanged_hash_skips_reclassification(tmp_path):
     assert second.pages_scanned == 3         # but re-scans still recorded (diff history)
     assert conn.execute("SELECT COUNT(*) FROM scans").fetchone()[0] == 6
     conn.close()
+
+
+def test_take_down_recorded_after_unchanged_interim_scan(tmp_path):
+    # scan 1: red box detected; scan 2: page unchanged (hash-skip, so no
+    # detection row of its own); scan 3: box removed. The diff must resolve
+    # scan 2's classification through its text hash and still record the
+    # take-down — a scan_id-only lookup read the quiet re-scan as no-guidance
+    # and dropped the event entirely.
+    conn = init_db(tmp_path / "db.sqlite")
+    conn.execute("""INSERT INTO candidates (candidate_id,name,website_url,url_verified,
+        created_at,updated_at) VALUES ('H1','T','https://example.org',1,'t','t')""")
+    conn.commit()
+    candidate = dict(conn.execute("SELECT * FROM candidates").fetchone())
+    fetcher = MutableFetcher()
+    archiver = Archiver(tmp_path / "a", wayback=StubWayback(), push_wayback=False)
+    kw = Classifier(KeywordLLM())
+
+    o1 = scan_candidate(conn, candidate, crawler=_crawler_with(fetcher), classifier=kw, archiver=archiver)
+    assert o1.positives == 1
+    o2 = scan_candidate(conn, candidate, crawler=_crawler_with(fetcher), classifier=kw, archiver=archiver)
+    assert o2.detections == 0 and o2.changes == 0    # unchanged interim scan
+
+    fetcher.media_text = "Press kit: logos, headshots, bios, and media contact info."
+    o3 = scan_candidate(conn, candidate, crawler=_crawler_with(fetcher), classifier=kw, archiver=archiver)
+    assert o3.take_downs == 1 and o3.changes == 1
+    ev = conn.execute("SELECT * FROM change_events WHERE event_type='take_down'").fetchone()
+    assert ev["url"] == "https://example.org/media"
+    assert ev["prev_classification"] == "red_box_guidance"
+    assert ev["new_classification"] == "no_guidance_detected"
+    conn.close()
+
+
+def test_backfill_reconstructs_suppressed_take_down(tmp_path):
+    # A DB carrying the pre-fix damage: positive scan (with detection), quiet
+    # unchanged re-scan (no detection row), then the box gone — and NO change
+    # event recorded. The backfill must replay history and reconstruct exactly
+    # the take-down, dated from the revealing scan; a second run inserts nothing.
+    from redbox.pipeline import backfill_change_events
+
+    conn = init_db(tmp_path / "db.sqlite")
+    conn.execute("""INSERT INTO candidates (candidate_id,name,website_url,url_verified,
+        created_at,updated_at) VALUES ('H1','T','https://example.org',1,'t','t')""")
+
+    def scan(url, hash_, text, when, status=200):
+        return conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,
+            http_status,raw_text,text_hash) VALUES ('H1',?,?,?,?,?)""",
+            (url, when, status, text, hash_)).lastrowid
+
+    s1 = scan("https://example.org/media", "boxhash", "younger voters should see", "2026-07-01T00:00:00+00:00")
+    conn.execute("""INSERT INTO detections (scan_id,candidate_id,classification,
+        confidence,evidence,rationale,model,classified_at)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        (s1, "H1", "red_box_guidance", 0.9, "[]", "r", "m", "2026-07-01T00:00:00+00:00"))
+    scan("https://example.org/media", "boxhash", "younger voters should see", "2026-07-08T00:00:00+00:00")
+    scan("https://example.org/media", "cleanhash", "press kit and logos", "2026-07-15T00:00:00+00:00")
+    conn.commit()
+
+    dry = backfill_change_events(conn, apply=False)["missing"]
+    assert [(e["event_type"], e["url"]) for e in dry] == [
+        ("take_down", "https://example.org/media")]
+    assert dry[0]["prev_classification"] == "red_box_guidance"
+    assert dry[0]["detected_at"].startswith("2026-07-15")
+    assert conn.execute("SELECT COUNT(*) FROM change_events").fetchone()[0] == 0  # dry run
+
+    backfill_change_events(conn, apply=True)
+    assert conn.execute("SELECT COUNT(*) FROM change_events").fetchone()[0] == 1
+    again = backfill_change_events(conn, apply=True)            # idempotent
+    assert again["missing"] == [] and again["spurious"] == []
+    conn.close()
+
+
+def test_backfill_does_not_duplicate_pipeline_events(tmp_path):
+    # History where the live (fixed) pipeline already recorded the events:
+    # backfill must find nothing to add.
+    from redbox.pipeline import backfill_change_events
+
+    conn = init_db(tmp_path / "db.sqlite")
+    conn.execute("""INSERT INTO candidates (candidate_id,name,website_url,url_verified,
+        created_at,updated_at) VALUES ('H1','T','https://example.org',1,'t','t')""")
+    conn.commit()
+    candidate = dict(conn.execute("SELECT * FROM candidates").fetchone())
+    fetcher = MutableFetcher()
+    archiver = Archiver(tmp_path / "a", wayback=StubWayback(), push_wayback=False)
+    kw = Classifier(KeywordLLM())
+    scan_candidate(conn, candidate, crawler=_crawler_with(fetcher), classifier=kw, archiver=archiver)
+    fetcher.media_text = "Press kit: logos, headshots, bios, and media contact info."
+    scan_candidate(conn, candidate, crawler=_crawler_with(fetcher), classifier=kw, archiver=archiver)
+    assert conn.execute("SELECT COUNT(*) FROM change_events").fetchone()[0] == 1
+    result = backfill_change_events(conn, apply=True)
+    assert result["missing"] == [] and result["spurious"] == []
+    conn.close()
+
+
+# --- Transient fetch failures must not manufacture change events. ------------
+# A 403 bot-block, an HTTP 500, or a bot-challenge shell says nothing about
+# the page's content; only a usable scan (or a confirmed disappearance —
+# two consecutive 404s) may move a URL's recorded state.
+
+class ErrorableFetcher:
+    """A one-page site whose /media response (status, text) is scriptable."""
+
+    def __init__(self):
+        self.media = (200, "Younger voters should see ads on the go.")  # positive
+
+    def fetch(self, url, *, screenshot=True):
+        key = url.rstrip("/") or url
+        if key == "https://example.org":
+            return FetchResult(url=url, final_url=url, status=200,
+                               content_type="text/html", render_mode="browser",
+                               html='<a href="/media">m</a>', visible_text="home",
+                               dom_text="home", screenshot_png=b"PNG")
+        if key == "https://example.org/media":
+            status, text = self.media
+            return FetchResult(url=url, final_url=url, status=status,
+                               content_type="text/html", render_mode="browser",
+                               html="" if status >= 400 else "<p>x</p>",
+                               visible_text=text, dom_text=text,
+                               screenshot_png=b"PNG" if status < 400 else None)
+        return FetchResult(url=url, final_url=url, status=404, content_type="text/html",
+                           render_mode="browser", html="", visible_text="", dom_text="")
+
+
+def _seed_candidate(conn):
+    conn.execute("""INSERT INTO candidates (candidate_id,name,website_url,url_verified,
+        created_at,updated_at) VALUES ('H1','T','https://example.org',1,'t','t')""")
+    conn.commit()
+    return dict(conn.execute("SELECT * FROM candidates").fetchone())
+
+
+def _scan(conn, candidate, fetcher, tmp_path):
+    return scan_candidate(
+        conn, candidate, crawler=_crawler_with(fetcher),
+        classifier=Classifier(KeywordLLM()),
+        archiver=Archiver(tmp_path / "a", wayback=StubWayback(), push_wayback=False))
+
+
+def test_bot_block_after_positive_is_not_a_take_down(tmp_path):
+    # The exact shape observed live: box detected, then the site starts
+    # 403ing the crawler, then serves a bot-challenge shell. Neither is
+    # evidence the campaign removed anything — no event may be recorded.
+    conn = init_db(tmp_path / "db.sqlite")
+    candidate = _seed_candidate(conn)
+    fetcher = ErrorableFetcher()
+
+    o1 = _scan(conn, candidate, fetcher, tmp_path)
+    assert o1.positives == 1
+
+    fetcher.media = (403, "")
+    o2 = _scan(conn, candidate, fetcher, tmp_path)
+    assert o2.changes == 0 and o2.take_downs == 0
+
+    fetcher.media = (202, "Just a moment... Checking your browser before accessing.")
+    o3 = _scan(conn, candidate, fetcher, tmp_path)
+    assert o3.changes == 0 and o3.take_downs == 0
+
+    fetcher.media = (500, "")
+    o4 = _scan(conn, candidate, fetcher, tmp_path)
+    assert o4.changes == 0
+    assert conn.execute("SELECT COUNT(*) FROM change_events").fetchone()[0] == 0
+    conn.close()
+
+
+def test_challenge_page_with_200_is_not_usable(tmp_path):
+    # Some challenge shells return 200. The marker check catches short ones.
+    conn = init_db(tmp_path / "db.sqlite")
+    candidate = _seed_candidate(conn)
+    fetcher = ErrorableFetcher()
+    _scan(conn, candidate, fetcher, tmp_path)
+
+    fetcher.media = (200, "Verifying you are human. Enable JavaScript and cookies to continue.")
+    o2 = _scan(conn, candidate, fetcher, tmp_path)
+    assert o2.changes == 0 and o2.take_downs == 0
+    conn.close()
+
+
+def test_second_consecutive_404_confirms_take_down(tmp_path):
+    # A page absent (404) on one scan may be a CDN blip; absent on two
+    # consecutive scans is a confirmed disappearance and records the
+    # take_down, dated at the confirming scan, diffed against the last
+    # usable (positive) scan. A later resurrection with the box records a
+    # put_up against the take_down event, not the stale positive scan.
+    conn = init_db(tmp_path / "db.sqlite")
+    candidate = _seed_candidate(conn)
+    fetcher = ErrorableFetcher()
+
+    _scan(conn, candidate, fetcher, tmp_path)                    # positive
+    fetcher.media = (404, "")
+    o2 = _scan(conn, candidate, fetcher, tmp_path)               # first 404: no event
+    assert o2.changes == 0
+    o3 = _scan(conn, candidate, fetcher, tmp_path)               # second 404: confirmed
+    assert o3.take_downs == 1 and o3.changes == 1
+    ev = conn.execute("SELECT * FROM change_events WHERE event_type='take_down'").fetchone()
+    assert ev["url"] == "https://example.org/media"
+    assert ev["prev_classification"] == "red_box_guidance"
+
+    o4 = _scan(conn, candidate, fetcher, tmp_path)               # third 404: state already gone
+    assert o4.changes == 0
+
+    fetcher.media = (200, "Younger voters should see ads on the go.")
+    o5 = _scan(conn, candidate, fetcher, tmp_path)               # box back up
+    assert o5.put_ups == 1
+    ev = conn.execute("SELECT * FROM change_events WHERE event_type='put_up'").fetchone()
+    assert ev["prev_classification"] == "no_guidance_detected"
+    conn.close()
+
+
+def test_recovery_scan_diffs_against_last_usable_scan(tmp_path):
+    # positive -> 403 blip -> genuinely clean page: the take_down is recorded
+    # at the recovery scan, diffed against the last USABLE scan (the
+    # positive), not against the 403.
+    conn = init_db(tmp_path / "db.sqlite")
+    candidate = _seed_candidate(conn)
+    fetcher = ErrorableFetcher()
+
+    _scan(conn, candidate, fetcher, tmp_path)
+    fetcher.media = (403, "")
+    _scan(conn, candidate, fetcher, tmp_path)
+    fetcher.media = (200, "Press kit: logos, headshots, bios, and media contact info.")
+    o3 = _scan(conn, candidate, fetcher, tmp_path)
+    assert o3.take_downs == 1 and o3.changes == 1
+    ev = conn.execute("SELECT * FROM change_events").fetchone()
+    assert ev["event_type"] == "take_down"
+    assert ev["prev_classification"] == "red_box_guidance"
+    conn.close()
+
+
+def test_identical_content_after_blip_records_no_event(tmp_path):
+    # positive -> 403 blip -> same positive content again: nothing changed,
+    # so no 'modified' (or any) event may appear.
+    conn = init_db(tmp_path / "db.sqlite")
+    candidate = _seed_candidate(conn)
+    fetcher = ErrorableFetcher()
+
+    _scan(conn, candidate, fetcher, tmp_path)
+    fetcher.media = (403, "")
+    _scan(conn, candidate, fetcher, tmp_path)
+    fetcher.media = (200, "Younger voters should see ads on the go.")
+    o3 = _scan(conn, candidate, fetcher, tmp_path)
+    assert o3.changes == 0
+    assert conn.execute("SELECT COUNT(*) FROM change_events").fetchone()[0] == 0
+    conn.close()
+
+
+def test_put_up_not_recorded_from_error_baseline(tmp_path):
+    # First scan errored (500), second finds the box. The box may have been
+    # up all along — a first usable sighting is 'detected', not 'put_up'.
+    conn = init_db(tmp_path / "db.sqlite")
+    candidate = _seed_candidate(conn)
+    fetcher = ErrorableFetcher()
+
+    fetcher.media = (500, "")
+    _scan(conn, candidate, fetcher, tmp_path)
+    fetcher.media = (200, "Younger voters should see ads on the go.")
+    o2 = _scan(conn, candidate, fetcher, tmp_path)
+    assert o2.positives == 1            # detection still recorded and reviewable
+    assert o2.put_ups == 0 and o2.changes == 0
+    conn.close()
+
+
+def test_all_error_site_is_fetch_failed_not_scanned(tmp_path):
+    # A parked/expired domain 404ing every page must not publish as a dated
+    # clean negative: zero usable pages -> scan_status='fetch_failed'.
+    conn = init_db(tmp_path / "db.sqlite")
+    candidate = _seed_candidate(conn)
+
+    class AllErrorFetcher:
+        def fetch(self, url, *, screenshot=True):
+            return FetchResult(url=url, final_url=url, status=404,
+                               content_type="text/html", render_mode="browser",
+                               html="", visible_text="", dom_text="")
+
+    out = _scan(conn, candidate, AllErrorFetcher(), tmp_path)
+    assert out.pages_scanned == 0
+    assert out.pages_failed >= 1
+    st = conn.execute("SELECT scan_status FROM candidates WHERE candidate_id='H1'").fetchone()[0]
+    assert st == "fetch_failed"
+    conn.close()
+
+
+def test_backfill_reconciles_spurious_error_events(tmp_path):
+    # A DB carrying pre-fix damage of the opposite kind: events diffed
+    # against error scans (a false put_up/take_down pair observed live). The
+    # reconciliation must flag them as spurious and delete them on --apply.
+    from redbox.pipeline import backfill_change_events
+
+    conn = init_db(tmp_path / "db.sqlite")
+    conn.execute("""INSERT INTO candidates (candidate_id,name,website_url,url_verified,
+        created_at,updated_at) VALUES ('H1','T','https://example.org',1,'t','t')""")
+
+    def scan(hash_, text, when, status=200):
+        return conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,
+            http_status,raw_text,text_hash)
+            VALUES ('H1','https://example.org/media',?,?,?,?)""",
+            (when, status, text, hash_)).lastrowid
+
+    s1 = scan("e", "", "2026-07-09T00:00:00+00:00", status=500)
+    s2 = scan("boxhash", "younger voters should see", "2026-07-25T00:00:00+00:00")
+    conn.execute("""INSERT INTO detections (scan_id,candidate_id,classification,
+        confidence,evidence,rationale,model,classified_at)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        (s2, "H1", "red_box_guidance", 0.9, "[]", "r", "m", "2026-07-25T00:00:00+00:00"))
+    s3 = scan("e", "", "2026-07-27T00:00:00+00:00", status=403)
+    # The events the old logic recorded from those error scans:
+    conn.execute("""INSERT INTO change_events (candidate_id,url,event_type,prev_scan_id,
+        new_scan_id,prev_classification,new_classification,detected_at)
+        VALUES ('H1','https://example.org/media','put_up',?,?,
+                'no_guidance_detected','red_box_guidance','2026-07-25T00:00:00+00:00')""",
+        (s1, s2))
+    conn.execute("""INSERT INTO change_events (candidate_id,url,event_type,prev_scan_id,
+        new_scan_id,prev_classification,new_classification,detected_at)
+        VALUES ('H1','https://example.org/media','take_down',?,?,
+                'red_box_guidance','no_guidance_detected','2026-07-27T00:00:00+00:00')""",
+        (s2, s3))
+    conn.commit()
+
+    dry = backfill_change_events(conn, apply=False)
+    assert dry["missing"] == []
+    assert sorted(e["event_type"] for e in dry["spurious"]) == ["put_up", "take_down"]
+    assert conn.execute("SELECT COUNT(*) FROM change_events").fetchone()[0] == 2  # dry
+
+    backfill_change_events(conn, apply=True)
+    assert conn.execute("SELECT COUNT(*) FROM change_events").fetchone()[0] == 0
+    again = backfill_change_events(conn, apply=True)
+    assert again["missing"] == [] and again["spurious"] == []
+    conn.close()
+
+
+def test_prev_scan_matches_across_url_forms(tmp_path):
+    # Sitemap order / redirects drift the stored URL form between scans
+    # (www vs apex, trailing slash). The diff baseline must treat them as
+    # one page — an exact-match lookup silently dropped take-down events.
+    from redbox.pipeline import _prev_scan
+
+    conn = init_db(tmp_path / "db.sqlite")
+    conn.execute("""INSERT INTO candidates (candidate_id,name,website_url,url_verified,
+        created_at,updated_at) VALUES ('H1','T','https://x.com',1,'t','t')""")
+    conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,http_status,
+        raw_text,text_hash) VALUES ('H1','https://www.x.com/media','t',200,'b','h1')""")
+    conn.commit()
+    for form in ("https://x.com/media", "https://x.com/media/",
+                 "http://www.x.com/media/", "https://www.x.com/media"):
+        prev = _prev_scan(conn, "H1", form)
+        assert prev is not None and prev["text_hash"] == "h1", form
+    assert _prev_scan(conn, "H1", "https://x.com/press") is None
+
+
+def test_scans_record_robots_posture(tmp_path):
+    # ROBOTS_POLICY.md: every fetch's robots posture is auditable on its
+    # scans row.
+    conn = init_db(tmp_path / "db.sqlite")
+    candidate = _seed_candidate(conn)
+    _scan(conn, candidate, ErrorableFetcher(), tmp_path)
+    postures = {r[0] for r in conn.execute("SELECT robots_posture FROM scans")}
+    assert postures == {"respect"}
+    conn.close()

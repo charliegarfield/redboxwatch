@@ -96,3 +96,40 @@ def test_persists_corroboration_row(tmp_path):
     assert row["supporting_total"] == 9384881
     assert row["ie_filing_count"] == 1
     assert "STAND FOR NEW YORK PAC" in row["spender_list"]
+
+
+def test_rejected_detection_does_not_date_corroboration(tmp_path):
+    # A detection whose latest review is 'reject' must not set
+    # guidance_first_detected (the published timeline anchor) nor keep the
+    # candidate in the corroborate-all set. Review history is append-only and
+    # latest wins: needs_more -> reject counts as rejected, and a later
+    # un-rejected detection re-anchors the date.
+    from redbox.corroboration import candidates_with_positive
+
+    conn = init_db(tmp_path / "db.sqlite")
+    _seed_candidate_with_detection(conn, detected="2026-05-20T00:00:00+00:00")
+    det = conn.execute("SELECT detection_id FROM detections").fetchone()[0]
+    conn.execute("""INSERT INTO reviews (detection_id,reviewer,action,reviewed_at)
+        VALUES (?,?,?,?)""", (det, "t", "needs_more", "2026-05-21T00:00:00+00:00"))
+    conn.execute("""INSERT INTO reviews (detection_id,reviewer,action,reviewed_at)
+        VALUES (?,?,?,?)""", (det, "t", "reject", "2026-05-22T00:00:00+00:00"))
+    conn.commit()
+
+    assert candidates_with_positive(conn) == []
+    corr = compute(conn, "H1", cycle=2026)
+    assert corr.guidance_first_detected is None
+    assert corr.detection_id is None
+
+    # A later, un-rejected detection anchors the date at ITS timestamp, not
+    # the rejected one's.
+    cur = conn.execute(
+        "INSERT INTO scans (candidate_id,url,fetched_at,text_hash) VALUES (?,?,?,?)",
+        ("H1", "https://x/media", "2026-06-01T00:00:00+00:00", "h2"))
+    conn.execute("""INSERT INTO detections (scan_id,candidate_id,classification,confidence,
+        evidence,model,classified_at) VALUES (?,?,?,?,?,?,?)""",
+        (cur.lastrowid, "H1", "red_box_guidance", 0.9, "[]", "m",
+         "2026-06-01T00:00:00+00:00"))
+    conn.commit()
+    assert candidates_with_positive(conn) == ["H1"]
+    corr = compute(conn, "H1", cycle=2026)
+    assert corr.guidance_first_detected == "2026-06-01T00:00:00+00:00"

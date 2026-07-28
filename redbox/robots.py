@@ -22,13 +22,23 @@ class RobotsPolicy:
         timeout: float = 15.0,
     ) -> None:
         self.default = default
-        self.per_domain = {k.lower(): v for k, v in (per_domain or {}).items()}
+        # Keys AND values normalized: an operator writing `example.com:
+        # Override` means the site whose candidates resolve to
+        # www.example.com too — an exact-netloc lookup made the deliberate,
+        # logged override a silent no-op for www/port/case variants.
+        self.per_domain = {self._norm_host(k): (v or "").strip().lower()
+                           for k, v in (per_domain or {}).items()}
         self.user_agent = user_agent
         self.timeout = timeout
         self._cache: dict[str, RobotFileParser | None] = {}
 
+    @staticmethod
+    def _norm_host(host: str) -> str:
+        h = (host or "").strip().lower().split(":", 1)[0]
+        return h[4:] if h.startswith("www.") else h
+
     def posture_for(self, domain: str) -> str:
-        return self.per_domain.get(domain.lower(), self.default)
+        return self.per_domain.get(self._norm_host(domain), self.default)
 
     def _parser(self, scheme: str, domain: str) -> RobotFileParser | None:
         if domain in self._cache:
@@ -40,7 +50,13 @@ class RobotsPolicy:
                 url, timeout=self.timeout, headers={"User-Agent": self.user_agent},
                 follow_redirects=True,
             )
-            if resp.status_code >= 400:
+            if resp.status_code >= 500:
+                # Host under stress: standard crawler practice is temporarily
+                # disallow, not open season. Cached for the process lifetime,
+                # so the site reads robots_blocked this run and is retried on
+                # the next (`scan-all --rescan` also re-attempts it).
+                rp.parse(["User-agent: *", "Disallow: /"])
+            elif resp.status_code >= 400:
                 rp = None  # no robots.txt -> allow
             else:
                 rp.parse(resp.text.splitlines())

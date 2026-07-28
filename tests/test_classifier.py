@@ -170,7 +170,7 @@ def test_routes_to_review_for_positive_and_ambiguous():
     assert neg.routes_to_review is False
 
 
-def test_router_dispatches_by_prefix_and_strips_for_anthropic():
+def test_router_passes_full_model_name_to_every_backend():
     from redbox.classifier import RouterLLM
 
     fw = FakeLLM(lambda t, m: _result("no_guidance_detected", 0.95))
@@ -182,7 +182,36 @@ def test_router_dispatches_by_prefix_and_strips_for_anthropic():
 
     router.classify_chunk("y", model="claude-haiku-4-5")       # unprefixed -> anthropic
     router.classify_chunk("z", model="anthropic/claude-haiku-4-5")
-    assert [m for m, _ in an.calls] == ["claude-haiku-4-5", "claude-haiku-4-5"]  # bare
+    # Full config-aligned names reach the backend — stripping here broke
+    # token metering (buckets are keyed by config strings); each backend
+    # strips the prefix itself for the wire.
+    assert [m for m, _ in an.calls] == ["claude-haiku-4-5", "anthropic/claude-haiku-4-5"]
+
+
+def test_anthropic_llm_meters_config_name_and_strips_prefix_for_wire():
+    from redbox.classifier import AnthropicLLM
+
+    metered = []
+
+    class Limiter:
+        def acquire(self, n, *, model=None):
+            metered.append(model)
+
+    llm = AnthropicLLM("test-key", rate_limiter=Limiter())
+    sent = {}
+
+    class _Blk:
+        type = "text"
+        text = ('{"classification":"no_guidance_detected","confidence":0.9,'
+                '"evidence":[],"rationale":"r"}')
+
+    class _Resp:
+        content = [_Blk()]
+
+    llm._client.messages.create = lambda **kw: (sent.update(kw), _Resp())[1]
+    llm.classify_chunk("some page text", model="anthropic/claude-haiku-4-5")
+    assert metered == ["anthropic/claude-haiku-4-5"]   # bucket key = config string
+    assert sent["model"] == "claude-haiku-4-5"         # bare name on the wire
 
 
 def test_router_missing_backend_raises():

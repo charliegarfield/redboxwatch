@@ -95,10 +95,14 @@ class PerModelTokenRateLimiter:
             bucket.acquire(n)
 
 
-def estimate_input_tokens(text: str, *, prompt_tokens: int = 700) -> int:
+def estimate_input_tokens(text: str, *, prompt_tokens: int = 700,
+                          chars: int | None = None) -> int:
     """Rough input-token estimate for one classification call.
 
     ~4 chars/token for English; add the fixed system-prompt cost. Intentionally
     a mild over-estimate so the limiter errs toward staying under the ceiling.
+    Pass ``chars`` to estimate from a length alone (the cost preflight used to
+    allocate a multi-megabyte throwaway string for this).
     """
-    return int(len(text or "") / 4) + prompt_tokens
+    n = chars if chars is not None else len(text or "")
+    return int(n / 4) + prompt_tokens

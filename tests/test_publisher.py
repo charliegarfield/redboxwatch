@@ -15,9 +15,9 @@ def _seed_universe(conn, n, *, with_detection=0):
             (cid, f"CAND {i:04d}", "H", "NY", f"{i % 27:02d}", "DEM", 2026,
              "contested_primary", "https://example.org", 0, 100000 + i, "t", "t"))
         if i < with_detection:
-            cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash)
-                VALUES (?,?,?,?)""", (cid, "https://example.org/media",
-                                      "2026-05-29T00:00:00+00:00", f"h{i}"))
+            cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,
+                text_hash,http_status,raw_text) VALUES (?,?,?,?,200,'page body')""",
+                (cid, "https://example.org/media", "2026-05-29T00:00:00+00:00", f"h{i}"))
             sid = cur.lastrowid
             conn.execute("""INSERT INTO detections (scan_id,candidate_id,classification,
                 confidence,evidence,rationale,model,classified_at)
@@ -32,8 +32,10 @@ def _seed(conn, classification="red_box_guidance"):
         party,cycle,universe_reason,website_url,url_verified,receipts,created_at,updated_at)
         VALUES ('H1','TEST CANDIDATE','H','NY','12','DEM',2026,'contested_primary',
                 'https://example.org',1,2000000,'t','t')""")
-    cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash)
-        VALUES ('H1','https://example.org/media','2026-05-29T00:00:00+00:00','abc')""")
+    cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash,
+        http_status,raw_text)
+        VALUES ('H1','https://example.org/media','2026-05-29T00:00:00+00:00','abc',
+                200,'page body')""")
     sid = cur.lastrowid
     cur = conn.execute("""INSERT INTO detections (scan_id,candidate_id,classification,
         confidence,evidence,rationale,model,classified_at)
@@ -75,7 +77,7 @@ def test_approved_positive_becomes_published_finding(tmp_path):
     assert "FINDING" in index
     # approved-only public build includes it
     out2 = build_site(conn, tmp_path / "site2", approved_only=True)
-    assert "TEST CANDIDATE" in (out2 / "index.html").read_text()
+    assert "Test Candidate" in (out2 / "index.html").read_text()
     conn.close()
 
 
@@ -321,6 +323,64 @@ def test_public_build_emits_finding_feeds(tmp_path):
     conn.close()
 
 
+def test_new_exhibit_reannounces_feed_item(tmp_path):
+    # Approving a second distinct box on an already-published candidate must
+    # change the item's guid (feed readers re-announce it), bump its date,
+    # count exhibits in the title, and showcase the NEWEST exhibit's page.
+    import json as _json
+    conn = init_db(tmp_path / "db.sqlite")
+    det_id = _seed(conn)
+    conn.execute("""INSERT INTO reviews (detection_id,reviewer,action,reviewed_at)
+                    VALUES (?,?,?,?)""", (det_id, "editor", "approve", "2026-05-30T00:00:00+00:00"))
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True,
+                     site_url="https://redboxwatch.org/")
+    first = _json.loads((out / "feed.json").read_text())["items"][0]
+
+    cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash,
+        http_status,raw_text)
+        VALUES ('H1','https://example.org/update.pdf','2026-06-10T00:00:00+00:00','def',
+                200,'page body')""")
+    cur = conn.execute("""INSERT INTO detections (scan_id,candidate_id,classification,
+        confidence,evidence,rationale,model,classified_at)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        (cur.lastrowid, 'H1', 'red_box_guidance', 0.9,
+         '[{"quote":"suburban voters need to read","why":"directive"}]',
+         'update box', 'claude-haiku-4-5', '2026-06-10T00:00:00+00:00'))
+    conn.execute("""INSERT INTO reviews (detection_id,reviewer,action,reviewed_at)
+                    VALUES (?,?,?,?)""", (cur.lastrowid, "editor", "approve", "2026-06-11T00:00:00+00:00"))
+    conn.commit()
+    out2 = build_site(conn, tmp_path / "site2", approved_only=True,
+                      site_url="https://redboxwatch.org/")
+    second = _json.loads((out2 / "feed.json").read_text())["items"][0]
+
+    assert second["id"] != first["id"]                      # re-announces
+    assert "(2 exhibits)" in second["title"]
+    assert second["date_published"].startswith("2026-06-11")
+    assert "update.pdf" in second["content_text"]           # newest showcased
+    assert "suburban voters need to read" in second["content_text"]
+    # A re-detection of the SAME box (same URL/body, new detection_id) must
+    # NOT change the guid — that was the point of dropping detid from it.
+    cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash,
+        http_status,raw_text)
+        VALUES ('H1','https://example.org/update.pdf','2026-06-20T00:00:00+00:00','def',
+                200,'page body')""")
+    cur = conn.execute("""INSERT INTO detections (scan_id,candidate_id,classification,
+        confidence,evidence,rationale,model,classified_at)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        (cur.lastrowid, 'H1', 'red_box_guidance', 0.92,
+         '[{"quote":"suburban voters need to read","why":"directive"}]',
+         'same box re-detected', 'claude-haiku-4-5', '2026-06-20T00:00:00+00:00'))
+    conn.execute("""INSERT INTO reviews (detection_id,reviewer,action,reviewed_at)
+                    VALUES (?,?,?,?)""", (cur.lastrowid, "editor", "approve", "2026-06-21T00:00:00+00:00"))
+    conn.commit()
+    out3 = build_site(conn, tmp_path / "site3", approved_only=True,
+                      site_url="https://redboxwatch.org/")
+    third = _json.loads((out3 / "feed.json").read_text())["items"][0]
+    assert third["id"] == second["id"]
+    conn.close()
+
+
 def test_negative_and_review_builds_have_no_feed_items(tmp_path):
     # A dated negative is not a "new finding"; review builds emit no feeds.
     import json as _json
@@ -397,8 +457,10 @@ def test_inactive_candidate_with_approved_finding_stays_published(tmp_path):
         created_at,updated_at)
         VALUES ('H4','RETIRED, RITA','H','CA','26','DEM',2026,'contested_general',
                 'https://rita.example',1,900000,1,'t','t')""")
-    cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash,raw_text)
-        VALUES ('H4','https://rita.example/media','2026-07-01T00:00:00+00:00','th','txt')""")
+    cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash,
+        http_status,raw_text)
+        VALUES ('H4','https://rita.example/media','2026-07-01T00:00:00+00:00','th',
+                200,'txt')""")
     cur = conn.execute("""INSERT INTO detections (scan_id,candidate_id,classification,
         confidence,evidence,rationale,model,classified_at)
         VALUES (?,?,?,?,?,?,?,?)""",
@@ -429,8 +491,10 @@ def test_approved_ambiguous_publishes_with_confirmed_label(tmp_path):
         created_at,updated_at)
         VALUES ('H5','CONFIRMED, CARLA','H','MI','00','DEM',2026,'contested_general',
                 'https://carla.example',1,500000,'t','t')""")
-    cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash,raw_text)
-        VALUES ('H5','https://carla.example/media','2026-07-01T00:00:00+00:00','th','txt')""")
+    cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash,
+        http_status,raw_text)
+        VALUES ('H5','https://carla.example/media','2026-07-01T00:00:00+00:00','th',
+                200,'txt')""")
     cur = conn.execute("""INSERT INTO detections (scan_id,candidate_id,classification,
         confidence,evidence,rationale,model,classified_at)
         VALUES (?,?,?,?,?,?,?,?)""",
@@ -462,8 +526,9 @@ def test_index_default_sort_is_aligned_ie_first(tmp_path):
             created_at,updated_at)
             VALUES (?,?,?,?,?,?,2026,'contested_primary','https://x.example',1,
                     100000,'t','t')""", (cid, name, "H", "NY", "01", "DEM"))
-        cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash)
-            VALUES (?,?,?,?)""", (cid, "https://x.example/media", "t", "h" + cid))
+        cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash,
+            http_status,raw_text) VALUES (?,?,?,?,200,'page body')""",
+            (cid, "https://x.example/media", "t", "h" + cid))
         cls = "red_box_guidance" if finding else "no_guidance_detected"
         cur = conn.execute("""INSERT INTO detections (scan_id,candidate_id,
             classification,confidence,evidence,rationale,model,classified_at)
@@ -488,3 +553,496 @@ def test_index_default_sort_is_aligned_ie_first(tmp_path):
     order = sorted(["BIG IE, BELLA", "SMALL IE, SAM", "NO IE, NORA", "NEGATIVE, NED"],
                    key=index.find)
     assert order == ["BIG IE, BELLA", "SMALL IE, SAM", "NO IE, NORA", "NEGATIVE, NED"]
+
+
+# ---------------------------------------------------------------------------
+# Detection lifecycle: re-detections, removals, and multiple red boxes.
+
+def _add_scan_det(conn, cid, url, text_hash, cls="red_box_guidance", conf=0.9,
+                  evidence="[]", fetched="2026-06-01T00:00:00+00:00"):
+    cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash,
+        http_status,raw_text) VALUES (?,?,?,?,200,'page body')""",
+        (cid, url, fetched, text_hash))
+    cur = conn.execute("""INSERT INTO detections (scan_id,candidate_id,classification,
+        confidence,evidence,rationale,model,classified_at)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        (cur.lastrowid, cid, cls, conf, evidence, "r", "m", fetched))
+    return cur.lastrowid
+
+
+def _review(conn, det_id, action):
+    conn.execute("""INSERT INTO reviews (detection_id,reviewer,action,reviewed_at)
+        VALUES (?,?,?,?)""", (det_id, "editor", action, "2026-06-02T00:00:00+00:00"))
+
+
+def test_approved_finding_survives_unreviewed_redetection(tmp_path):
+    # The same red box re-detected after a page tweak (new hash, higher
+    # confidence, unreviewed) must NOT displace the approved detection: the
+    # candidate stays a published finding — not demoted to pending and dropped
+    # from the --approved-only build — and the page shows one exhibit, not two.
+    conn = init_db(tmp_path / "db.sqlite")
+    det_id = _seed(conn)                              # approved box on /media
+    _review(conn, det_id, "approve")
+    _add_scan_det(conn, "H1", "https://example.org/media", "def", conf=0.99,
+                  fetched="2026-06-10T00:00:00+00:00")   # re-detection, pending
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True)
+    cand = (out / "H1.html").read_text()
+    assert "FINDING" in (out / "index.html").read_text()
+    assert "pending human review" not in cand.lower()
+    assert cand.count('<section class="detection">') == 1
+    conn.close()
+
+
+def test_rejected_top_does_not_bury_approved_finding(tmp_path):
+    # Reviewer rejects the higher-confidence flag on one page but approves a
+    # real box on another: the approved finding must publish (the old ranking
+    # picked the rejected detection and dropped the candidate entirely).
+    conn = init_db(tmp_path / "db.sqlite")
+    conn.execute("""INSERT INTO candidates (candidate_id,name,office,state,district,
+        party,cycle,universe_reason,website_url,url_verified,receipts,created_at,updated_at)
+        VALUES ('H1','TEST CANDIDATE','H','NY','12','DEM',2026,'contested_primary',
+                'https://example.org',1,2000000,'t','t')""")
+    false_pos = _add_scan_det(conn, "H1", "https://example.org/about", "a1", conf=0.99)
+    real = _add_scan_det(conn, "H1", "https://example.org/media", "b1", conf=0.70,
+                         evidence='[{"quote":"suburban women should hear","why":"directive"}]')
+    _review(conn, false_pos, "reject")
+    _review(conn, real, "approve")
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True)
+    cand = (out / "H1.html").read_text()
+    assert "Test Candidate" in (out / "index.html").read_text()
+    assert "suburban women should hear" in cand
+    assert "example.org/media" in cand
+    assert "example.org/about" not in cand            # rejected flag stays out
+    conn.close()
+
+
+def test_two_page_findings_render_both_exhibits(tmp_path):
+    # Genuinely distinct red boxes on two pages: both approved detections render
+    # as separate exhibits with their own evidence; the feed still carries one
+    # item per candidate.
+    conn = init_db(tmp_path / "db.sqlite")
+    a = _seed(conn)                                   # /media, quote about younger voters
+    b = _add_scan_det(conn, "H1", "https://example.org/priorities", "p1", conf=0.85,
+                      evidence='[{"quote":"veterans in the district should know","why":"directive"}]')
+    _review(conn, a, "approve")
+    _review(conn, b, "approve")
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True,
+                     site_url="https://redboxwatch.org/")
+    cand = (out / "H1.html").read_text()
+    assert cand.count('<section class="detection">') == 2
+    assert "younger voters should see" in cand
+    assert "veterans in the district should know" in cand
+    assert "Additional page with guidance" in cand
+    assert (out / "feed.xml").read_text().count("<item>") == 1
+    conn.close()
+
+
+def test_public_build_never_renders_pending_second_exhibit(tmp_path):
+    # Candidate has an approved box on one page and an unreviewed flag on
+    # another: the public build shows only the approved exhibit — a pending
+    # detection is an unpublished allegation even on a published page.
+    conn = init_db(tmp_path / "db.sqlite")
+    a = _seed(conn)
+    _add_scan_det(conn, "H1", "https://example.org/newpage", "n1", conf=0.9,
+                  evidence='[{"quote":"NOT YET REVIEWED SPAN","why":"w"}]')
+    _review(conn, a, "approve")
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True)
+    cand = (out / "H1.html").read_text()
+    assert cand.count('<section class="detection">') == 1
+    assert "NOT YET REVIEWED SPAN" not in cand
+    # ...but the review build shows it, marked as pending.
+    out2 = build_site(conn, tmp_path / "site2")
+    cand2 = (out2 / "H1.html").read_text()
+    assert cand2.count('<section class="detection">') == 2
+    assert "NOT YET REVIEWED SPAN" in cand2
+    assert "pending human review" in cand2.lower()
+    conn.close()
+
+
+def test_removed_guidance_gets_dated_note_and_past_tense(tmp_path):
+    # "Used to have a red box, now doesn't": the finding stays on the ledger,
+    # but the page discloses the removal with the last-checked date and the
+    # meta description shifts to past tense.
+    conn = init_db(tmp_path / "db.sqlite")
+    det_id = _seed(conn)
+    _review(conn, det_id, "approve")
+    # Later re-scan of the same page: guidance gone.
+    _add_scan_det(conn, "H1", "https://example.org/media", "gone1",
+                  cls="no_guidance_detected", conf=0.2,
+                  fetched="2026-06-15T00:00:00+00:00")
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True,
+                     site_url="https://redboxwatch.org/")
+    cand = (out / "H1.html").read_text()
+    assert "FINDING" in (out / "index.html").read_text()   # ledger keeps it
+    assert "No longer present." in cand
+    assert "June 15, 2026" in cand
+    assert "carried a red box" in cand                     # past-tense meta desc
+    assert "carries a red box" not in cand
+    assert "The guidance has since been removed." in cand
+    conn.close()
+
+
+def test_still_live_guidance_has_no_removal_note(tmp_path):
+    conn = init_db(tmp_path / "db.sqlite")
+    det_id = _seed(conn)
+    _review(conn, det_id, "approve")
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True,
+                     site_url="https://redboxwatch.org/")
+    cand = (out / "H1.html").read_text()
+    assert "No longer present." not in cand
+    assert "carries a red box" in cand
+    conn.close()
+
+
+def test_feed_guid_is_stable_per_candidate(tmp_path):
+    # The feed guid must not embed the detection id: a re-approved re-detection
+    # of the SAME box (same URL/body, fresh detection row) must not change it,
+    # or feed readers would announce the same finding twice. A genuinely NEW
+    # exhibit SHOULD change it — test_new_exhibit_reannounces_feed_item.
+    import re as _re
+    conn = init_db(tmp_path / "db.sqlite")
+    det_id = _seed(conn)
+    _review(conn, det_id, "approve")
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True,
+                     site_url="https://redboxwatch.org/")
+    guid = lambda p: _re.search(r'<guid isPermaLink="false">([^<]+)</guid>',
+                                (p / "feed.xml").read_text()).group(1)
+    first = guid(out)
+    assert first.startswith("H1")
+    re_det = _add_scan_det(conn, "H1", "https://example.org/media", "abc",
+                           evidence='[{"quote":"younger voters should see","why":"directive"}]')
+    _review(conn, re_det, "approve")
+    conn.commit()
+    out2 = build_site(conn, tmp_path / "site2", approved_only=True,
+                      site_url="https://redboxwatch.org/")
+    assert guid(out2) == first
+    conn.close()
+
+
+def test_alias_urls_collapse_to_one_exhibit(tmp_path):
+    # Catch-all routes serving the SAME body under several URLs (re-detected
+    # across separate scan runs, so the pipeline's in-run dedup never saw them
+    # together) must render as ONE exhibit with the aliases listed — not as a
+    # stack of near-identical red boxes.
+    conn = init_db(tmp_path / "db.sqlite")
+    a = _seed(conn)                                   # /media, hash 'abc'
+    b = _add_scan_det(conn, "H1", "https://example.org/press", "abc",
+                      evidence='[{"quote":"younger voters should see","why":"directive"}]')
+    c = _add_scan_det(conn, "H1", "https://example.org/media-kit", "abc",
+                      evidence='[{"quote":"younger voters should see","why":"directive"}]')
+    for det in (a, b, c):
+        _review(conn, det, "approve")
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True)
+    cand = (out / "H1.html").read_text()
+    assert cand.count('<section class="detection">') == 1
+    assert "The same page body is also served at" in cand
+    assert "example.org/press" in cand
+    assert "example.org/media-kit" in cand
+    conn.close()
+
+
+def test_alias_exhibit_not_gone_while_any_url_still_serves_it(tmp_path):
+    # A body that moved off one alias but still lives at another is NOT
+    # "no longer present" — the removal note requires every URL to have
+    # dropped it.
+    conn = init_db(tmp_path / "db.sqlite")
+    a = _seed(conn)                                   # /media, hash 'abc'
+    b = _add_scan_det(conn, "H1", "https://example.org/press", "abc")
+    _review(conn, a, "approve")
+    _review(conn, b, "approve")
+    # /media re-scanned: body gone there; /press unchecked since detection.
+    _add_scan_det(conn, "H1", "https://example.org/media", "clean",
+                  cls="no_guidance_detected", conf=0.1,
+                  fetched="2026-06-20T00:00:00+00:00")
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True)
+    cand = (out / "H1.html").read_text()
+    assert "No longer present." not in cand
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Per-exhibit timelines and the review-gated change history.
+
+def test_exhibit_timeline_shows_detection_and_removal(tmp_path):
+    # Every exhibit carries a timeline strip; a removal appears there (from the
+    # take-down event) as well as in the prose note.
+    conn = init_db(tmp_path / "db.sqlite")
+    det_id = _seed(conn)                                        # classified 05-29
+    _review(conn, det_id, "approve")
+    _add_scan_det(conn, "H1", "https://example.org/media", "gone1",
+                  cls="no_guidance_detected", conf=0.2,
+                  fetched="2026-06-15T00:00:00+00:00")
+    conn.execute("""INSERT INTO change_events (candidate_id,url,event_type,
+        prev_classification,new_classification,detected_at)
+        VALUES ('H1','https://example.org/media','take_down',
+                'red_box_guidance','no_guidance_detected','2026-06-15T00:00:00+00:00')""")
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True)
+    cand = (out / "H1.html").read_text()
+    assert 'aria-label="Detection timeline"' in cand
+    assert "First detected" in cand and "May 29, 2026" in cand
+    assert "Guidance removed" in cand and "June 15, 2026" in cand
+    # take_down event present -> no duplicate state-derived "No longer present"
+    # timeline entry, but the prose note still renders.
+    assert cand.count("No longer present") == 1                 # gone-note only
+    conn.close()
+
+
+def test_timeline_distinguishes_page_update_from_guidance_revision(tmp_path):
+    # Two 'modified' events: one where the quoted spans survived verbatim in
+    # both versions (page updated) and one where the spans changed (revised).
+    conn = init_db(tmp_path / "db.sqlite")
+    conn.execute("""INSERT INTO candidates (candidate_id,name,office,state,district,
+        party,cycle,universe_reason,website_url,url_verified,receipts,created_at,updated_at)
+        VALUES ('H1','TEST CANDIDATE','H','NY','12','DEM',2026,'contested_primary',
+                'https://example.org',1,2000000,'t','t')""")
+
+    def scan_det(url, h, text, ev, when, conf=0.9):
+        cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,
+            http_status,raw_text,text_hash) VALUES ('H1',?,?,200,?,?)""",
+            (url, when, text, h))
+        sid = cur.lastrowid
+        conn.execute("""INSERT INTO detections (scan_id,candidate_id,classification,
+            confidence,evidence,rationale,model,classified_at)
+            VALUES (?,'H1','red_box_guidance',?,?,?,'m',?)""",
+            (sid, conf, ev, "r", when))
+        return sid
+
+    # Page A: news item changes around identical guidance -> "Page updated".
+    a1 = scan_det("https://example.org/media", "a1", "NEWS ONE. voters should see this ad",
+                  '[{"quote":"voters should see this ad","why":"w"}]',
+                  "2026-06-01T00:00:00+00:00")
+    a2 = scan_det("https://example.org/media", "a2", "NEWS TWO. voters should see this ad",
+                  '[{"quote":"voters should see this ad","why":"w"}]',
+                  "2026-06-10T00:00:00+00:00", conf=0.91)
+    conn.execute("""INSERT INTO change_events (candidate_id,url,event_type,prev_scan_id,
+        new_scan_id,prev_classification,new_classification,detected_at)
+        VALUES ('H1','https://example.org/media','modified',?,?,
+                'red_box_guidance','red_box_guidance','2026-06-10T00:00:00+00:00')""",
+        (a1, a2))
+    # Page B: the guidance itself changes -> "Guidance revised".
+    b1 = scan_det("https://example.org/plan", "b1", "seniors should hear about Medicare",
+                  '[{"quote":"seniors should hear about Medicare","why":"w"}]',
+                  "2026-06-01T00:00:00+00:00")
+    b2 = scan_det("https://example.org/plan", "b2", "veterans should hear about the GI bill",
+                  '[{"quote":"veterans should hear about the GI bill","why":"w"}]',
+                  "2026-06-12T00:00:00+00:00", conf=0.91)
+    conn.execute("""INSERT INTO change_events (candidate_id,url,event_type,prev_scan_id,
+        new_scan_id,prev_classification,new_classification,detected_at)
+        VALUES ('H1','https://example.org/plan','modified',?,?,
+                'red_box_guidance','red_box_guidance','2026-06-12T00:00:00+00:00')""",
+        (b1, b2))
+    for r in conn.execute("SELECT detection_id FROM detections"):
+        _review(conn, r["detection_id"], "approve")
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True)
+    cand = (out / "H1.html").read_text()
+    assert "Page updated" in cand
+    assert "Guidance revised" in cand
+    conn.close()
+
+
+def test_alias_events_collapse_to_one_timeline_entry(tmp_path):
+    # The same site update fires one 'modified' event per alias URL; the
+    # exhibit's timeline must show a single entry, not one per URL.
+    conn = init_db(tmp_path / "db.sqlite")
+    a = _seed(conn)
+    b = _add_scan_det(conn, "H1", "https://example.org/press", "abc")
+    _review(conn, a, "approve")
+    _review(conn, b, "approve")
+    for url in ("https://example.org/media", "https://example.org/press"):
+        conn.execute("""INSERT INTO change_events (candidate_id,url,event_type,
+            prev_classification,new_classification,detected_at)
+            VALUES ('H1',?,'modified','red_box_guidance','red_box_guidance',
+                    '2026-06-20T00:00:00+00:00')""", (url,))
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True)
+    cand = (out / "H1.html").read_text()
+    assert cand.count('class="tl-changed"') == 1
+    conn.close()
+
+
+def test_change_history_section_is_review_build_only(tmp_path):
+    # The raw event log can name URLs whose detections are pending/rejected,
+    # so it renders in the review console but never on public pages.
+    conn = init_db(tmp_path / "db.sqlite")
+    det_id = _seed(conn)
+    _review(conn, det_id, "approve")
+    # A put-up event for a PENDING detection on another page.
+    _add_scan_det(conn, "H1", "https://example.org/secret-page", "s1")
+    conn.execute("""INSERT INTO change_events (candidate_id,url,event_type,
+        prev_classification,new_classification,detected_at)
+        VALUES ('H1','https://example.org/secret-page','put_up',
+                'no_guidance_detected','red_box_guidance','2026-06-25T00:00:00+00:00')""")
+    conn.commit()
+    pub = build_site(conn, tmp_path / "site", approved_only=True)
+    cand_pub = (pub / "H1.html").read_text()
+    assert "Change history" not in cand_pub
+    assert "secret-page" not in cand_pub          # pending URL never leaks
+    rev = build_site(conn, tmp_path / "site2")
+    cand_rev = (rev / "H1.html").read_text()
+    assert "Change history" in cand_rev
+    assert "review console only" in cand_rev
+    assert "secret-page" in cand_rev
+    conn.close()
+
+
+def test_contradictory_sibling_verdict_is_not_a_removal(tmp_path):
+    # Legacy scans classified one body under several URLs, and the classifier
+    # sometimes contradicted itself on the identical text. An unreviewed
+    # no-guidance verdict on the same body must not overrule the approved
+    # detection and fabricate a "No longer present" note (the page was never
+    # re-scanned).
+    conn = init_db(tmp_path / "db.sqlite")
+    det_id = _seed(conn)                              # /media, hash 'abc', approved below
+    _review(conn, det_id, "approve")
+    # Same body under an alias URL, same day, classified no-guidance (legacy
+    # pre-dedup contradiction) — never reviewed.
+    _add_scan_det(conn, "H1", "https://example.org/blank", "abc",
+                  cls="no_guidance_detected", conf=0.95)
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True)
+    cand = (out / "H1.html").read_text()
+    assert "No longer present" not in cand
+    assert "carries a red box" in cand or "TEST CANDIDATE" in cand
+    conn.close()
+
+
+def test_error_scan_does_not_mark_exhibit_gone(tmp_path):
+    # An approved finding whose page later 403s (bot-block) or serves a bot
+    # challenge: the crawler being blocked is not a removal. The exhibit must
+    # stay "live" — only a usable scan (or confirmed take_down event) may
+    # flip it to gone.
+    conn = init_db(tmp_path / "db.sqlite")
+    det_id = _seed(conn)
+    _review(conn, det_id, "approve")
+    conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash,
+        http_status,raw_text)
+        VALUES ('H1','https://example.org/media','2026-06-15T00:00:00+00:00',
+                'errhash',403,'')""")
+    conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash,
+        http_status,raw_text)
+        VALUES ('H1','https://example.org/media','2026-06-16T00:00:00+00:00',
+                'chal','202','Just a moment... Checking your browser.')""")
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True,
+                     site_url="https://redboxwatch.org/")
+    cand = (out / "H1.html").read_text()
+    assert "No longer present." not in cand
+    assert "carries a red box" in cand
+    conn.close()
+
+
+def test_confirmed_take_down_event_marks_exhibit_gone(tmp_path):
+    # A confirmed-disappearance take_down (recorded by the pipeline after two
+    # consecutive 404s) has no usable scan of its own; the event itself must
+    # flip the exhibit to gone, dated at the event.
+    conn = init_db(tmp_path / "db.sqlite")
+    det_id = _seed(conn)
+    _review(conn, det_id, "approve")
+    cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash,
+        http_status,raw_text)
+        VALUES ('H1','https://example.org/media','2026-06-20T00:00:00+00:00',
+                'e404',404,'')""")
+    conn.execute("""INSERT INTO change_events (candidate_id,url,event_type,
+        prev_scan_id,new_scan_id,prev_classification,new_classification,detected_at)
+        VALUES ('H1','https://example.org/media','take_down',1,?,
+                'red_box_guidance','no_guidance_detected','2026-06-20T00:00:00+00:00')""",
+        (cur.lastrowid,))
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True,
+                     site_url="https://redboxwatch.org/")
+    cand = (out / "H1.html").read_text()
+    assert "No longer present." in cand
+    assert "June 20, 2026" in cand
+    conn.close()
+
+
+def test_build_sweeps_evidence_of_rejected_detections(tmp_path):
+    # site/evidence must mirror what THIS build references. A screenshot
+    # copied while a detection was approved must disappear from the output
+    # directory once the detection is rejected — otherwise the artifact of a
+    # rejected allegation stays deployed and publicly fetchable.
+    conn = init_db(tmp_path / "db.sqlite")
+    det_id = _seed(conn)
+    shot = tmp_path / "shot123.webp"
+    shot.write_bytes(b"RIFFfakeWEBP")
+    conn.execute("""INSERT INTO archives (detection_id,candidate_id,url,archived_at,
+        screenshot_path) VALUES (?,?,?,?,?)""",
+        (det_id, "H1", "https://example.org/media",
+         "2026-05-29T00:00:00+00:00", str(shot)))
+    _review(conn, det_id, "approve")
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True)
+    assert (out / "evidence" / "shot123.webp").exists()
+
+    _review(conn, det_id, "reject")
+    conn.commit()
+    build_site(conn, tmp_path / "site", approved_only=True)
+    assert not (out / "evidence" / "shot123.webp").exists()
+
+
+def test_public_build_discloses_coverage_gap_and_full_universe(tmp_path):
+    # The approved-only build must count the whole universe (not the rendered
+    # subset) and keep the coverage-gap disclosure; candidates with no
+    # resolved site get a public page (it IS the gap disclosure), while a
+    # pending detection's candidate stays out entirely.
+    conn = init_db(tmp_path / "db.sqlite")
+    det_id = _seed(conn)                       # H1: positive
+    _review(conn, det_id, "approve")
+    conn.execute("""INSERT INTO candidates (candidate_id,name,office,state,district,
+        party,cycle,universe_reason,website_url,url_source,url_verified,receipts,
+        created_at,updated_at)
+        VALUES ('H2','GAP, GRETA','H','OH','03','DEM',2026,'contested_primary',
+                NULL,'none',0,300000,'t','t')""")
+    conn.execute("""INSERT INTO candidates (candidate_id,name,office,state,district,
+        party,cycle,universe_reason,website_url,url_verified,receipts,
+        created_at,updated_at)
+        VALUES ('H3','PENDING, PAULA','H','PA','07','DEM',2026,'contested_primary',
+                'https://paula.example',1,400000,'t','t')""")
+    cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash,
+        http_status,raw_text)
+        VALUES ('H3','https://paula.example/media','2026-06-01T00:00:00+00:00','ph',
+                200,'page body')""")
+    conn.execute("""INSERT INTO detections (scan_id,candidate_id,classification,
+        confidence,evidence,rationale,model,classified_at)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        (cur.lastrowid, "H3", "red_box_guidance", 0.9, "[]", "r", "m",
+         "2026-06-01T00:00:00+00:00"))
+    conn.commit()
+
+    out = build_site(conn, tmp_path / "site", approved_only=True)
+    index = (out / "index.html").read_text()
+    assert "Coverage gap:" in index
+    assert "1 have no campaign site resolved" in index
+    assert "<b>3</b>" in index                      # full universe, all 3 tracked
+    assert (out / "H2.html").exists()               # gap page is public
+    assert "No campaign site found" in (out / "H2.html").read_text()
+    assert not (out / "H3.html").exists()           # pending stays unpublished
+    assert "PENDING, PAULA" not in index
+    assert "Pending human review" not in index      # no pending stat publicly
+    conn.close()
+
+
+def test_index_row_uses_display_name(tmp_path):
+    # Every other surface prints "Haley Stevens"; the index table printed the
+    # raw FEC "STEVENS, HALEY" — so the name filter couldn't match what users
+    # type.
+    conn = init_db(tmp_path / "db.sqlite")
+    _seed(conn)
+    conn.execute("UPDATE candidates SET name='STEVENS, HALEY' WHERE candidate_id='H1'")
+    conn.commit()
+    out = build_site(conn, tmp_path / "site")
+    index = (out / "index.html").read_text()
+    assert "Haley Stevens" in index
+    assert "STEVENS, HALEY" not in index
+    conn.close()
