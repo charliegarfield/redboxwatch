@@ -796,3 +796,55 @@ def test_scans_record_robots_posture(tmp_path):
     postures = {r[0] for r in conn.execute("SELECT robots_posture FROM scans")}
     assert postures == {"respect"}
     conn.close()
+
+
+def test_wallclock_deadline_yields_partial_scan(tmp_path, monkeypatch):
+    # A crawl that would serve pages forever must stop at the candidate
+    # wall-clock ceiling with a clean partial outcome: pages already scanned
+    # stay committed, scan_status is 'scanned', timed_out is flagged.
+    conn = init_db(tmp_path / "db.sqlite")
+    conn.execute("""INSERT INTO candidates (candidate_id,name,website_url,url_verified,
+        created_at,updated_at) VALUES ('H1','T','https://example.org',1,'t','t')""")
+    conn.commit()
+    candidate = dict(conn.execute("SELECT * FROM candidates").fetchone())
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr("redbox.pipeline._monotonic", lambda: clock["t"])
+
+    class _EndlessCrawler:
+        def crawl_site(self, url):
+            i = 0
+            while True:
+                i += 1
+                clock["t"] += 30.0          # each page "takes" 30s
+                yield FetchResult(
+                    url=f"https://example.org/p{i}", final_url=f"https://example.org/p{i}",
+                    status=200, content_type="text/html", render_mode="browser",
+                    html="", visible_text=f"press kit page {i}",
+                    dom_text=f"press kit page {i}")
+
+    out = scan_candidate(conn, candidate, crawler=_EndlessCrawler(),
+                         classifier=Classifier(KeywordLLM()),
+                         archiver=Archiver(tmp_path / "a", push_wayback=False),
+                         deadline_seconds=120.0)
+    assert out.timed_out is True
+    assert 0 < out.pages_scanned <= 5
+    assert "wall-clock ceiling" in out.skipped_reason
+    st = conn.execute("SELECT scan_status FROM candidates WHERE candidate_id='H1'").fetchone()[0]
+    assert st == "scanned"                   # partial, not failed
+    conn.close()
+
+
+def test_no_deadline_means_no_ceiling(tmp_path):
+    # deadline_seconds=None (the default) must not change behavior.
+    conn = init_db(tmp_path / "db.sqlite")
+    conn.execute("""INSERT INTO candidates (candidate_id,name,website_url,url_verified,
+        created_at,updated_at) VALUES ('H1','T','https://example.org',1,'t','t')""")
+    conn.commit()
+    candidate = dict(conn.execute("SELECT * FROM candidates").fetchone())
+    out = scan_candidate(conn, candidate, crawler=_crawler(),
+                         classifier=Classifier(KeywordLLM()),
+                         archiver=Archiver(tmp_path / "a", push_wayback=False))
+    assert out.timed_out is False
+    assert out.pages_scanned == 3
+    conn.close()

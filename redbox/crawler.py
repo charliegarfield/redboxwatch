@@ -177,17 +177,44 @@ class PlaywrightFetcher:
 
 
 # ---------------------------------------------------------------------------
-def fetch_pdf(url: str, *, user_agent: str, timeout: float = 30.0) -> FetchResult:
-    """Fetch a PDF over HTTP and extract its text (no browser render)."""
-    resp = httpx.get(url, headers={"User-Agent": user_agent}, follow_redirects=True,
-                     timeout=timeout)
-    ok = resp.status_code < 400
-    text = extract_pdf_text(resp.content) if ok else ""
+def fetch_pdf(url: str, *, user_agent: str, timeout: float = 30.0,
+              max_total_seconds: float = 120.0,
+              max_bytes: int = 50_000_000) -> FetchResult:
+    """Fetch a PDF over HTTP and extract its text (no browser render).
+
+    Streamed with a TOTAL wall-clock deadline: httpx's read timeout resets on
+    every chunk, so a drip-feeding server (one byte every few seconds) can hold
+    a worker thread forever without ever tripping it — the documented scan-all
+    hang signature. ``max_bytes`` caps runaway bodies for the same reason.
+    """
+    import time as _time
+
+    deadline = _time.monotonic() + max_total_seconds
+    chunks: list[bytes] = []
+    size = 0
+    with httpx.stream("GET", url, headers={"User-Agent": user_agent},
+                      follow_redirects=True, timeout=timeout) as resp:
+        status, final_url = resp.status_code, str(resp.url)
+        content_type = resp.headers.get("content-type", "application/pdf")
+        ok = status < 400
+        if ok:
+            for chunk in resp.iter_bytes():
+                chunks.append(chunk)
+                size += len(chunk)
+                if _time.monotonic() > deadline:
+                    raise httpx.ReadTimeout(
+                        f"drip-feed guard: {url} still streaming after "
+                        f"{max_total_seconds:.0f}s ({size} bytes)")
+                if size > max_bytes:
+                    raise httpx.ReadTimeout(
+                        f"size guard: {url} exceeded {max_bytes} bytes")
+    content = b"".join(chunks)
+    text = extract_pdf_text(content) if ok else ""
     return FetchResult(
-        url=url, final_url=str(resp.url), status=resp.status_code,
-        content_type=resp.headers.get("content-type", "application/pdf"),
+        url=url, final_url=final_url, status=status,
+        content_type=content_type,
         render_mode="pdf", visible_text=text, dom_text=text,
-        pdf_bytes=resp.content if ok else None,
+        pdf_bytes=content if ok else None,
     )
 
 

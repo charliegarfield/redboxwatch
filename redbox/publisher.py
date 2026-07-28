@@ -191,6 +191,40 @@ def _gather(conn: sqlite3.Connection) -> list[CandidateView]:
                 by_hash[h] = d
         exhibit_dets_by_cid[cid_key] = list(by_hash.values())
 
+    # Every distinct positive BODY a candidate has ever served (one window
+    # query): the best-ranked detection per (candidate, text_hash). Every
+    # revision of a box got its own detection AND archive when it was
+    # classified, so the full version history already exists on disk — this
+    # surfaces it. An exhibit's "earlier versions" resolve from these by URL
+    # group in the assembly loop below.
+    body_dets: dict[str, list[dict]] = {}
+    for r in conn.execute(
+        f"""SELECT * FROM (
+              SELECT d.*, s.url AS page_url, s.text_hash AS page_text_hash,
+                     r.action AS review_action,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY d.candidate_id, s.text_hash
+                       ORDER BY {_RANK_ORDER_SQL}) AS rn
+              FROM detections d JOIN scans s USING(scan_id)
+              {_LATEST_REVIEW_JOIN}
+              WHERE d.classification IN ('red_box_guidance','ambiguous')
+           ) WHERE rn = 1"""):
+        d = dict(r)
+        d.pop("rn", None)
+        body_dets.setdefault(d["candidate_id"], []).append(d)
+    # When each positive body was FIRST seen (one grouped query): orders the
+    # versions and dates each one's lifespan.
+    body_first_seen: dict[tuple[str, str], str] = {
+        (r["candidate_id"], r["text_hash"]): r["fs"]
+        for r in conn.execute(
+            """SELECT s.candidate_id, s.text_hash, MIN(s.fetched_at) AS fs
+               FROM scans s
+               WHERE (s.candidate_id, s.text_hash) IN (
+                   SELECT d.candidate_id, sd.text_hash
+                   FROM detections d JOIN scans sd USING(scan_id)
+                   WHERE d.classification IN ('red_box_guidance','ambiguous'))
+               GROUP BY s.candidate_id, s.text_hash""")}
+
     # Current live state of each exhibit URL (one query): the latest USABLE
     # scan of the URL — error/challenge fetches say nothing about the page, so
     # a 403 bot-block must not read as a removal — with its classification
@@ -331,6 +365,7 @@ def _gather(conn: sqlite3.Connection) -> list[CandidateView]:
             archive = archive_by_det.get(det["detection_id"])
             evidence = _parse_evidence(det)
         exhibits = []
+        current_hashes = {x["page_text_hash"] for x in exhibit_dets_by_cid.get(cid, [])}
         for d in exhibit_dets_by_cid.get(cid, []):
             # Gone only when EVERY URL serving this body has stopped carrying
             # it (a page that moved to an alias is still up); dated by the most
@@ -338,6 +373,9 @@ def _gather(conn: sqlite3.Connection) -> list[CandidateView]:
             urls = [d.get("page_url")] + d.get("alias_urls", [])
             gone = [gone_by_cid_url.get((cid, u)) for u in urls]
             gone_since = max(gone) if all(gone) else None
+            versions = _exhibit_versions(
+                d, urls, current_hashes, body_dets.get(cid, []),
+                body_first_seen, archive_by_det, cid)
             exhibits.append({
                 "detection": d,
                 "evidence": _parse_evidence(d),
@@ -348,7 +386,10 @@ def _gather(conn: sqlite3.Connection) -> list[CandidateView]:
                 "alias_urls": d.get("alias_urls", []),
                 "gone_since": gone_since,
                 "timeline": _exhibit_timeline(
-                    d, changes_by_cid.get(cid, []), urls, gone_since),
+                    d, changes_by_cid.get(cid, []), urls, gone_since,
+                    revision_days=[v["superseded"] for v in versions
+                                   if v.get("superseded")]),
+                "versions": versions,
             })
         status, label = _status(det, review, last, scan_count, candidate=dict(c))
         views.append(CandidateView(
@@ -367,6 +408,66 @@ def _parse_evidence(det: dict) -> list[dict]:
         return json.loads(det.get("evidence") or "[]")
     except json.JSONDecodeError:
         return []
+
+
+def _exhibit_versions(det: dict, urls: list[str], current_hashes: set[str],
+                      bodies: list[dict], first_seen: dict[tuple[str, str], str],
+                      archive_by_det: dict[int, dict], cid: str) -> list[dict]:
+    """Earlier versions of one exhibit's guidance, oldest first.
+
+    A version is a distinct positive body previously served on this exhibit's
+    URL group: not the current body, not any other exhibit's current body (a
+    page that switched to serving a different exhibit's box must not list it
+    twice), not rejected by review, and first seen BEFORE the current body.
+    Each carries its own detection, archived evidence, lifespan (first seen ->
+    superseded by the next version), and a quote-level diff against what
+    replaced it. "Guidance revised" stops being a dead-end label: the thing it
+    was revised FROM is one click away.
+    """
+    cur_first = (first_seen.get((cid, det["page_text_hash"]))
+                 or det.get("first_detected_at") or "")
+    olds = [b for b in bodies
+            if b["page_url"] in urls
+            and b["page_text_hash"] not in current_hashes
+            and b.get("review_action") != "reject"
+            and (first_seen.get((cid, b["page_text_hash"]), "") or "~") < cur_first]
+    olds.sort(key=lambda b: first_seen.get((cid, b["page_text_hash"]), ""))
+    versions: list[dict] = []
+    for i, b in enumerate(olds):
+        nxt = olds[i + 1] if i + 1 < len(olds) else det
+        versions.append({
+            "detection": b,
+            "evidence": _parse_evidence(b),
+            "archive": archive_by_det.get(b["detection_id"]),
+            "approved": b.get("review_action") == "approve",
+            "first_seen": (first_seen.get((cid, b["page_text_hash"]), "") or "")[:10],
+            "superseded": (first_seen.get((cid, nxt["page_text_hash"]), "") or "")[:10],
+            # NOTE: quote diffs are computed at RENDER time against the next
+            # SURVIVING version — computing them here against the raw
+            # successor leaked an unreviewed revision's quotes through the
+            # diff line after the public build filtered that revision out.
+        })
+    return versions
+
+
+def _quote_diff(old_det: dict, new_det: dict) -> tuple[list[str], list[str]]:
+    """Raw quoted spans the NEXT version added / dropped relative to this one.
+
+    Comparison is over normalized spans (same convention as
+    _guidance_unchanged) so whitespace/case/ellipsis drift doesn't read as a
+    change; display keeps the raw quotes.
+    """
+    def raw_by_norm(det: dict) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for q in _parse_evidence(det):
+            if q.get("quote"):
+                out[_norm_span(q["quote"]).rstrip(".…")] = q["quote"]
+        return out
+
+    o, n = raw_by_norm(old_det), raw_by_norm(new_det)
+    added = [v for k, v in n.items() if k not in o]
+    dropped = [v for k, v in o.items() if k not in n]
+    return added, dropped
 
 
 def _norm_span(s: str | None) -> str:
@@ -416,12 +517,15 @@ _TL_RANK = {"detected": 0, "put_up": 0, "updated": 1, "revised": 2,
 
 
 def _exhibit_timeline(det: dict, changes: list[dict], urls: list[str],
-                      gone_since: str | None) -> list[tuple[str, str]]:
+                      gone_since: str | None,
+                      revision_days: list[str] = ()) -> list[tuple[str, str]]:
     """Chronological (day, kind) entries for one exhibit's URL group: first
     detection, then posted / page-updated / guidance-revised / removed events.
     Alias URLs report the same underlying change, so same-day same-kind events
     collapse to one entry. A removal the event log never captured (or that is
-    only visible from scan state) still appears, dated from the last check."""
+    only visible from scan state) still appears, dated from the last check —
+    and so does a revision proven by the version history (``revision_days``:
+    each earlier version's superseded date) that the event log missed."""
     entries: set[tuple[str, str]] = set()
     for ch in changes:
         if ch.get("url") not in urls:
@@ -432,6 +536,10 @@ def _exhibit_timeline(det: dict, changes: list[dict], urls: list[str],
             same = ch.get("guidance_same")
             kind = "updated" if same else ("revised" if same is False else "changed")
         entries.add((day, kind))
+    modified_days = {d for d, k in entries if k in ("updated", "revised", "changed")}
+    for day in revision_days:
+        if day and day not in modified_days:
+            entries.add((day, "revised"))
     first = (det.get("first_detected_at") or det.get("classified_at") or "")[:10]
     if first and (first, "put_up") not in entries:
         entries.add((first, "detected"))
@@ -527,15 +635,23 @@ def build_site(conn: sqlite3.Connection, out_dir: Path, *, approved_only: bool =
                   "blocked_by_robots", "fetch_failed", "not_scanned")
         views = [v for v in views if v.status in public]
         # A pending exhibit is an unpublished allegation even when the
-        # candidate has a separate approved finding — never render it.
+        # candidate has a separate approved finding — never render it. Same
+        # per-detection discipline for version history: only earlier versions
+        # a human approved appear publicly.
         for v in views:
             v.exhibits = [e for e in v.exhibits if e["approved"]]
+            for e in v.exhibits:
+                e["versions"] = [ver for ver in e.get("versions", [])
+                                 if ver["approved"]]
 
     # Copy evidence screenshots + archived PDFs into the site, rewrite to
     # relative paths.
     kept_evidence: set[str] = set()
     for v in views:
-        for archive in {id(a): a for a in ([v.archive] + [e["archive"] for e in v.exhibits])
+        for archive in {id(a): a for a in (
+                [v.archive] + [e["archive"] for e in v.exhibits]
+                + [ver["archive"] for e in v.exhibits
+                   for ver in e.get("versions", [])])
                         if a}.values():
             for key, rel_key in (("screenshot_path", "screenshot_rel"),
                                  ("pdf_path", "pdf_rel")):
@@ -1469,8 +1585,18 @@ def _render_exhibit(e: dict, *, first: bool, label_override: str | None = None) 
     also = "" if first else '<p class="exhibit-more">Additional page with guidance</p>'
     timeline = ""
     if e.get("timeline"):
+        # Revision entries link into the version history below, so "Guidance
+        # revised" shows what it was revised FROM instead of dead-ending.
+        vhref = f'#versions-{d["detection_id"]}' if e.get("versions") else None
+
+        def _tl_label(kind: str) -> str:
+            lab = _TL_LABEL.get(kind, kind)
+            if vhref and kind in ("revised", "changed", "updated"):
+                return f'<a href="{vhref}">{lab}</a>'
+            return lab
+
         items = "".join(
-            f'<li class="tl-{kind}"><span class="tl-l">{_TL_LABEL.get(kind, kind)}</span>'
+            f'<li class="tl-{kind}"><span class="tl-l">{_tl_label(kind)}</span>'
             f'<span class="tl-d">{_h(_pretty_date(day))}</span></li>'
             for day, kind in e["timeline"])
         timeline = f'<ol class="tl" aria-label="Detection timeline">{items}</ol>'
@@ -1503,7 +1629,75 @@ def _render_exhibit(e: dict, *, first: bool, label_override: str | None = None) 
       <ul class="evidence">{ev}</ul>
       {exhibit}
       {_render_page_text(archive)}
+      {_render_versions(e)}
     </section>"""
+
+
+def _render_versions(e: dict) -> str:
+    """Collapsed version history for one exhibit: each earlier revision of the
+    guidance with its lifespan, quoted spans, what the next revision changed,
+    and the SAME archived-evidence treatment the current version gets. Every
+    revision was archived at its own detection time, so this is preserved
+    primary material, not reconstruction."""
+    vers = e.get("versions") or []
+    if not vers:
+        return ""
+    d = e["detection"]
+    blocks = []
+    for i, ver in enumerate(vers, start=1):
+        vd = ver["detection"]
+        span = f"Live from {_pretty_date(ver['first_seen'])}" if ver.get("first_seen") else ""
+        if ver.get("superseded"):
+            span += f" &#8211; revised {_pretty_date(ver['superseded'])}"
+        pending = ("" if ver["approved"]
+                   else ' <strong class="v-pending">pending human review — not published</strong>')
+        quotes = "".join(
+            f'<li><blockquote>{_h(q.get("quote"))}</blockquote></li>'
+            for q in ver["evidence"] if q.get("quote"))
+        # Diff against the next version IN THIS (already review-filtered)
+        # list, falling back to the current exhibit — so an unpublished
+        # revision's quotes can never leak through the diff line.
+        nxt_det = vers[i]["detection"] if i < len(vers) else d
+        added, dropped = _quote_diff(vd, nxt_det)
+        diffbits = []
+        if added:
+            diffbits.append("added " + "; ".join(
+                f"&#8220;{_h(q)}&#8221;" for q in added[:3]))
+        if dropped:
+            diffbits.append("dropped " + "; ".join(
+                f"&#8220;{_h(q)}&#8221;" for q in dropped[:3]))
+        diff = (f'<p class="v-diff">The next revision {"; ".join(diffbits)}.</p>'
+                if diffbits else "")
+        arch = ver.get("archive") or {}
+        ev_bits = []
+        if arch.get("wayback_url"):
+            ev_bits.append(f'<a href="{_h(arch["wayback_url"])}" rel="noopener">Wayback snapshot</a>')
+        if arch.get("pdf_rel"):
+            ev_bits.append(f'<a href="{_h(arch["pdf_rel"])}" rel="noopener">Archived PDF (original)</a>')
+        shot = ""
+        if arch.get("screenshot_rel"):
+            rel = _h(arch["screenshot_rel"])
+            shot = (f'<figure class="exhibit v-exhibit"><a class="exhibit-frame" href="{rel}">'
+                    f'<img src="{rel}" loading="lazy" '
+                    f'alt="Archived screenshot of version {i} of {_h(d.get("page_url"))}"></a>'
+                    f'<figcaption><span class="exhibit-label">Archived at detection</span>'
+                    f'{(" &#183; ".join(ev_bits))}</figcaption></figure>')
+        elif ev_bits:
+            shot = (f'<p class="evlinks"><span class="exhibit-label">Archived at detection</span>'
+                    f'{" &#183; ".join(ev_bits)}</p>')
+        blocks.append(f"""<div class="version">
+        <p class="v-span">Version {i}{(' &#183; ' + span) if span else ''}{pending}</p>
+        <ul class="evidence">{quotes}</ul>
+        {diff}{shot}
+        {_render_page_text(arch)}
+      </div>""")
+    n = len(vers)
+    return f"""<details class="versions" id="versions-{d['detection_id']}">
+      <summary>Earlier version{'s' if n != 1 else ''} of this guidance ({n}) — archived</summary>
+      <p class="v-note">Each revision below was archived when it was detected; the
+      current version is shown above. Newest earlier version last.</p>
+      {''.join(blocks)}
+    </details>"""
 
 
 def _render_page_text(archive: dict | None) -> str:
@@ -1883,6 +2077,15 @@ code{font-size:.85em;background:var(--paper-bright);border:1px solid var(--hair)
 .ended-banner{margin:1.6rem 0 0;padding:1rem 1.3rem;border-top:1px solid var(--line);border-bottom:1px solid var(--line);font-style:italic;font-size:.97rem;color:var(--ink-soft)}
 .review-banner strong{font-style:normal;color:var(--amber)}
 .gone-note{margin:1.2rem 0 0;padding:.6rem 1.1rem;border-left:3px solid var(--ink-faint);font-size:.94rem;font-style:italic;color:var(--ink-soft)}
+.versions{margin:1.4rem 0 0}
+.versions summary{cursor:pointer;color:var(--red-deep);font-family:var(--grot);font-size:.82rem;letter-spacing:.04em}
+.versions .v-note{font-size:.88rem;color:var(--ink-faint);margin:.6rem 0 0}
+.version{border-top:1px solid var(--line);margin-top:.9rem;padding-top:.7rem}
+.version .v-span{font-family:var(--grot);font-size:.72rem;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-faint);margin:0 0 .4rem}
+.version .v-pending{color:var(--red-deep);text-transform:none;letter-spacing:0}
+.version .v-diff{font-size:.92rem;color:var(--ink-soft);border-left:3px solid var(--amber);padding:.35rem .8rem;margin:.5rem 0}
+.version .v-exhibit img{max-width:100%}
+.tl .tl-l a{color:inherit;text-decoration:underline dotted}
 .gone-note strong{font-style:normal;color:var(--ink)}
 .tl{margin:1.15rem 0 0;padding:.65rem 0 .7rem;list-style:none;display:flex;flex-wrap:wrap;align-items:center;gap:.5rem 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
 .tl li{display:flex;align-items:center;gap:.6em;font-family:var(--grot);font-size:.72rem;letter-spacing:.07em;text-transform:uppercase;white-space:nowrap}

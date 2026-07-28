@@ -1046,3 +1046,89 @@ def test_index_row_uses_display_name(tmp_path):
     assert "Haley Stevens" in index
     assert "STEVENS, HALEY" not in index
     conn.close()
+
+
+# --- Version history: earlier revisions of a red box are browsable ----------
+
+def _seed_versioned_exhibit(conn, tmp_path):
+    """One page (/media) that served three successive guidance bodies, each
+    detected and archived at its time: v1 (approved), v2 (never reviewed),
+    current v3 (approved)."""
+    conn.execute("""INSERT INTO candidates (candidate_id,name,office,state,district,
+        party,cycle,universe_reason,website_url,url_verified,receipts,created_at,updated_at)
+        VALUES ('H1','REVISED, RITA','H','NY','12','DEM',2026,'contested_primary',
+                'https://example.org',1,2000000,'t','t')""")
+
+    def version(hash_, when, quote, shot_name):
+        cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash,
+            http_status,raw_text) VALUES ('H1','https://example.org/media',?,?,200,?)""",
+            (when, hash_, f"page body {quote}"))
+        cur = conn.execute("""INSERT INTO detections (scan_id,candidate_id,classification,
+            confidence,evidence,rationale,model,classified_at) VALUES (?,?,?,?,?,?,?,?)""",
+            (cur.lastrowid, "H1", "red_box_guidance", 0.9,
+             f'[{{"quote":"{quote}","why":"directive"}}]', "r", "m", when))
+        det = cur.lastrowid
+        shot = tmp_path / shot_name
+        shot.write_bytes(b"RIFFfakeWEBP")
+        conn.execute("""INSERT INTO archives (detection_id,candidate_id,url,archived_at,
+            screenshot_path,wayback_url) VALUES (?,?,?,?,?,?)""",
+            (det, "H1", "https://example.org/media", when, str(shot),
+             f"https://web.archive.org/web/x/{shot_name}"))
+        return det
+
+    d1 = version("v1hash", "2026-06-01T00:00:00+00:00",
+                 "younger voters should see this on TV", "v1shot.webp")
+    d2 = version("v2hash", "2026-06-15T00:00:00+00:00",
+                 "younger voters should see this on TV and mail", "v2shot.webp")
+    d3 = version("v3hash", "2026-07-01T00:00:00+00:00",
+                 "suburban women need to hear this on CTV", "v3shot.webp")
+    _review(conn, d1, "approve")
+    _review(conn, d3, "approve")           # v2 never reviewed
+    conn.commit()
+    return d1, d2, d3
+
+
+def test_exhibit_lists_earlier_versions_with_archives(tmp_path):
+    # Review build: both earlier versions render, each with its own quotes,
+    # lifespan, archived screenshot, and a diff line against its successor;
+    # the never-reviewed one is marked pending. The timeline's revision
+    # entries link into the version block.
+    conn = init_db(tmp_path / "db.sqlite")
+    _seed_versioned_exhibit(conn, tmp_path)
+    out = build_site(conn, tmp_path / "site")
+    cand = (out / "H1.html").read_text()
+    assert "Earlier versions of this guidance (2)" in cand
+    assert "younger voters should see this on TV" in cand         # v1 quote
+    assert "younger voters should see this on TV and mail" in cand  # v2 quote
+    assert 'src="evidence/v1shot.webp"' in cand                   # v1 archive copied
+    assert 'src="evidence/v2shot.webp"' in cand
+    assert (out / "evidence" / "v1shot.webp").exists()
+    assert "The next revision added" in cand                      # quote diff
+    assert "pending human review" in cand                         # v2 marked
+    assert 'href="#versions-' in cand                             # timeline anchor
+    conn.close()
+
+
+def test_public_build_shows_only_approved_versions(tmp_path):
+    # Public: v1 (approved) appears; v2 (never reviewed) is an unpublished
+    # allegation — no quote, no screenshot in the output directory.
+    conn = init_db(tmp_path / "db.sqlite")
+    _seed_versioned_exhibit(conn, tmp_path)
+    out = build_site(conn, tmp_path / "site", approved_only=True)
+    cand = (out / "H1.html").read_text()
+    assert "Earlier version of this guidance (1)" in cand
+    assert "younger voters should see this on TV" in cand
+    assert "on TV and mail" not in cand
+    assert (out / "evidence" / "v1shot.webp").exists()
+    assert not (out / "evidence" / "v2shot.webp").exists()        # swept/not copied
+    conn.close()
+
+
+def test_single_version_exhibit_has_no_version_block(tmp_path):
+    conn = init_db(tmp_path / "db.sqlite")
+    det_id = _seed(conn)
+    _review(conn, det_id, "approve")
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True)
+    assert "Earlier version" not in (out / "H1.html").read_text()
+    conn.close()

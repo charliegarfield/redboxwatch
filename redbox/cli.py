@@ -497,7 +497,7 @@ def cmd_resolve(args, cfg) -> int:
 
 
 def _scan_one_candidate(candidate: dict, cfg, *, push_wayback: bool, rate_limiter=None,
-                        chunk_executor=None):
+                        chunk_executor=None, watchdog_registry: dict | None = None):
     """Scan a single candidate in an isolated context (own browser + DB conn).
 
     Designed to run in a worker thread: Playwright's sync API is not thread-safe
@@ -520,6 +520,10 @@ def _scan_one_candidate(candidate: dict, cfg, *, push_wayback: bool, rate_limite
     rl = cfg.get("rate_limit", {}) or {}
     models = cfg.models
     conn = connect(cfg.database_path)          # own connection for this thread
+    if watchdog_registry is not None:
+        import time as _time
+        watchdog_registry[candidate["candidate_id"]] = (candidate.get("name", ""),
+                                                        _time.monotonic())
     try:
         with PlaywrightFetcher(user_agent=cfg.user_agent) as fetcher:
             crawler = Crawler(
@@ -551,8 +555,12 @@ def _scan_one_candidate(candidate: dict, cfg, *, push_wayback: bool, rate_limite
             archiver = _build_archiver(cfg, push_wayback)
             return scan_candidate(conn, candidate, crawler=crawler,
                                   classifier=classifier, archiver=archiver,
-                                  require_verified=cfg.require_verified_url)
+                                  require_verified=cfg.require_verified_url,
+                                  deadline_seconds=cfg.get(
+                                      "candidate_wallclock_seconds", 1500))
     finally:
+        if watchdog_registry is not None:
+            watchdog_registry.pop(candidate["candidate_id"], None)
         conn.close()
 
 
@@ -658,13 +666,36 @@ def cmd_scan_all(args, cfg) -> int:
     print(f"Classify pool: up to {pool_size} concurrent chunk calls "
           f"(shared across {args.workers} workers).")
 
+    # Stuck-scan watchdog: a daemon thread that names any candidate running past
+    # the wall-clock ceiling. The ceiling itself is enforced cooperatively
+    # between pages (pipeline) and per fetch (drip-feed guards) — a candidate
+    # still over it here is wedged INSIDE a blocking call, and this makes the
+    # hang loud (who + which site) instead of a silent 0%-CPU stall.
+    import threading
+    import time as _time
+    in_flight: dict[str, tuple[str, float]] = {}
+    ceiling = cfg.get("candidate_wallclock_seconds", 1500)
+    stop_watchdog = threading.Event()
+
+    def _watchdog():
+        while not stop_watchdog.wait(60):
+            now = _time.monotonic()
+            for cid, (name, started) in sorted(in_flight.items()):
+                mins = (now - started) / 60
+                if now - started > ceiling + 120:
+                    print(f"  ⏱ WATCHDOG: {cid} {name[:30]} running {mins:.0f}m "
+                          f"(ceiling {ceiling/60:.0f}m) — likely wedged in a "
+                          f"blocking call; investigate this site")
+
+    threading.Thread(target=_watchdog, daemon=True).start()
+
     done = fails = pos = amb = 0
     interrupted = False
     with ThreadPoolExecutor(max_workers=pool_size, thread_name_prefix="chunk") as chunk_pool, \
          ThreadPoolExecutor(max_workers=args.workers) as pool:
         futs = {pool.submit(_scan_one_candidate, c, cfg,
                             push_wayback=args.push_wayback, rate_limiter=limiter,
-                            chunk_executor=chunk_pool): c
+                            chunk_executor=chunk_pool, watchdog_registry=in_flight): c
                 for c in rows}
         try:
             for fut in as_completed(futs):
@@ -678,6 +709,8 @@ def cmd_scan_all(args, cfg) -> int:
                 done += 1
                 pos += o.positives; amb += o.ambiguous
                 flag = " ⚑ POSITIVE" if o.positives else (" ? ambiguous" if o.ambiguous else "")
+                if getattr(o, "timed_out", False):
+                    flag += " ⏱ partial (wall-clock ceiling)"
                 dd = f", {o.deduped} deduped" if o.deduped else ""
                 ff = f" {o.pages_failed}f" if o.pages_failed else ""
                 ch = (f" [{o.put_ups} put-up/{o.take_downs} take-down]"
@@ -697,6 +730,7 @@ def cmd_scan_all(args, cfg) -> int:
             print(f"\nInterrupted — cancelled {n_cancelled} queued candidate(s); "
                   f"letting up to {args.workers} in-flight scan(s) finish "
                   f"(may take a few minutes; Ctrl-C again to abandon them mid-scan)...")
+    stop_watchdog.set()
     print(f"\nDone: {done} scanned, {fails} failed | "
           f"{pos} positive, {amb} ambiguous detections (all held for review).")
     if interrupted:

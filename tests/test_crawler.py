@@ -275,3 +275,40 @@ def test_crawl_resolves_links_from_the_fetched_page(tmp_path):
     urls = [r.url for r in results]
     assert "https://x.example/news/2026/article-1" in urls
     assert "https://x.example/article-1" not in urls
+
+
+def test_fetch_pdf_dripfeed_guard(monkeypatch):
+    # A server that drips bytes forever must trip the TOTAL wall-clock guard —
+    # httpx's own read timeout resets per chunk and never fires on a drip-feed.
+    import httpx
+    import pytest
+
+    import redbox.crawler as cm
+
+    class _DripResponse:
+        status_code = 200
+        url = "https://slow.example/a.pdf"
+        headers = {"content-type": "application/pdf"}
+
+        def iter_bytes(self):
+            while True:
+                yield b"x"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(cm.httpx, "stream", lambda *a, **k: _DripResponse())
+
+    t = {"now": 0.0}
+
+    def _clock():
+        t["now"] += 30.0                 # every look at the clock advances 30s
+        return t["now"]
+
+    monkeypatch.setattr("time.monotonic", _clock)
+
+    with pytest.raises(httpx.ReadTimeout, match="drip-feed guard"):
+        cm.fetch_pdf("https://slow.example/a.pdf", user_agent="t", max_total_seconds=120)

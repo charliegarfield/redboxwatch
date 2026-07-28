@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
+from time import monotonic as _monotonic
 
 from . import prefilter
 from .archiver import Archiver
@@ -44,6 +45,7 @@ class ScanOutcome:
     take_downs: int = 0
     put_ups: int = 0
     robots_blocked: bool = False   # site's robots.txt disallowed our crawler
+    timed_out: bool = False        # candidate wall-clock ceiling hit (partial scan)
     skipped_reason: str | None = None
 
 
@@ -323,9 +325,11 @@ def scan_candidate(
     classifier: Classifier,
     archiver: Archiver,
     require_verified: bool = False,
+    deadline_seconds: float | None = None,
 ) -> ScanOutcome:
     cid = candidate["candidate_id"]
     out = ScanOutcome(candidate_id=cid)
+    _started = _monotonic()
 
     url = candidate.get("website_url")
     if not url:
@@ -347,6 +351,16 @@ def scan_candidate(
     verdict_by_hash: dict[str, str] = {}
 
     for res in crawler.crawl_site(url):
+        # Wall-clock ceiling (checked between pages, so every page's writes stay
+        # complete): a site that is merely SLOW across many pages must not pin a
+        # worker for hours. Pages already scanned are committed; the candidate
+        # finishes as a normal partial 'scanned' and re-enters on its next
+        # cadence day. Hangs *inside* one fetch are the per-fetch guards' job.
+        if deadline_seconds and _monotonic() - _started > deadline_seconds:
+            out.timed_out = True
+            out.skipped_reason = (f"wall-clock ceiling {deadline_seconds:.0f}s hit "
+                                  f"after {out.pages_scanned} pages — rest of site skipped")
+            break
         # Look at the previous scan of this URL *before* inserting the new one,
         # so we can diff for put-up/take-down (spec §3.2).
         prev = _prev_scan(conn, cid, res.url)
