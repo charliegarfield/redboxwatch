@@ -1033,18 +1033,21 @@ def test_public_build_discloses_coverage_gap_and_full_universe(tmp_path):
     conn.close()
 
 
-def test_index_row_uses_display_name(tmp_path):
-    # Every other surface prints "Haley Stevens"; the index table printed the
-    # raw FEC "STEVENS, HALEY" — so the name filter couldn't match what users
-    # type.
+def test_index_row_fec_name_with_display_data_attribute(tmp_path):
+    # The visible cell prints the official FEC "LAST, FIRST" form (the ledger
+    # formality is deliberate, and it sorts by surname natively); the display
+    # form rides along in data-name so the filter still matches what people
+    # type ("haley stevens").
     conn = init_db(tmp_path / "db.sqlite")
     _seed(conn)
     conn.execute("UPDATE candidates SET name='STEVENS, HALEY' WHERE candidate_id='H1'")
     conn.commit()
     out = build_site(conn, tmp_path / "site")
     index = (out / "index.html").read_text()
-    assert "Haley Stevens" in index
-    assert "STEVENS, HALEY" not in index
+    assert ">STEVENS, HALEY<" in index               # visible cell text
+    assert 'data-name="Haley Stevens"' in index      # filter matches typed form
+    # Working-notes columns stay off the home table.
+    assert ">Conf.<" not in index and ">Pages<" not in index
     conn.close()
 
 

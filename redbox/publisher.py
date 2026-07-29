@@ -1366,8 +1366,8 @@ def _render_index(views: list[CandidateView], approved_only: bool, *,
     </form>
     <table class="agate"><thead><tr>
       <th data-sort="0">Candidate</th><th data-sort="1">Seat</th><th data-sort="2">Party</th>
-      <th data-sort="3">Status</th><th data-sort="4" class="num">Conf.</th>
-      <th data-sort="5" class="num">Aligned IE</th><th data-sort="6" class="num">Pages</th>
+      <th data-sort="3">Status</th>
+      <th data-sort="4" class="num">Aligned IE</th>
     </tr></thead><tbody id="rows">{''.join(rows)}</tbody></table>
     {pager}
     <script>const PAGED={'true' if n_pages > 1 else 'false'};{INDEX_JS}</script>"""
@@ -1381,21 +1381,25 @@ def _render_index(views: list[CandidateView], approved_only: bool, *,
 
 
 def _index_row(v: CandidateView) -> str:
+    # The visitor-facing home table stays simple: name, seat, party, status,
+    # aligned money. Classifier confidence and page counts are working-notes —
+    # they live on the candidate page, not the front door. Names print in the
+    # official FEC "LAST, FIRST" form (user's call: the ledger formality is
+    # the point, and it sorts by surname for free); data-name carries the
+    # display form ("Haley Stevens") so the filter matches either name order.
     c = v.row
     pill_txt, pill_cls = STATUS_PILL.get(v.status, ("—", "pill-muted"))
-    conf = f"{v.detection['confidence']:.2f}" if v.detection and v.detection.get("confidence") is not None else "—"
     ie = ""
     if v.corroboration and v.corroboration.get("supporting_total"):
         ie = f"${float(v.corroboration['supporting_total']):,.0f}"
     return f"""<tr data-status="{v.status}" data-state="{_h(c.get('state'))}"
-        data-office="{_h(c.get('office'))}" data-party="{_h(c.get('party'))}">
-      <td class="cand"><a href="{_h(c['candidate_id'])}.html">{_h(_display_name(c.get('name')))}</a></td>
+        data-office="{_h(c.get('office'))}" data-party="{_h(c.get('party'))}"
+        data-name="{_h(_display_name(c.get('name')))}">
+      <td class="cand"><a href="{_h(c['candidate_id'])}.html">{_h(c.get('name'))}</a></td>
       <td class="seat">{_h(c.get('office'))}-{_h(c.get('state'))}{('-' + _h(c.get('district'))) if c.get('district') else ''}</td>
       <td class="party">{_h(c.get('party'))}</td>
       <td><a class="status {pill_cls}" href="{_h(c['candidate_id'])}.html">{pill_txt}</a></td>
-      <td class="num conf">{conf}</td>
       <td class="num ie ie-col">{ie}</td>
-      <td class="num pages">{v.scan_count}</td>
     </tr>"""
 
 
@@ -1989,14 +1993,17 @@ function apply(){const t=q.value.trim().toLowerCase(),s=fs.value,st=fst.value,
   if(active)loadAll();
   const src=active&&allRows?allRows:pageRows;
   if(shown!==src){shown=src;tb.replaceChildren(...src);}
-  shown.forEach(r=>{const name=r.children[0].textContent.toLowerCase();
-    const ok=(!t||name.includes(t))&&(!s||r.dataset.status===s)&&(!st||r.dataset.state===st);
+  shown.forEach(r=>{const name=r.children[0].textContent.toLowerCase(),
+    fec=(r.dataset.name||'').toLowerCase();
+    const ok=(!t||name.includes(t)||fec.includes(t))&&(!s||r.dataset.status===s)&&(!st||r.dataset.state===st);
     r.style.display=ok?'':'none';});
   if(pager)pager.style.display=active&&allRows?'none':'';}
 [q,fs,fst].forEach(e=>e.addEventListener('input',apply));
 document.querySelectorAll('th[data-sort]').forEach(th=>th.addEventListener('click',()=>{
   const i=+th.dataset.sort,tb=document.getElementById('rows');
   const sorted=[...tb.querySelectorAll('tr')].sort((a,b)=>{
+    // Candidate cells print the FEC "LAST, FIRST" form, so plain text
+    // comparison already sorts by surname.
     const x=a.children[i].textContent.trim(),y=b.children[i].textContent.trim();
     const nx=parseFloat(x.replace(/[$,]/g,'')),ny=parseFloat(y.replace(/[$,]/g,''));
     if(!isNaN(nx)||!isNaN(ny)){return(isNaN(ny)?-Infinity:ny)-(isNaN(nx)?-Infinity:nx);}
@@ -2077,8 +2084,12 @@ code{font-size:.85em;background:var(--paper-bright);border:1px solid var(--hair)
 .ended-banner{margin:1.6rem 0 0;padding:1rem 1.3rem;border-top:1px solid var(--line);border-bottom:1px solid var(--line);font-style:italic;font-size:.97rem;color:var(--ink-soft)}
 .review-banner strong{font-style:normal;color:var(--amber)}
 .gone-note{margin:1.2rem 0 0;padding:.6rem 1.1rem;border-left:3px solid var(--ink-faint);font-size:.94rem;font-style:italic;color:var(--ink-soft)}
-.versions{margin:1.4rem 0 0}
-.versions summary{cursor:pointer;color:var(--red-deep);font-family:var(--grot);font-size:.82rem;letter-spacing:.04em}
+.versions{margin:1.8rem 0 0}
+/* Summary matches .pagetext summary exactly — the collapsed-section rows at
+   the bottom of an exhibit read as one set. */
+.versions summary{cursor:pointer;font-family:var(--grot);font-size:.7rem;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--red-deep)}
+.versions summary::marker{color:var(--red)}
+.versions[open] summary{margin-bottom:.7rem}
 .versions .v-note{font-size:.88rem;color:var(--ink-faint);margin:.6rem 0 0}
 .version{border-top:1px solid var(--line);margin-top:.9rem;padding-top:.7rem}
 .version .v-span{font-family:var(--grot);font-size:.72rem;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-faint);margin:0 0 .4rem}
