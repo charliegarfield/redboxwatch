@@ -774,8 +774,18 @@ def _write_feeds(out_dir: Path, views: list[CandidateView]) -> None:
                .encode()).hexdigest()[:8] if approved_ex else "0")
         guid = f"{cid}#{sig}"
         n = len(approved_ex)
-        title = (f"{_display_name(v.row['name'])} ({_seat_compact(v.row)}) "
-                 "— red-box guidance found" + (f" ({n} exhibits)" if n > 1 else ""))
+        # A multi-exhibit item reads as an update only when its approvals span
+        # more than one day: candidates routinely DEBUT with several boxes
+        # approved in one bulk review session, and that first announcement
+        # must not call itself "updated". A later same-day second approval can
+        # slip through as a plain title — understating beats overclaiming.
+        approval_days = {((e["review"] or {}).get("reviewed_at") or "")[:10]
+                         for e in approved_ex}
+        name_seat = f"{_display_name(v.row['name'])} ({_seat_compact(v.row)})"
+        if n > 1 and len(approval_days) > 1:
+            title = f"Updated red-box guidance found for {name_seat}"
+        else:
+            title = f"{name_seat} — red-box guidance found"
         if n > 1:
             # An update should showcase what's new: the most recently
             # approved exhibit, not the top-ranked (usually oldest) one.
@@ -2067,7 +2077,10 @@ code{font-size:.85em;background:var(--paper-bright);border:1px solid var(--hair)
 .headline{margin:0;font-family:var(--display);font-weight:540;font-variation-settings:"opsz" 144,"WONK" 1;font-size:clamp(2.5rem,6.4vw,4.15rem);line-height:1.01;letter-spacing:-.018em;text-wrap:balance;max-width:20ch}
 .headline-cand{font-size:clamp(2.1rem,5.4vw,3.4rem);max-width:none}
 .deck{margin:1.35rem 0 0;font-family:var(--display);font-weight:400;font-style:italic;font-variation-settings:"opsz" 34;font-size:clamp(1.15rem,2.4vw,1.45rem);line-height:1.45;color:var(--ink-soft);max-width:34em;text-wrap:pretty}
-.byline-row{margin:1.8rem 0 0;padding:.65rem 0;border-top:1px solid var(--hair);border-bottom:1px solid var(--hair);font-family:var(--grot);font-size:.72rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-soft);display:flex;gap:.7em 1.4em;flex-wrap:wrap;align-items:baseline}
+/* Letter-spacing/gap leave ~40px headroom at the 64rem wrap width: the row
+   used to sit within a few px of overflow, and a universe count with wider
+   digit glyphs (1,114 -> 1,169) was enough to wrap it onto two lines. */
+.byline-row{margin:1.8rem 0 0;padding:.65rem 0;border-top:1px solid var(--hair);border-bottom:1px solid var(--hair);font-family:var(--grot);font-size:.72rem;letter-spacing:.085em;text-transform:uppercase;color:var(--ink-soft);display:flex;gap:.7em 1em;flex-wrap:wrap;align-items:baseline}
 .byline-row strong{color:var(--ink);font-weight:700}
 .byline-row .sep{color:var(--red)}
 .dropcap::first-letter{font-family:var(--display);font-weight:800;font-variation-settings:"opsz" 144;float:left;font-size:3.7em;line-height:.78;padding:.06em .12em 0 0;color:var(--ink)}

@@ -355,7 +355,9 @@ def test_new_exhibit_reannounces_feed_item(tmp_path):
     second = _json.loads((out2 / "feed.json").read_text())["items"][0]
 
     assert second["id"] != first["id"]                      # re-announces
-    assert "(2 exhibits)" in second["title"]
+    # Approvals span two days, so this genuinely is an update — the title
+    # says so instead of the old "(2 exhibits)" jargon.
+    assert second["title"].startswith("Updated red-box guidance found for ")
     assert second["date_published"].startswith("2026-06-11")
     assert "update.pdf" in second["content_text"]           # newest showcased
     assert "suburban voters need to read" in second["content_text"]
@@ -378,6 +380,38 @@ def test_new_exhibit_reannounces_feed_item(tmp_path):
                       site_url="https://redboxwatch.org/")
     third = _json.loads((out3 / "feed.json").read_text())["items"][0]
     assert third["id"] == second["id"]
+    conn.close()
+
+
+def test_multi_exhibit_debut_is_not_titled_as_update(tmp_path):
+    # Candidates routinely debut with several boxes approved in one bulk
+    # review session (the item's FIRST feed appearance). That announcement
+    # must not call itself "Updated" — only approvals spanning more than one
+    # day read as an update.
+    import json as _json
+    conn = init_db(tmp_path / "db.sqlite")
+    det_id = _seed(conn)
+    conn.execute("""INSERT INTO reviews (detection_id,reviewer,action,reviewed_at)
+                    VALUES (?,?,?,?)""", (det_id, "editor", "approve", "2026-05-30T09:00:00+00:00"))
+    cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash,
+        http_status,raw_text)
+        VALUES ('H1','https://example.org/other.pdf','2026-05-29T00:00:00+00:00','def',
+                200,'page body')""")
+    cur = conn.execute("""INSERT INTO detections (scan_id,candidate_id,classification,
+        confidence,evidence,rationale,model,classified_at)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        (cur.lastrowid, 'H1', 'red_box_guidance', 0.9,
+         '[{"quote":"suburban voters need to read","why":"directive"}]',
+         'second box', 'claude-haiku-4-5', '2026-05-29T00:00:00+00:00'))
+    conn.execute("""INSERT INTO reviews (detection_id,reviewer,action,reviewed_at)
+                    VALUES (?,?,?,?)""", (cur.lastrowid, "editor", "approve", "2026-05-30T11:00:00+00:00"))
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True,
+                     site_url="https://redboxwatch.org/")
+    item = _json.loads((out / "feed.json").read_text())["items"][0]
+    assert "Updated" not in item["title"]
+    assert "exhibits" not in item["title"]
+    assert item["title"].endswith("— red-box guidance found")
     conn.close()
 
 
