@@ -916,6 +916,8 @@ def cmd_review(args, cfg) -> int:
             groups: dict = {}
             for r in pend:
                 groups.setdefault((r["candidate_id"], r["text_hash"]), []).append(r)
+            from .reviewweb import cross_committee_twins, multi_committee_hashes
+            multi = multi_committee_hashes(conn)
             print(f"{len(groups)} finding(s) pending review "
                   f"({len(pend)} detection(s) incl. template aliases):\n")
             for rows in groups.values():
@@ -924,6 +926,18 @@ def cmd_review(args, cfg) -> int:
                          if len(rows) > 1 else "")
                 print(f"  #{r['detection_id']}  {r['name']} ({r['candidate_id']})  "
                       f"{r['classification']} conf={r['confidence']:.2f}{alias}\n      {r['url']}")
+                if r["text_hash"] in multi:
+                    # Same page body positive under another committee: only one
+                    # race's attribution is right — approve one, reject the rest.
+                    others = {t["candidate_id"]: t
+                              for t in cross_committee_twins(conn, r["detection_id"])}
+                    for t in others.values():
+                        state = t["review_action"] or "pending"
+                        print(f"      ⚠ MULTI-COMMITTEE: same page detected under "
+                              f"{t['name']} ({t['candidate_id']}, "
+                              f"{t['office']}-{t['state']}) — #{t['detection_id']} "
+                              f"[{state}]. Approve only the committee for the race "
+                              f"the guidance targets.")
             print("\nApprove/reject:  python -m redbox review --detection <ID> "
                   "--action approve|reject|needs_more [--group]")
         conn.close()

@@ -116,6 +116,57 @@ WHERE d.detection_id = ?
   AND d2.classification IN ('red_box_guidance','ambiguous')
 """
 
+# Positive detections of the SAME page body under a DIFFERENT candidate — the
+# multi-committee trap: one person's old and current committees both resolve to
+# one site (e.g. a House committee and a leftover Senate committee), the scanner
+# hits it once per committee, and the identical red box lands in the queue twice.
+# The guidance concerns exactly one race, so exactly one attribution is right;
+# without a flag a reviewer approves both and the ledger double-counts. Twins are
+# reported whatever their review state — an already-approved twin is precisely
+# the case where one of the two decisions needs revisiting.
+_CROSS_COMMITTEE_SQL = """
+WITH latest AS (
+  SELECT detection_id, action FROM (
+    SELECT detection_id, action, ROW_NUMBER() OVER (
+        PARTITION BY detection_id ORDER BY reviewed_at DESC, review_id DESC) rn
+    FROM reviews) WHERE rn = 1)
+SELECT d2.detection_id, d2.candidate_id, c2.name, c2.office, c2.state,
+       c2.district, c2.inactive, s2.url, r.action AS review_action
+FROM detections d
+JOIN scans s USING(scan_id)
+JOIN scans s2 ON s2.text_hash = s.text_hash
+             AND s2.candidate_id <> s.candidate_id
+JOIN detections d2 ON d2.scan_id = s2.scan_id
+JOIN candidates c2 ON c2.candidate_id = d2.candidate_id
+LEFT JOIN latest r ON r.detection_id = d2.detection_id
+WHERE d.detection_id = ?
+  AND d2.classification IN ('red_box_guidance','ambiguous')
+ORDER BY d2.candidate_id, d2.detection_id
+"""
+
+
+def cross_committee_twins(conn: sqlite3.Connection, detection_id: int) -> list[dict]:
+    """Positive detections of this detection's page body attributed to another
+    candidate record, in any review state. Non-empty means the same red box is
+    (or was) claimed for more than one race and only one attribution can be
+    right."""
+    return [dict(r) for r in conn.execute(_CROSS_COMMITTEE_SQL, (detection_id,))]
+
+
+# text_hash values whose positive detections span more than one candidate_id —
+# the queue-level version of the twin check, one query for the whole list.
+_MULTI_COMMITTEE_HASHES_SQL = """
+SELECT s.text_hash FROM detections d JOIN scans s USING(scan_id)
+WHERE d.classification IN ('red_box_guidance','ambiguous')
+GROUP BY s.text_hash
+HAVING COUNT(DISTINCT d.candidate_id) > 1
+"""
+
+
+def multi_committee_hashes(conn: sqlite3.Connection) -> set[str]:
+    """All text_hashes with positive detections under 2+ candidates."""
+    return {r["text_hash"] for r in conn.execute(_MULTI_COMMITTEE_HASHES_SQL)}
+
 
 def pending_groups(conn: sqlite3.Connection) -> list[list[dict]]:
     """Pending detections grouped into findings: one group per distinct
@@ -283,6 +334,7 @@ def detection_view(conn: sqlite3.Connection, detection_id: int) -> dict | None:
         "reviews": reviews,
         "corroboration": dict(corr) if corr else None,
         "siblings": siblings,
+        "cross_committee": cross_committee_twins(conn, detection_id),
         "evidence": evidence,
     }
 
@@ -336,16 +388,19 @@ def _done_banner(qs: dict[str, list[str]]) -> str:
 def _render_queue(conn: sqlite3.Connection, qs: dict[str, list[str]]) -> str:
     groups = pending_groups(conn)
     n_detections = sum(len(g) for g in groups)
+    multi = multi_committee_hashes(conn)
     rows = []
     for g in groups:
         r = g[0]
         pill_txt, pill_cls = _CLASS_PILL.get(r["classification"], ("—", "pill-muted"))
         seat = f"{r['office'] or ''}-{r['state'] or ''}" + (f"-{r['district']}" if r["district"] else "")
         alias = f'<span class="alias-tag">+{len(g) - 1} alias</span>' if len(g) > 1 else ""
+        twin = (' <span class="twin-tag">multi-committee</span>'
+                if r["text_hash"] in multi else "")
         verified = "" if r["url_verified"] else ' <span class="unverified-tag">unverified URL</span>'
         conf = f"{r['confidence']:.2f}" if r["confidence"] is not None else "—"
         rows.append(f"""<tr>
-          <td><a href="/detection/{r['detection_id']}">{_h(r['name'])}</a>{verified}</td>
+          <td><a href="/detection/{r['detection_id']}">{_h(r['name'])}</a>{verified}{twin}</td>
           <td>{_h(seat)}</td>
           <td><span class="pill {pill_cls}">{pill_txt}</span></td>
           <td class="num">{conf}</td>
@@ -414,6 +469,30 @@ def _render_detail(view: dict, *, reviewer_default: str, n_pending: int) -> str:
                 f'This site URL was auto-resolved (source: '
                 f'{_h(c.get("url_source") or "unknown")}) — confirm the site really '
                 f'belongs to this candidate before approving.</div>')
+
+    twins = view.get("cross_committee") or []
+    if twins:
+        by_cand: dict[str, list[dict]] = {}
+        for t in twins:
+            by_cand.setdefault(t["candidate_id"], []).append(t)
+        items = []
+        for tcid, rows in by_cand.items():
+            t = rows[0]
+            tseat = f"{t['office'] or ''}-{t['state'] or ''}" + (
+                f"-{t['district']}" if t["district"] else "")
+            dets = ", ".join(
+                f'<a href="/detection/{r["detection_id"]}">#{r["detection_id"]}</a>'
+                + (f' ({_h(r["review_action"])})' if r["review_action"] else " (pending)")
+                for r in rows)
+            inactive = " · candidacy inactive" if t["inactive"] else ""
+            items.append(f'<li>{_h(t["name"])} — {_h(tseat)} '
+                         f'<span class="qurl">({_h(tcid)}{inactive})</span>: {dets}</li>')
+        warn += (f'<div class="warn-banner"><strong>Multi-committee page.</strong> '
+                 f'This exact page body was also detected under a different '
+                 f'committee for what is likely the same campaign site. The '
+                 f'guidance applies to one race — approve it under the committee '
+                 f'for that race and reject the other attribution(s):'
+                 f'<ul class="twin-list">{"".join(items)}</ul></div>')
 
     meta = f"""<dl class="meta">
       <dt>Seat</dt><dd>{_h(seat)} · {_h(c.get('party'))}</dd>
@@ -678,6 +757,9 @@ REVIEW_CSS = """
 .warn-banner{background:#fbeaea;border:1px solid #e0b4b4;border-left:4px solid var(--pos);padding:12px 16px;border-radius:4px;margin:16px 0;font-size:.94rem}
 .alias-tag{background:#eceae4;color:#88847a;border-radius:999px;padding:1px 8px;font-size:.72rem;font-weight:700;margin-left:6px;white-space:nowrap}
 .unverified-tag{background:#fbe7c7;color:#8a5a14;border-radius:999px;padding:1px 8px;font-size:.7rem;font-weight:700;margin-left:6px;white-space:nowrap}
+.twin-tag{background:#f3e0ee;color:#7d3a6c;border-radius:999px;padding:1px 8px;font-size:.7rem;font-weight:700;margin-left:6px;white-space:nowrap}
+.twin-list{margin:8px 0 0 18px;padding:0}
+.twin-list li{margin:4px 0}
 .qurl{color:#7a766a;font-size:.84rem;word-break:break-all}
 .empty{color:#6b675c;font-style:italic}
 details.rawtext,details.aliases{margin:14px 0}

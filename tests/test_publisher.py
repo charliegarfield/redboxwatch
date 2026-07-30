@@ -227,7 +227,11 @@ def test_404_page_built_with_absolute_links(tmp_path):
     nf = (out / "404.html").read_text()
     assert "No page detected" in nf
     assert 'href="/styles.css' in nf
-    assert 'href="/index.html"' in nf
+    # Public builds link the extensionless form Pages serves, so crawlers
+    # never traverse the /X.html -> /X redirect.
+    assert 'href="/"' in nf
+    assert 'href="/methodology"' in nf
+    assert 'href="/index.html"' not in nf
     assert "404" not in (out / "sitemap.xml").read_text()
     conn.close()
 
@@ -296,6 +300,32 @@ def test_display_name_natural_order():
     # …stuttered words collapse, doubled initials don't.
     assert _display_name("GUTHRIE, S. BRETT BRETT HON.") == "S. Brett Guthrie"
     assert _display_name("MURPHY, MORGAN W. W.") == "Morgan W. W. Murphy"
+    # Congressional self-styling and parenthesized military retirement tags.
+    assert _display_name("ADERHOLT, ROBERT B. REP.") == "Robert B. Aderholt"
+    assert _display_name("MARKEY, EDWARD SEN.") == "Edward Markey"
+    assert _display_name("PIERCE, MICHAEL DAVID LTC (RET.)") == "Michael David Pierce"
+    assert _display_name("CHALIFOUX, THOMAS E. COLONEL JR.") == "Thomas E. Chalifoux Jr."
+    # Parenthesized nicknames are names, not titles.
+    assert _display_name("FOSTER, G. WILLIAM (BILL)") == "G. William (Bill) Foster"
+
+
+def test_ledger_name_light_cleanup():
+    # The index keeps the official ALL-CAPS 'LAST, FIRST' ledger form but
+    # drops filing noise: double commas, self-styled titles, stutters.
+    from redbox.publisher import _ledger_name
+    assert _ledger_name("LEE, SUMMER") == "LEE, SUMMER"
+    assert _ledger_name("BRINK,, BRIDGET") == "BRINK, BRIDGET"
+    assert _ledger_name("LANDER, BRAD MR.") == "LANDER, BRAD"
+    assert _ledger_name("DUNN, LAURA L. MS. ESQ.") == "DUNN, LAURA L."
+    assert _ledger_name("GUTHRIE, S. BRETT BRETT HON.") == "GUTHRIE, S. BRETT"
+    # Suffixes stay at the tail where FEC files them, titles between them go.
+    assert _ledger_name("JACKSON, JESSE L. JR") == "JACKSON, JESSE L. JR"
+    assert _ledger_name("SMITH, RAYMOND EDWARD DR. JR.") == "SMITH, RAYMOND EDWARD JR."
+    assert _ledger_name("STEUBE, W. GREGORY III") == "STEUBE, W. GREGORY III"
+    # No comma (or a suffix fused into the surname): as filed.
+    assert _ledger_name("MADONNA") == "MADONNA"
+    assert _ledger_name("ONDER JR, ROBERT FRANK") == "ONDER JR, ROBERT FRANK"
+    assert _ledger_name("") == ""
 
 
 def test_public_build_emits_finding_feeds(tmp_path):

@@ -842,7 +842,7 @@ def _pager(page_no: int, n_pages: int) -> str:
     if n_pages <= 1:
         return ""
     def href(p: int) -> str:
-        return "index.html" if p == 1 else f"index-{p}.html"
+        return _href("index") if p == 1 else _href(f"index-{p}")
     prev = (f'<a class="pg-prev" href="{href(page_no - 1)}">← Prev</a>'
             if page_no > 1 else '<span class="pg-prev pg-off">← Prev</span>')
     nxt = (f'<a class="pg-next" href="{href(page_no + 1)}">Next →</a>'
@@ -937,8 +937,20 @@ def _canonical(path: str) -> str | None:
     return f"{_SITE_URL}/" if path == "index" else f"{_SITE_URL}/{path}"
 
 
+def _href(path: str, root: str = "") -> str:
+    """Internal link target for a page. Public builds link the extensionless
+    form Pages actually serves, so crawlers never traverse (or index) the
+    /X.html → /X redirect; site-less builds keep .html so the output still
+    browses from file:// and servers without pretty URLs."""
+    if not _SITE_URL:
+        return f"{root}{path}.html"
+    if path == "index":
+        return root or "./"
+    return f"{root}{path}"
+
+
 def _seo_head(title: str, path: str, desc: str, og_image: str | None,
-              og_type: str) -> str:
+              og_type: str, og_title: str | None = None) -> str:
     tags = []
     if desc:
         tags.append(f'<meta name="description" content="{_h(desc)}">')
@@ -948,7 +960,7 @@ def _seo_head(title: str, path: str, desc: str, og_image: str | None,
     if desc:
         tags += [
             '<meta property="og:site_name" content="Red Box Watch">',
-            f'<meta property="og:title" content="{_h(title)}">',
+            f'<meta property="og:title" content="{_h(og_title or title)}">',
             f'<meta property="og:description" content="{_h(desc)}">',
             f'<meta property="og:type" content="{_h(og_type)}">',
         ]
@@ -981,16 +993,17 @@ def _css_version() -> str:
 
 def _layout(title: str, body: str, *, page_class: str = "", active: str = "",
             path: str = "", desc: str = "", og_image: str | None = None,
-            og_type: str = "website", root: str = "") -> str:
+            og_type: str = "website", og_title: str | None = None,
+            root: str = "") -> str:
     # root="/" makes internal links absolute — required for 404.html, which
     # Pages serves at arbitrary depths where relative links would break.
-    def nav(href: str, label: str, key: str) -> str:
+    def nav(page: str, label: str, key: str) -> str:
         cur = ' aria-current="page"' if key == active else ""
-        return f'<a href="{root}{href}"{cur}>{label}</a>'
+        return f'<a href="{_href(page, root)}"{cur}>{label}</a>'
     return f"""<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{_h(title)} · Red Box Watch</title>
-{_seo_head(title, path, desc, og_image, og_type)}
+{_seo_head(title, path, desc, og_image, og_type, og_title)}
 <link rel="icon" href="{root}favicon.svg" type="image/svg+xml">
 <link rel="icon" href="{root}favicon.png" type="image/png" sizes="48x48">
 <link rel="apple-touch-icon" href="{root}apple-touch-icon.png">
@@ -1000,10 +1013,10 @@ def _layout(title: str, body: str, *, page_class: str = "", active: str = "",
 <header class="masthead">
   <div class="folio wrap">
     <span>Published {_h(_pub_date())}&ensp;·&ensp;Updated with each build</span>
-    <nav>{nav('index.html', 'Index', 'index')}{nav('methodology.html', 'Methodology', 'methodology')}{nav('corrections.html', 'Corrections &amp; Appeals', 'corrections')}{nav('about.html', 'About', 'about')}</nav>
+    <nav>{nav('index', 'Index', 'index')}{nav('methodology', 'Methodology', 'methodology')}{nav('corrections', 'Corrections &amp; Appeals', 'corrections')}{nav('about', 'About', 'about')}</nav>
   </div>
   <div class="nameplate wrap">
-    <a class="brand" href="{root}index.html"><span class="redbox"></span>Red&nbsp;Box&nbsp;Watch</a>
+    <a class="brand" href="{_href('index', root)}"><span class="redbox"></span>Red&nbsp;Box&nbsp;Watch</a>
     <p class="tagline">A public ledger of red&#8209;boxing &#8212; campaign&#8209;site signals to super PACs</p>
   </div>
   <div class="wrap"><div class="double-rule"></div></div>
@@ -1013,7 +1026,7 @@ def _layout(title: str, body: str, *, page_class: str = "", active: str = "",
   <div class="double-rule"></div>
   <p class="foot-mark"><span class="redbox"></span></p>
   <p>Detections are gated behind human review before any are treated as findings. Negatives are recorded as dated &#8220;no guidance detected as of&#8221; statements, never as &#8220;does not red-box.&#8221; Red-boxing exploits campaign-finance rules openly; it is <strong>not per se unlawful</strong>. Every published claim links to archived evidence. Generated {_h(now_iso()[:16].replace('T', ' '))} UTC.</p>
-  <p class="foot-contact">Press &amp; media: <a class="px-mail" href="#">press&nbsp;[at]&nbsp;redboxwatch&nbsp;[dot]&nbsp;org</a>&ensp;·&ensp;<a href="{root}corrections.html">Corrections &amp; appeals</a>{f'&ensp;·&ensp;<a href="{_SITE_URL}/feed.xml">New-findings RSS</a>' if _SITE_URL else ''}</p>
+  <p class="foot-contact">Press &amp; media: <a class="px-mail" href="#">press&nbsp;[at]&nbsp;redboxwatch&nbsp;[dot]&nbsp;org</a>&ensp;·&ensp;<a href="{_href('corrections', root)}">Corrections &amp; appeals</a>{f'&ensp;·&ensp;<a href="{_SITE_URL}/feed.xml">New-findings RSS</a>' if _SITE_URL else ''}</p>
 </div></footer>
 <script>(function(){{
   var r=function(s){{return s.split('').reverse().join('')}};
@@ -1073,7 +1086,7 @@ def _statemap_pop(st: str, finds: list["CandidateView"], row: int, col: int) -> 
         if v.corroboration and v.corroboration.get("supporting_total"):
             ie = f'<span class="pop-ie">{_h(_money_compact(float(v.corroboration["supporting_total"])))}</span>'
         items.append(
-            f'<li><a href="{_h(c["candidate_id"])}.html">{_h(_display_name(c.get("name")))}</a>'
+            f'<li><a href="{_h(_href(c["candidate_id"]))}">{_h(_display_name(c.get("name")))}</a>'
             f'<span class="pop-seat">{seat}</span>{ie}</li>')
     pos = ("pop-below" if row <= 3 else "") + (" pop-right" if col >= 8 else "")
     name = STATE_NAMES.get(st, st)
@@ -1147,13 +1160,73 @@ _NAME_UPPER = {"II", "III", "IV", "V", "VI", "VII"}
 _NAME_SUFFIX = {"JR", "SR", "II", "III", "IV", "VI", "VII"}
 # Titles/degrees FEC filers append to their own names ('SHAH, AMISH DR.',
 # 'BONAMICI, SUZANNE MS.', 'KAPTUR, MARCY HON. M.C.'). Compared after
-# stripping trailing dots, only in the trailing zone of the given-name half —
+# stripping dots/parens, only in the trailing zone of the given-name half —
 # so 'Do' the Vietnamese name or 'Maj' the Scandinavian name can't be eaten
 # (deliberately excluded), and a leading token is never touched.
 _NAME_TITLE = {"MR", "MRS", "MS", "MISS", "DR", "HON", "REV", "PROF",
-               "SGT", "COL", "CAPT", "LT", "GEN",
+               "SGT", "COL", "COLONEL", "CAPT", "LT", "LTC", "GEN", "RET",
+               "REP", "SEN",
                "MD", "PHD", "DDS", "OD", "JD", "ESQ", "MBA", "CPA", "FACS",
                "M.C"}
+
+
+def _parse_fec_name(name: str) -> tuple[str, list[str], list[str]] | None:
+    """Split FEC 'LAST, FIRST ...' into (surname, given tokens, suffixes),
+    or None when there's no comma to parse.
+
+    Split on commas (empty segments like 'BRINK,, BRIDGET' are filing noise,
+    dropped); surname is the first part, everything after joins as the
+    given-name half. From that half's tail, strip self-styled titles/degrees
+    ('WHALEN, JEROMIE PATRICK DR.', 'DUNN, NEAL PATRICK MD, FACS', with 'THE'
+    swallowed before a title for 'WOMACK, STEPHEN A THE HON') and pull off
+    suffixes ('STEUBE, W. GREGORY III', 'SMITH, RAYMOND EDWARD DR. JR.'),
+    returned innermost-first. A lone bare 'V' with no title context stays
+    put — as a trailing token it's more likely a middle initial ('SMITH, JOHN
+    V') — but after a title it reads as a suffix ('MARKERT, GEORGE WASHINGTON
+    MR V'). Consecutive duplicate tokens are collapsed ('GUTHRIE, S. BRETT
+    BRETT HON.')."""
+    parts = [p.strip() for p in (name or "").split(",") if p.strip()]
+    if len(parts) < 2:
+        return None
+    last = parts[0]
+    given = " ".join(parts[1:]).split()
+    suffixes: list[str] = []
+    saw_title = False
+    while given:
+        # Parens join dots in the strip so '(RET.)' reads as RET; a real
+        # parenthesized nickname ('(JACK)') never lands in the title set.
+        t = given[-1].strip("().")
+        if t in _NAME_TITLE:
+            given.pop()
+            saw_title = True
+            if given and given[-1].rstrip(".") == "THE":
+                given.pop()
+        elif t in _NAME_SUFFIX or t == "V":
+            suffixes.append(given.pop())
+        else:
+            break
+    if suffixes == ["V"] and not saw_title:
+        given.append(suffixes.pop())
+    # Collapse consecutive duplicate words ('S. BRETT BRETT') — but keep
+    # doubled initials ('MORGAN W. W.'), which can be two real names.
+    given = [w for i, w in enumerate(given)
+             if i == 0 or w != given[i - 1] or len(w.rstrip(".")) <= 1]
+    return last, given, suffixes
+
+
+def _ledger_name(name: str) -> str:
+    """Light cleanup for the index ledger: keep the official ALL-CAPS
+    'LAST, FIRST' form (it's the point of the home table, and it sorts by
+    surname for free) but drop the filing noise a formal ledger shouldn't
+    reprint — double commas, self-styled titles/degrees ('LANDER, BRAD MR.'),
+    doubled tokens. Suffixes stay at the tail where FEC files them
+    ('JACKSON, JESSE L. JR'). No comma: as filed."""
+    parsed = _parse_fec_name(name)
+    if not parsed:
+        return name or ""
+    last, given, suffixes = parsed
+    rest = " ".join(given + list(reversed(suffixes)))
+    return f"{last}, {rest}" if rest else last
 
 
 def _display_name(name: str) -> str:
@@ -1161,43 +1234,15 @@ def _display_name(name: str) -> str:
     'MOORE, FELIX BARRY' -> 'Felix Barry Moore'. Display-only — the raw FEC
     string stays the DB/sort/matching key everywhere.
 
-    Reorder: split on commas (empty segments like 'BRINK,, BRIDGET' are filing
-    noise, dropped); surname is the first part, everything after joins as the
-    given-name half. From that half's tail, strip self-styled titles/degrees
-    ('WHALEN, JEROMIE PATRICK DR.', 'DUNN, NEAL PATRICK MD, FACS', with 'THE'
-    swallowed before a title for 'WOMACK, STEPHEN A THE HON') and re-seat
-    suffixes after the surname ('STEUBE, W. GREGORY III', 'SMITH, RAYMOND
-    EDWARD DR. JR.'). A lone bare 'V' with no title context stays put — as a
-    trailing token it's more likely a middle initial ('SMITH, JOHN V') — but
-    after a title it reads as a suffix ('MARKERT, GEORGE WASHINGTON MR V').
-    Consecutive duplicate tokens are collapsed ('GUTHRIE, S. BRETT BRETT
-    HON.'). Suffixes already fused into the surname ('ONDER JR, ROBERT FRANK')
-    land correctly by the swap alone. No comma: name passes through as filed.
+    Parsing quirks live in _parse_fec_name; here the given-name half is
+    re-seated before the surname with suffixes after it — a suffix already
+    fused into the surname ('ONDER JR, ROBERT FRANK') lands correctly by the
+    swap alone. No comma: name passes through as filed.
     Case: capitalize each letter-run (handles hyphens/apostrophes), keep
     roman-numeral suffixes upper, give Mc- surnames their inner cap."""
-    parts = [p.strip() for p in (name or "").split(",") if p.strip()]
-    if len(parts) >= 2:
-        last = parts[0]
-        given = " ".join(parts[1:]).split()
-        suffixes: list[str] = []
-        saw_title = False
-        while given:
-            t = given[-1].rstrip(".")
-            if t in _NAME_TITLE:
-                given.pop()
-                saw_title = True
-                if given and given[-1].rstrip(".") == "THE":
-                    given.pop()
-            elif t in _NAME_SUFFIX or t == "V":
-                suffixes.append(given.pop())
-            else:
-                break
-        if suffixes == ["V"] and not saw_title:
-            given.append(suffixes.pop())
-        # Collapse consecutive duplicate words ('S. BRETT BRETT') — but keep
-        # doubled initials ('MORGAN W. W.'), which can be two real names.
-        given = [w for i, w in enumerate(given)
-                 if i == 0 or w != given[i - 1] or len(w.rstrip(".")) <= 1]
+    parsed = _parse_fec_name(name)
+    if parsed:
+        last, given, suffixes = parsed
         rebuilt = " ".join(given + [last] + list(reversed(suffixes))).strip()
         if rebuilt:
             name = rebuilt
@@ -1387,7 +1432,8 @@ def _render_index(views: list[CandidateView], approved_only: bool, *,
             f"every claim linked to archived evidence.")
     return _layout("Candidate Index" if page_no == 1 else f"Candidate Index — page {page_no}",
                    body, page_class="page-index", active="index",
-                   path="index" if page_no == 1 else f"index-{page_no}", desc=desc)
+                   path="index" if page_no == 1 else f"index-{page_no}", desc=desc,
+                   og_title="Red Box Watch" if page_no == 1 else None)
 
 
 def _index_row(v: CandidateView) -> str:
@@ -1395,8 +1441,9 @@ def _index_row(v: CandidateView) -> str:
     # aligned money. Classifier confidence and page counts are working-notes —
     # they live on the candidate page, not the front door. Names print in the
     # official FEC "LAST, FIRST" form (user's call: the ledger formality is
-    # the point, and it sorts by surname for free); data-name carries the
-    # display form ("Haley Stevens") so the filter matches either name order.
+    # the point, and it sorts by surname for free), lightly cleaned of filing
+    # noise by _ledger_name; data-name carries the display form ("Haley
+    # Stevens") so the filter matches either name order.
     c = v.row
     pill_txt, pill_cls = STATUS_PILL.get(v.status, ("—", "pill-muted"))
     ie = ""
@@ -1405,10 +1452,10 @@ def _index_row(v: CandidateView) -> str:
     return f"""<tr data-status="{v.status}" data-state="{_h(c.get('state'))}"
         data-office="{_h(c.get('office'))}" data-party="{_h(c.get('party'))}"
         data-name="{_h(_display_name(c.get('name')))}">
-      <td class="cand"><a href="{_h(c['candidate_id'])}.html">{_h(c.get('name'))}</a></td>
+      <td class="cand"><a href="{_h(_href(c['candidate_id']))}">{_h(_ledger_name(c.get('name')))}</a></td>
       <td class="seat">{_h(c.get('office'))}-{_h(c.get('state'))}{('-' + _h(c.get('district'))) if c.get('district') else ''}</td>
       <td class="party">{_h(c.get('party'))}</td>
-      <td><a class="status {pill_cls}" href="{_h(c['candidate_id'])}.html">{pill_txt}</a></td>
+      <td><a class="status {pill_cls}" href="{_h(_href(c['candidate_id']))}">{pill_txt}</a></td>
       <td class="num ie ie-col">{ie}</td>
     </tr>"""
 
@@ -1506,7 +1553,7 @@ def _render_candidate(v: CandidateView, *, public: bool = False) -> str:
 
     body = f"""
     <article class="article">
-    <p class="crumb"><a href="index.html">&#8592; Back to the index</a></p>
+    <p class="crumb"><a href="{_href('index')}">&#8592; Back to the index</a></p>
     <p class="kicker">{_h(kicker_status)} <span class="redbox"></span> {_h(office)} &#183; {_h(state_name)} <span class="redbox"></span> {_h(party)}</p>
     <h1 class="headline headline-cand">{_h(_display_name(c.get('name')))} <span class="finding-tag {pill_cls}">{pill_txt}</span></h1>
     {banner}{meta}{'' if public else _render_changes(v)}{detail}{_render_corroboration(v)}
@@ -1851,7 +1898,9 @@ def _render_methodology() -> str:
     contested party primaries, plus an overlay of competitive general-election races. Each
     candidate's official campaign URL is resolved and labeled as either human-verified or
     auto-resolved; <strong>a flagged site's attribution to the candidate is confirmed by a
-    human reviewer before any finding is published.</strong></p>
+    human reviewer before any finding is published.</strong> Red-boxing has historically
+    been concentrated on the Democratic side; the scan itself covers all funded federal
+    candidates regardless of party, and findings reflect what the crawls detect.</p>
     <h2 class="section-head"><span class="redbox"></span>How pages are evaluated</h2>
     <p class="rationale">Sites are crawled with a real browser (visible and hidden page text, plus
     linked PDFs), politely and identifiably. Extracted text is classified by its
@@ -1914,29 +1963,29 @@ def _render_corrections() -> str:
 
 
 def _render_about() -> str:
-    body = """
+    body = f"""
     <article class="article">
     <p class="kicker">About <span class="redbox"></span> Who runs this</p>
-    <h1 class="headline">Built by a volunteer who found the box.</h1>
+    <h1 class="headline">Built by a volunteer who saw the box up close.</h1>
     <p class="rationale">Red Box Watch is an independent, one-person monitoring project. It crawls the
     public websites of federal candidates nationwide, detects red-boxing &#8212; message
     guidance posted in plain sight for the super PACs that are barred from coordinating
     with campaigns directly &#8212; and publishes the evidence: the archived page, the exact
     quoted spans, and the aligned outside spending that followed.</p>
     <h2 class="section-head"><span class="redbox"></span>Why it exists</h2>
-    <p class="rationale">The site is built and maintained by <strong>Charlie Garfield</strong>, who spent 2026
-    as a campaign fellow in New York&#8217;s 12th District &#8212; one of the most
-    expensive House primaries ever run, absorbing more than $20&nbsp;million. Told to
-    downplay the campaign&#8217;s connection to outside money, he went looking &#8212;
-    and found the campaign&#8217;s own red box.</p>
-    <p class="rationale">That page is what this site exists to surface. Voters deserve to know exactly how
+    <p class="rationale">The site is built and maintained by <strong>Charlie Garfield</strong>,
+    who spent 2026 as a campaign fellow in one of the most expensive House primaries
+    ever run, where he saw the effects of red-boxing firsthand.</p>
+    <p class="rationale">Red-box pages are what this site exists to surface. Voters deserve to know exactly how
     involved a candidate is with the outside money in their local race &#8212; not because
     red-boxing is unlawful (it is not), but because it is public, deliberate, and easy to
     miss unless someone points at it.</p>
     <h2 class="section-head"><span class="redbox"></span>Who&#8217;s behind it</h2>
-    <p class="rationale">Charlie is a recent college graduate. He believes technology can make
-    democracy more transparent. Red Box Watch is unaffiliated with any campaign, party,
-    or PAC.</p>
+    <p class="rationale">Charlie is a recent graduate of Davidson College with a degree 
+    in Computer Science and Sociology. He believes technology can make democracy more
+    transparent. Red Box Watch is unaffiliated with any campaign, party, or PAC. Findings
+    currently skew toward Democratic campaigns because the practice historically has; the
+    scan covers every funded candidate of every party.</p>
     <h2 class="section-head"><span class="redbox"></span>Open source</h2>
     <p class="rationale">The entire pipeline &#8212; candidate discovery, crawling, classification,
     evidence archiving, and the generator that builds this site &#8212; is open source at
@@ -1949,7 +1998,7 @@ def _render_about() -> str:
     <p class="rationale">Press and media inquiries:
     <a class="px-mail" href="#">press&nbsp;[at]&nbsp;redboxwatch&nbsp;[dot]&nbsp;org</a>.
     Candidates or representatives disputing a finding:
-    <a href="corrections.html">corrections &amp; appeals</a>.</p>
+    <a href="{_href('corrections')}">corrections &amp; appeals</a>.</p>
     </article>"""
     return _layout("About", body, page_class="page-finding", active="about",
                    path="about",
@@ -1977,10 +2026,10 @@ def _render_404() -> str:
     finding is never proof of absence. Here we make our sole exception.</p>
     <p class="rationale">Candidate pages do come and go as races end and
     candidacies close &#8212; if you followed a link here, the campaign may
-    simply be over. The <a href="/index.html">Candidate Index</a> is current;
-    our <a href="/methodology.html">methodology</a> explains what we track,
+    simply be over. The <a href="{_href('index', '/')}">Candidate Index</a> is current;
+    our <a href="{_href('methodology', '/')}">methodology</a> explains what we track,
     and if you believe this page <em>should</em> exist,
-    <a href="/corrections.html">corrections &amp; appeals</a> is that way.</p>
+    <a href="{_href('corrections', '/')}">corrections &amp; appeals</a> is that way.</p>
     </article>"""
     return _layout("Page not found", body, page_class="page-finding", root="/")
 
@@ -2057,7 +2106,7 @@ code{font-size:.85em;background:var(--paper-bright);border:1px solid var(--hair)
 /* masthead */
 .masthead{padding-top:1.1rem}
 .folio{display:flex;justify-content:space-between;align-items:baseline;gap:1.5rem;border-bottom:1px solid var(--hair);padding-bottom:.6rem;font-family:var(--grot);font-size:.6875rem;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-soft)}
-.folio nav{display:flex;gap:1.75rem}
+.folio nav{display:flex;flex-wrap:wrap;gap:.4rem 1.75rem}
 .folio nav a{text-decoration:none;color:var(--ink-soft)}
 .folio nav a:hover{color:var(--red-deep)}
 .folio nav a[aria-current="page"]{color:var(--ink);font-weight:700;border-bottom:2px solid var(--red);padding-bottom:2px}
@@ -2325,6 +2374,7 @@ a.status:hover{text-decoration:underline;text-decoration-color:var(--red)}
 @media (max-width:640px){
   .wrap,.page-index,.page-finding{padding-left:1.1rem;padding-right:1.1rem}
   .folio{flex-direction:column;gap:.5rem;align-items:flex-start}
+  .folio nav{gap:.4rem 1.1rem}
   .meta{grid-template-columns:8rem 1fr}
   .agate .conf,.agate th:nth-child(5){display:none}
   .evidence li{padding-left:1.1rem}

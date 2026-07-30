@@ -664,3 +664,93 @@ def test_overrides_write_is_atomic_and_locked(tmp_path):
     data = _json.loads(overrides.read_text())
     assert len(data) == 8                       # nobody's entry was lost
     assert not list(tmp_path.glob("websites.json.*"))   # no temp litter
+
+
+# ---------------------------------------------------------------------------
+# Cross-committee (multi-committee) duplicate flagging: the same page body
+# positive under two candidate records — one person's two committees resolving
+# to one site. Only one attribution can be right; the console must say so.
+
+def _seed_two_committees(conn):
+    """One person, two committees (House + leftover Senate), one shared site:
+    the identical page body scans and classifies positive under both."""
+    _seed_candidate(conn, cid="H1", name="COLIN SAMPLE")
+    conn.execute("""INSERT INTO candidates (candidate_id,name,office,state,district,
+        party,cycle,universe_reason,website_url,url_source,url_verified,receipts,
+        created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        ("S1", "COLIN SAMPLE", "S", "NY", "00", "DEM", 2026, "contested_general",
+         "https://example.org", "search", 1, 3000000, "t", "t"))
+    d_house = _seed_detection(conn, cid="H1", text_hash="sharedbody")
+    d_sen = _seed_detection(conn, cid="S1", text_hash="sharedbody")
+    return d_house, d_sen
+
+
+def test_detail_flags_cross_committee_twin(tmp_path):
+    db = tmp_path / "db.sqlite"
+    conn = init_db(db)
+    d_house, d_sen = _seed_two_committees(conn)
+    conn.close()
+    app = ReviewApp(db)
+    _, _, body = get(app, f"/detection/{d_house}")
+    page = body.decode()
+    assert "Multi-committee page" in page
+    assert f"/detection/{d_sen}" in page        # links the twin for triage
+    assert "S-NY" in page                       # names the other race
+    assert "(pending)" in page                  # twin's review state shown
+
+
+def test_detail_twin_shows_decided_state(tmp_path):
+    # An already-approved twin is the dangerous case — the banner must say the
+    # other attribution was approved so the reviewer revisits one of the two.
+    db = tmp_path / "db.sqlite"
+    conn = init_db(db)
+    d_house, d_sen = _seed_two_committees(conn)
+    record_review(conn, d_sen, "approve", reviewer="t")
+    _, _, body = get(ReviewApp(db), f"/detection/{d_house}")
+    page = body.decode()
+    conn.close()
+    assert "Multi-committee page" in page
+    assert "(approve)" in page
+
+
+def test_queue_tags_multi_committee_finding(tmp_path):
+    db = tmp_path / "db.sqlite"
+    conn = init_db(db)
+    _seed_two_committees(conn)
+    conn.close()
+    _, _, body = get(ReviewApp(db), "/")
+    page = body.decode()
+    assert page.count("multi-committee") >= 2   # both queue rows tagged
+
+
+def test_no_twin_flag_without_cross_committee_dup(tmp_path):
+    # Template aliases under ONE candidate are a grouping affordance, not a
+    # multi-committee conflict — no twin banner, no queue tag.
+    db = tmp_path / "db.sqlite"
+    conn = init_db(db)
+    _seed_candidate(conn)
+    d1 = _seed_detection(conn, url="https://example.org/media", text_hash="same")
+    _seed_detection(conn, url="https://example.org/press", text_hash="same")
+    conn.close()
+    app = ReviewApp(db)
+    _, _, qbody = get(app, "/")
+    _, _, dbody = get(app, f"/detection/{d1}")
+    assert "multi-committee" not in qbody.decode()
+    assert "Multi-committee page" not in dbody.decode()
+
+
+def test_cross_committee_twins_ignore_negatives(tmp_path):
+    # A no-guidance scan of the same body under another committee is not a
+    # conflicting positive attribution.
+    db = tmp_path / "db.sqlite"
+    conn = init_db(db)
+    _seed_candidate(conn, cid="H1")
+    conn.execute("""INSERT INTO candidates (candidate_id,name,created_at,updated_at)
+        VALUES ('S1','OTHER','t','t')""")
+    d1 = _seed_detection(conn, cid="H1", text_hash="same")
+    _seed_detection(conn, cid="S1", text_hash="same",
+                    classification="no_guidance_detected")
+    from redbox.reviewweb import cross_committee_twins
+    assert cross_committee_twins(conn, d1) == []
+    conn.close()
