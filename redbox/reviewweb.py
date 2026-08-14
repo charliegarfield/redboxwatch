@@ -38,8 +38,13 @@ typing in a form field, and every key is hinted inline with a ``<kbd>`` chip.
   removes them from the queue without inventing a URL, or marks the record
   ``inactive=2`` ("not running for this seat": a stale FEC record, e.g. a
   House record for someone actually running for Senate — excluded from
-  resolve/scan/publish). Newly URL'd candidates have no ``scan_status``, so
-  the next ``scan-all`` picks them up.
+  resolve/scan/publish). Saving a URL also clears ``scan_status`` so the next
+  ``scan-all`` re-crawls the candidate at the corrected address. If the
+  candidate already has a website_url, the form shows it and an overwrite
+  must be explicitly confirmed — a human correction is never silent. No-site
+  and wrong-race calls are appended to ``data/url_triage.json`` (outcome,
+  reviewer, timestamp) — the durable human record, same as websites.json is
+  for found URLs.
 
 Pending here means the *latest* review action is absent or ``needs_more``
 (window-function query, same convention as the publisher) — so a detection
@@ -107,11 +112,22 @@ ORDER BY d.confidence DESC, d.detection_id
 
 # All of a detection's template-alias siblings (identical page body for the
 # same candidate), itself included — the same grouping `review --group` uses.
+# Each sibling carries its LATEST review action/reviewer: the detail page must
+# show a decided sibling before the group checkbox fans a new decision out over
+# it (a group reject must never silently flip another reviewer's approve).
 _SIBLINGS_SQL = """
-SELECT d2.detection_id, s2.url FROM detections d
+WITH latest AS (
+  SELECT detection_id, action, reviewer FROM (
+    SELECT detection_id, action, reviewer, ROW_NUMBER() OVER (
+        PARTITION BY detection_id ORDER BY reviewed_at DESC, review_id DESC) rn
+    FROM reviews) WHERE rn = 1)
+SELECT d2.detection_id, s2.url,
+       r.action AS review_action, r.reviewer AS review_reviewer
+FROM detections d
 JOIN scans s USING(scan_id)
 JOIN scans s2 ON s2.candidate_id = s.candidate_id AND s2.text_hash = s.text_hash
 JOIN detections d2 ON d2.scan_id = s2.scan_id
+LEFT JOIN latest r ON r.detection_id = d2.detection_id
 WHERE d.detection_id = ?
   AND d2.classification IN ('red_box_guidance','ambiguous')
 """
@@ -233,43 +249,31 @@ def normalize_url(raw: str) -> str | None:
     return u
 
 
-# One lock for the read-modify-write on the overrides file: the console runs
-# a THREADING server, and two concurrent triage POSTs interleaving the
-# read/write lost the earlier reviewer's URL (last writer wins).
+# One lock for the read-modify-write on the durable JSON files: the console
+# runs a THREADING server, and two concurrent triage POSTs interleaving the
+# read/write lost the earlier reviewer's entry (last writer wins).
 _OVERRIDES_LOCK = threading.Lock()
 
+# Durable record of human no-site / wrong-race calls, beside websites.json —
+# the same role websites.json plays for human-found URLs: a rebuilt DB loses
+# bare UPDATEs, the file keeps who decided what, when.
+URL_TRIAGE_PATH = OVERRIDES_PATH.with_name("url_triage.json")
 
-def record_found_url(conn: sqlite3.Connection, candidate_id: str, url: str, *,
-                     reviewer: str | None = None,
-                     overrides_path: Path = OVERRIDES_PATH) -> None:
-    """A human found the candidate's site: store it as manual/VERIFIED and
-    append it to the overrides file, the durable home for human-curated URLs
-    (a re-resolve or a rebuilt DB re-reads it; DB-only edits would not survive
-    that). The DB write makes the candidate scannable immediately.
 
-    The file write is locked (threading server) and atomic (temp file +
-    os.replace): a crash mid-write must never truncate the canonical
-    human-curated store."""
-    ts = now_iso()
-    conn.execute(
-        """UPDATE candidates SET website_url=?, url_source='manual',
-               url_verified=1, updated_at=? WHERE candidate_id=?""",
-        (url, ts, candidate_id))
-    conn.commit()
+def _write_json_entry(path: Path, key: str, value: dict) -> None:
+    """Locked, atomic read-modify-write of one entry in a JSON-object file.
+
+    Locked (threading server) and atomic (temp file + os.replace): a crash
+    mid-write must never truncate a canonical human-curated store."""
     with _OVERRIDES_LOCK:
-        overrides = (json.loads(overrides_path.read_text())
-                     if overrides_path.exists() else {})
-        overrides[candidate_id] = {
-            "url": url, "verified": True,
-            "note": f"found by {reviewer or 'reviewer'} via review console {ts[:10]}",
-        }
-        overrides_path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=overrides_path.parent,
-                                   prefix=overrides_path.name + ".")
+        data = json.loads(path.read_text()) if path.exists() else {}
+        data[key] = value
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".")
         try:
             with os.fdopen(fd, "w") as f:
-                f.write(json.dumps(overrides, indent=2) + "\n")
-            os.replace(tmp, overrides_path)
+                f.write(json.dumps(data, indent=2) + "\n")
+            os.replace(tmp, path)
         except BaseException:
             try:
                 os.unlink(tmp)
@@ -278,25 +282,61 @@ def record_found_url(conn: sqlite3.Connection, candidate_id: str, url: str, *,
             raise
 
 
-def record_no_site(conn: sqlite3.Connection, candidate_id: str) -> None:
+def record_found_url(conn: sqlite3.Connection, candidate_id: str, url: str, *,
+                     reviewer: str | None = None,
+                     overrides_path: Path = OVERRIDES_PATH) -> None:
+    """A human found the candidate's site: store it as manual/VERIFIED and
+    append it to the overrides file, the durable home for human-curated URLs
+    (a re-resolve or a rebuilt DB re-reads it; DB-only edits would not survive
+    that). scan_status is cleared in the same UPDATE so the next ``scan-all``
+    (which selects unscanned candidates) actually crawls the corrected URL —
+    a previously scanned candidate would otherwise keep its stale disposition
+    and never be re-fetched."""
+    ts = now_iso()
+    conn.execute(
+        """UPDATE candidates SET website_url=?, url_source='manual',
+               url_verified=1, scan_status=NULL, updated_at=?
+           WHERE candidate_id=?""",
+        (url, ts, candidate_id))
+    conn.commit()
+    _write_json_entry(overrides_path, candidate_id, {
+        "url": url, "verified": True,
+        "note": f"found by {reviewer or 'reviewer'} via review console {ts[:10]}",
+    })
+
+
+def record_no_site(conn: sqlite3.Connection, candidate_id: str, *,
+                   reviewer: str | None = None,
+                   triage_path: Path = URL_TRIAGE_PATH) -> None:
     """A human looked and found no site: mark the candidate 'human_none' so the
     queue drops them. website_url stays NULL — nothing is invented, and the
-    publisher keeps reporting them as a coverage gap."""
+    publisher keeps reporting them as a coverage gap. The call (outcome,
+    reviewer, timestamp) is appended to the durable triage file — a rebuilt DB
+    would otherwise forget a human ever checked."""
+    ts = now_iso()
     conn.execute(
         """UPDATE candidates SET url_source='human_none', updated_at=?
-           WHERE candidate_id=?""", (now_iso(), candidate_id))
+           WHERE candidate_id=?""", (ts, candidate_id))
     conn.commit()
+    _write_json_entry(triage_path, candidate_id, {
+        "outcome": "human_none", "reviewer": reviewer or None, "at": ts})
 
 
-def record_wrong_race(conn: sqlite3.Connection, candidate_id: str) -> None:
+def record_wrong_race(conn: sqlite3.Connection, candidate_id: str, *,
+                      reviewer: str | None = None,
+                      triage_path: Path = URL_TRIAGE_PATH) -> None:
     """A human determined this FEC record isn't a real candidacy for this seat
     (e.g. a House record for someone actually running for Senate). inactive=2
     is the human value — `mark-inactive` refreshes FEC flags (inactive=1) but
-    never touches human calls. The row leaves resolve/scan/publish entirely."""
+    never touches human calls. The row leaves resolve/scan/publish entirely.
+    Recorded durably in the triage file like record_no_site."""
+    ts = now_iso()
     conn.execute(
         """UPDATE candidates SET inactive=2, updated_at=?
-           WHERE candidate_id=?""", (now_iso(), candidate_id))
+           WHERE candidate_id=?""", (ts, candidate_id))
     conn.commit()
+    _write_json_entry(triage_path, candidate_id, {
+        "outcome": "wrong_race", "reviewer": reviewer or None, "at": ts})
 
 
 def detection_view(conn: sqlite3.Connection, detection_id: int) -> dict | None:
@@ -554,13 +594,41 @@ def _render_detail(view: dict, *, reviewer_default: str, n_pending: int) -> str:
     siblings = view["siblings"]
     aliases = group_box = ""
     if len(siblings) > 1:
-        urls = "".join(f'<li>{_h(s["url"])} <span class="qurl">(#{s["detection_id"]})</span></li>'
-                       for s in siblings)
-        aliases = (f'<details class="aliases"><summary>{len(siblings)} identical alias '
-                   f'pages (same page body, different URLs)</summary><ul>{urls}</ul></details>')
+        decided_word = {"approve": "approved", "reject": "rejected",
+                        "needs_more": "marked needs-more"}
+        items = []
+        n_decided = 0
+        for s in siblings:
+            act = s.get("review_action")
+            if act in ("approve", "reject"):
+                n_decided += 1
+                state = (f' — <strong>already {_h(decided_word[act])} by '
+                         f'{_h(s.get("review_reviewer") or "(unnamed)")}</strong>')
+            elif act:
+                state = f' — {_h(decided_word.get(act, act))}'
+            else:
+                state = " — pending"
+            items.append(f'<li>{_h(s["url"])} <span class="qurl">'
+                         f'(#{s["detection_id"]})</span>{state}</li>')
+        aliases = (f'<details class="aliases"{" open" if n_decided else ""}>'
+                   f'<summary>{len(siblings)} identical alias '
+                   f'pages (same page body, different URLs)</summary>'
+                   f'<ul>{"".join(items)}</ul></details>')
+        # Fanning one decision out is the default ONLY while every sibling is
+        # undecided. Once any sibling has an approve/reject on record, the box
+        # defaults to UNCHECKED — a group decision would silently overwrite
+        # another reviewer's call, so overriding must be a visible opt-in.
+        if n_decided:
+            checked = ""
+            why = (f' — <strong>{n_decided} of {len(siblings)} already '
+                   f'decided</strong>; check only to override those decisions '
+                   f'too (latest review wins)')
+        else:
+            checked = " checked"
+            why = ""
         group_box = (f'<label class="group-box"><input type="checkbox" name="group" '
-                     f'value="1" checked> Apply to all {len(siblings)} identical alias '
-                     f'pages (one judgment, one review record each) <kbd>g</kbd></label>')
+                     f'value="1"{checked}> Apply to all {len(siblings)} identical alias '
+                     f'pages (one judgment, one review record each){why} <kbd>g</kbd></label>')
 
     history = ""
     if view["reviews"]:
@@ -620,7 +688,12 @@ def _seat(c: dict) -> str:
         f"-{c.get('district')}" if c.get("district") else "")
 
 
-def _url_done_banner(qs: dict[str, list[str]]) -> str:
+def _url_done_banner(conn: sqlite3.Connection, qs: dict[str, list[str]]) -> str:
+    """The one-shot confirmation after a triage POST. It names the candidate
+    (not just the FEC id) and the outcome, so a decision recorded for the wrong
+    row — one mis-click in a long queue — is at least visible; the reopen link
+    is the undo hint (a full undo flow doesn't exist, re-triaging the candidate
+    records the correction)."""
     cid = qs.get("done", [""])[0]
     action = qs.get("as", [""])[0]
     verbs = {
@@ -631,7 +704,14 @@ def _url_done_banner(qs: dict[str, list[str]]) -> str:
     }
     if not cid or action not in verbs:
         return ""
-    return f'<div class="done-banner">{_h(cid)} {verbs[action]}.</div>'
+    row = conn.execute("SELECT name FROM candidates WHERE candidate_id=?",
+                       (cid,)).fetchone()
+    who = f'{_h(row["name"])} ({_h(cid)})' if row else _h(cid)
+    undo = ""
+    if action in ("none", "wrong_race"):
+        undo = (f' Mis-click? <a href="/urls/{_h(cid)}">Reopen this '
+                f'candidate</a> and record the right outcome.')
+    return f'<div class="done-banner">{who} {verbs[action]}.{undo}</div>'
 
 
 def _render_url_queue(conn: sqlite3.Connection, qs: dict[str, list[str]]) -> str:
@@ -658,7 +738,7 @@ def _render_url_queue(conn: sqlite3.Connection, qs: dict[str, list[str]]) -> str
     checked = (f'<p class="srcline">{n_none} candidate(s) previously marked '
                f'no-findable-website by a human.</p>' if n_none else "")
     body = f"""
-    {_url_done_banner(qs)}
+    {_url_done_banner(conn, qs)}
     <h1>Website triage queue</h1>
     <p class="summary">{len(rows)} candidate(s) with no resolved campaign site,
       richest first. A URL you save is stored as <strong>manual / verified</strong>
@@ -679,6 +759,24 @@ def _render_url_form(c: dict, *, n_pending: int, reviewer_default: str,
         f'<a href="https://ballotpedia.org/wiki/index.php?search={quote_plus(str(c.get("name")))}" rel="noopener">Ballotpedia</a>',
     ])
     err = f'<div class="warn-banner">{_h(error)}</div>' if error else ""
+    existing = c.get("website_url") or ""
+    exists_block = confirm_box = ""
+    if existing:
+        # An overwrite must never be silent: show what would be replaced and
+        # require the explicit confirm checkbox before accepting a new URL.
+        exists_block = (
+            f'<div class="warn-banner"><strong>This candidate already has a '
+            f'URL.</strong> Current: <a href="{_h(existing)}" '
+            f'rel="nofollow noopener">{_h(existing)}</a> '
+            f'(source: {_h(c.get("url_source") or "unknown")}, '
+            f'{"verified" if c.get("url_verified") else "unverified"}). '
+            f'Saving a URL below replaces it — tick the confirmation in the '
+            f'form.</div>')
+        confirm_box = (
+            f'<label class="group-box"><input type="checkbox" '
+            f'name="confirm_replace" value="1"> Replace the existing URL '
+            f'({_h(existing)}) with the one above — required to overwrite'
+            f'</label>')
     meta = f"""<dl class="meta">
       <dt>Seat</dt><dd>{_h(_seat(c))} · {_h(c.get('party'))}</dd>
       <dt>FEC receipts</dt><dd>${float(c.get('receipts') or 0):,.0f}</dd>
@@ -689,12 +787,13 @@ def _render_url_form(c: dict, *, n_pending: int, reviewer_default: str,
     {banner}
     <p class="crumb"><a href="/urls">← Site URLs</a> · {n_pending} candidate(s) in the queue</p>
     <div class="cand-head"><h1>{_h(c.get('name'))}</h1></div>
-    {err}{meta}
+    {err}{exists_block}{meta}
     <section class="detection review-form-box">
       <h2>Record what you found</h2>
       <form method="post" class="review-form">
         <label class="field">Campaign website URL (leave blank if none found)
           <input name="url" value="{_h(url_value)}" placeholder="https://…" autofocus></label>
+        {confirm_box}
         <label class="field">Reviewer
           <input name="reviewer" value="{_h(reviewer_default)}" placeholder="your name/id"></label>
         <div class="btn-row">
@@ -809,11 +908,16 @@ class ReviewApp:
     """
 
     def __init__(self, db_path: str | Path,
-                 overrides_path: str | Path | None = None):
+                 overrides_path: str | Path | None = None,
+                 triage_path: str | Path | None = None):
         self.db_path = Path(db_path)
         # Where human-found URLs are durably recorded (data/websites.json
         # unless overridden — tests point this at a temp file).
         self.overrides_path = Path(overrides_path) if overrides_path else OVERRIDES_PATH
+        # Durable no-site / wrong-race calls; defaults beside the overrides
+        # file so a redirected overrides_path keeps both stores together.
+        self.triage_path = (Path(triage_path) if triage_path
+                            else self.overrides_path.with_name("url_triage.json"))
         init_db(self.db_path).close()
 
     def __call__(self, environ, start_response):
@@ -886,7 +990,7 @@ class ReviewApp:
             return self._html(_render_url_form(
                 dict(row), n_pending=len(url_queue(conn)),
                 reviewer_default=self._cookie_reviewer(environ),
-                banner=_url_done_banner(qs)))
+                banner=_url_done_banner(conn, qs)))
 
         return self._not_found("No such page.")
 
@@ -929,9 +1033,11 @@ class ReviewApp:
         reviewer = (form.get("reviewer") or "").strip()
         cid = cand["candidate_id"]
         if outcome == "none":
-            record_no_site(conn, cid)
+            record_no_site(conn, cid, reviewer=reviewer or None,
+                           triage_path=self.triage_path)
         elif outcome == "wrong_race":
-            record_wrong_race(conn, cid)
+            record_wrong_race(conn, cid, reviewer=reviewer or None,
+                              triage_path=self.triage_path)
         elif outcome == "found":
             url = normalize_url(form.get("url", ""))
             if not url:
@@ -939,6 +1045,16 @@ class ReviewApp:
                     cand, n_pending=len(url_queue(conn)), reviewer_default=reviewer,
                     error="That doesn't look like a usable http(s) URL — "
                           "check it and try again (or use “No website found”).",
+                    url_value=form.get("url", "")))
+            if cand.get("website_url") and form.get("confirm_replace") != "1":
+                # Overwriting an auto-resolved (or earlier human) URL must be
+                # an explicit act — re-render with the existing URL shown and
+                # the confirm checkbox required, saving nothing.
+                return self._html(_render_url_form(
+                    cand, n_pending=len(url_queue(conn)), reviewer_default=reviewer,
+                    error="This candidate already has a website URL on record. "
+                          "To replace it, tick “Replace the existing URL” and "
+                          "save again — nothing was changed.",
                     url_value=form.get("url", "")))
             record_found_url(conn, cid, url, reviewer=reviewer or None,
                              overrides_path=self.overrides_path)

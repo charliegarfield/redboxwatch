@@ -21,9 +21,13 @@ statement about a real person, we do **not** silently ignore robots. Instead:
   (per-domain overrides are deployment-specific decisions and live in the
   untracked local config, not the public repo). Host matching is normalized:
   an override for `example.com` also covers `www.example.com`.
-- Every fetch records its posture (`respect` | `override`) in the
-  `scans.robots_posture` column, so the basis for collecting any given page
-  is auditable after the fact.
+- Every **page and PDF fetch** records its posture (`respect` | `override`)
+  in the `scans.robots_posture` column, so the basis for collecting any given
+  page is auditable after the fact. (Sitemap and robots.txt fetches during
+  enumeration produce no `scans` rows and so carry no recorded posture — but
+  sitemap *documents* are themselves robots-gated: a sitemap the site's
+  robots.txt disallows is skipped. robots.txt itself is by definition always
+  fetchable.)
 
 ## Why this shape
 
@@ -49,7 +53,16 @@ add the host to `robots_policy.per_domain` (in the untracked
 - **Honest User-Agent** identifying the project and a contact address
   (`config.yaml -> user_agent`). No spoofing of browser UAs to evade blocks.
 - **Per-domain rate limiting** with a minimum inter-request delay
-  (`config.yaml -> rate_limit`).
+  (`config.yaml -> rate_limit`). The limiter is a single instance **shared
+  across all `scan-all` workers**, so concurrent workers landing on the same
+  host still honor the delay between them.
+- **429/503 backoff** (`redbox/crawler.py`): on a rate-limit response the
+  crawler pushes the host's next-allowed fetch forward — by the server's
+  `Retry-After` when sent (delta-seconds or HTTP-date, capped at 300 s so a
+  hostile `Retry-After: 86400` can't pin a worker), else exponentially from
+  30 s, doubling per consecutive 429/503. After **3 consecutive** rate-limit
+  responses the host is abandoned for the rest of that crawl (it gets
+  rescanned on a later run). Any non-rate-limit response resets the streak.
 - **A real browser context** (Playwright/Chromium) is used for rendering, not to
   disguise the crawler — JS-rendered and hidden/unlinked content is part of the
   detection target (§3.3).
@@ -62,4 +75,5 @@ add the host to `robots_policy.per_domain` (in the untracked
 ## What we never do
 
 - No login/credential bypass, no paywalled content, no non-public endpoints.
-- No high request rates; no ignoring 429s (we back off).
+- No high request rates; no ignoring 429s — we back off and, on repeated
+  429/503s, walk away from the host entirely (see the backoff rules above).

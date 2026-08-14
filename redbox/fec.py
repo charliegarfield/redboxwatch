@@ -7,6 +7,8 @@ api.data.gov rate limit. Pass ``use_cache=False`` to force-refresh.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Iterator
@@ -45,6 +47,23 @@ class FECClient:
         digest = sha256_text(path + "?" + json.dumps(keyable, sort_keys=True))
         return self.cache_dir / f"{digest}.json"
 
+    def _write_cache(self, cache_file: Path, data: dict[str, Any]) -> None:
+        """Atomic cache write: tempfile-in-same-dir + os.replace (the same
+        pattern as weball.fetch_weball). A plain write_text interrupted by
+        Ctrl-C left truncated JSON that raised JSONDecodeError on every
+        future read of that key, forever."""
+        fd, tmp = tempfile.mkstemp(dir=self.cache_dir, prefix=".cache-")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(json.dumps(data))
+            os.replace(tmp, cache_file)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            raise
+
     def _throttle(self) -> None:
         elapsed = time.monotonic() - self._last_request
         if elapsed < self.min_delay:
@@ -58,7 +77,13 @@ class FECClient:
         params = dict(params or {})
         cache_file = self._cache_path(path, params)
         if use_cache and cache_file.exists():
-            return json.loads(cache_file.read_text())
+            try:
+                return json.loads(cache_file.read_text())
+            except (json.JSONDecodeError, OSError):
+                # Truncated/corrupt cache entry (e.g. a write interrupted
+                # before writes were atomic) — treat as a miss and refetch;
+                # the fresh response overwrites the bad file.
+                pass
 
         params["api_key"] = self.api_key
         url = f"{BASE_URL}{path}"
@@ -68,24 +93,27 @@ class FECClient:
             self._throttle()
             try:
                 resp = self._client.get(url, params=params)
-            except (httpx.TimeoutException, httpx.TransportError):
-                # Transient network failure (read timeout, connection reset).
-                # At scale these are routine — back off and retry rather than
-                # crash the whole run.
+            except httpx.TransportError:
+                # Transient network failure (read timeout, connection reset —
+                # TimeoutException is a TransportError subclass). At scale
+                # these are routine — back off and retry rather than crash
+                # the whole run.
                 if attempt == max_attempts - 1:
                     raise
                 time.sleep(min(2.0 * (2 ** attempt), 30.0))
                 continue
-            if resp.status_code != 429:
+            if resp.status_code != 429 and resp.status_code < 500:
                 break
-            # Rate limited — honor Retry-After if present, else exponential backoff.
+            # Rate limited (429) or an openFEC-side 5xx — both are transient
+            # at this scale. Honor Retry-After if present, else exponential
+            # backoff. A persistent 5xx falls through to raise_for_status.
             retry_after = resp.headers.get("retry-after")
             delay = float(retry_after) if retry_after and retry_after.isdigit() else 2.0 * (2 ** attempt)
             if attempt < max_attempts - 1:
                 time.sleep(min(delay, 60.0))
         resp.raise_for_status()
         data = resp.json()
-        cache_file.write_text(json.dumps(data))
+        self._write_cache(cache_file, data)
         return data
 
     # ------------------------------------------------------------------

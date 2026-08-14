@@ -1,4 +1,4 @@
-// Red Box Watch → Bluesky poster.
+// RedBoxWatch → Bluesky poster.
 //
 // Hourly cron: fetch the site's JSON Feed, post any finding not yet in the
 // KV "posted-ids" set, oldest first, capped per run. The first run ever
@@ -47,20 +47,30 @@ async function tick(env) {
 
   const posted = new Set(stored);
   // Feed is newest-first; post oldest-first so the timeline reads naturally.
-  const fresh = items.filter((i) => i.id && !posted.has(i.id)).reverse();
+  let fresh = items.filter((i) => i.id && !posted.has(i.id)).reverse();
   // A feed guid-scheme change makes every item look new at once (it happened:
   // cid/detection_id -> cid re-posted the whole backfill over a weekend).
-  // Genuine news arrives a few items at a time; a wall of "new" is a
-  // migration — absorb it into state without posting, like the bootstrap.
+  // But a wall of "new" is NOT always a migration: candidates routinely debut
+  // in bulk after one review session, and absorbing those wholesale silently
+  // never-posted them. The actual migration signature is per item: its
+  // candidate prefix (the id before '#') is already in posted state under a
+  // DIFFERENT suffix — a re-keyed known finding, not news. Absorb exactly
+  // those; genuinely new candidates post normally (still capped per run).
   const floodLimit = Number(env.FLOOD_LIMIT || "15");
+  let absorbed = 0;
   if (fresh.length > floodLimit) {
-    for (const i of fresh) posted.add(i.id);
-    await env.STATE.put("posted-ids", JSON.stringify([...posted]));
-    console.log(JSON.stringify({ event: "migration-absorbed", count: fresh.length }));
-    return { absorbed: fresh.length, posted: 0 };
+    const postedPrefixes = new Set([...posted].map((id) => String(id).split("#")[0]));
+    const rekeyed = fresh.filter((i) => postedPrefixes.has(String(i.id).split("#")[0]));
+    if (rekeyed.length) {
+      for (const i of rekeyed) posted.add(i.id);
+      await env.STATE.put("posted-ids", JSON.stringify([...posted]));
+      console.log(JSON.stringify({ event: "migration-absorbed", count: rekeyed.length }));
+      fresh = fresh.filter((i) => !posted.has(i.id));
+      absorbed = rekeyed.length;
+    }
   }
   const toPost = fresh.slice(0, Number(env.MAX_POSTS_PER_RUN || "5"));
-  if (!toPost.length) return { posted: 0, pending: 0 };
+  if (!toPost.length) return { posted: 0, pending: 0, absorbed };
 
   const session = await xrpc("com.atproto.server.createSession", null, {
     identifier: env.BSKY_HANDLE,
@@ -104,7 +114,10 @@ async function tick(env) {
                                    message: String(err) }));
     }
   }
-  return { posted: count, failed, pending: fresh.length - count };
+  // pending = rate-capped remainder only; failed items are reported in
+  // `failed` (they stay un-recorded and retry next run, but lumping them
+  // into pending hid failures behind an expected-looking backlog number).
+  return { posted: count, failed, pending: fresh.length - toPost.length, absorbed };
 }
 
 async function xrpc(method, jwt, body) {

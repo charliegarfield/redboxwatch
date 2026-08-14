@@ -15,32 +15,32 @@ Legal-safety discipline (spec §3.7a) is enforced here:
   "does not red-box".
 - Methodology and corrections pages are generated (spec §3.7a).
 
-This is the local review build (`--include-pending`, default). A strict public
-build (`--approved-only`) would emit approved positives + dated negatives only.
+This is the local review build (the default). The strict public build
+(`--approved-only`) emits approved positives + dated negatives only.
 """
 from __future__ import annotations
 
-import html
+import hashlib
 import json
+import re
 import shutil
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
+from email.utils import format_datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from .pipeline import usable_scan_sql
+# Shared presentation pieces live in render.py (labels, escaping, fonts, the
+# STATUSES table, and the static assets under redbox/assets/). They are
+# imported AND re-exported here: reviewweb.py and others import them from
+# redbox.publisher, and that surface must keep working.
+from .render import (AMBIGUOUS_CONFIRMED_LABEL, AMBIGUOUS_LABEL, CSS,
+                     CSS_VERSION, FAVICON_ICO, FAVICON_PNG48, FAVICON_PNG180,
+                     FAVICON_SVG, INDEX_JS, POSITIVE_LABEL, STATUSES,
+                     StatusSpec, _FONTS, _h, _neg_label)
 from .util import STATE_NAMES, now_iso, sha256_text
-
-POSITIVE_LABEL = "Posted public messaging guidance consistent with red-boxing"
-AMBIGUOUS_LABEL = "Possible messaging guidance — under review"
-# An ambiguous detection a human reviewer then approved: publishable, with the
-# classifier's initial hesitation disclosed rather than hidden.
-AMBIGUOUS_CONFIRMED_LABEL = ("Posted public messaging guidance consistent with "
-                             "red-boxing — initially classified ambiguous by the "
-                             "automated screen; confirmed on human review")
-
-
-def _neg_label(date: str) -> str:
-    return f"No public messaging guidance detected as of {date[:10]}"
 
 
 @dataclass
@@ -471,8 +471,7 @@ def _quote_diff(old_det: dict, new_det: dict) -> tuple[list[str], list[str]]:
 
 
 def _norm_span(s: str | None) -> str:
-    import re as _re
-    return _re.sub(r"\s+", " ", (s or "")).strip().lower()
+    return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
 
 def _quote_set(evidence_json: str | None) -> set[str]:
@@ -531,11 +530,7 @@ def _exhibit_timeline(det: dict, changes: list[dict], urls: list[str],
         if ch.get("url") not in urls:
             continue
         day = (ch.get("detected_at") or "")[:10]
-        kind = ch["event_type"]
-        if kind == "modified":
-            same = ch.get("guidance_same")
-            kind = "updated" if same else ("revised" if same is False else "changed")
-        entries.add((day, kind))
+        entries.add((day, _change_key(ch)))
     modified_days = {d for d, k in entries if k in ("updated", "revised", "changed")}
     for day in revision_days:
         if day and day not in modified_days:
@@ -552,13 +547,17 @@ def _status(det, review, last, scan_count, candidate=None):
     if not scan_count:
         # Distinguish "no campaign site found" / "blocked by robots" / "not yet
         # scanned" so each gap is visible rather than silent (spec §3.1 honesty).
+        # Labels come from the STATUSES table (they double as the candidate
+        # page's coverage-gap section heading).
         if candidate is not None and not candidate.get("website_url"):
-            return "no_url", "No campaign site found — not scanned"
-        if candidate is not None and candidate.get("scan_status") == "robots_blocked":
-            return "blocked_by_robots", "Site blocks automated access — not scanned"
-        if candidate is not None and candidate.get("scan_status") == "fetch_failed":
-            return "fetch_failed", "Site unreachable — fetch failed"
-        return "not_scanned", "Not yet scanned"
+            key = "no_url"
+        elif candidate is not None and candidate.get("scan_status") == "robots_blocked":
+            key = "blocked_by_robots"
+        elif candidate is not None and candidate.get("scan_status") == "fetch_failed":
+            key = "fetch_failed"
+        else:
+            key = "not_scanned"
+        return key, STATUSES[key].row_label
     cls = det["classification"] if det else "no_guidance_detected"
     action = review["action"] if review else None
     if cls == "red_box_guidance":
@@ -590,11 +589,7 @@ DEFAULT_PAGE_SIZE = 500
 # story), then findings without IE, then everything else in status-rank order
 # (negatives before coverage gaps). Within a band, status rank keeps published
 # findings ahead of pending ones, then a stable state/district/name sort.
-_STATUS_RANK = {
-    "positive_published": 0, "positive_pending": 1, "ambiguous_pending": 2,
-    "rejected": 3, "negative": 4, "fetch_failed": 5,
-    "blocked_by_robots": 6, "no_url": 7, "not_scanned": 8,
-}
+_STATUS_RANK = {k: s.rank for k, s in STATUSES.items()}
 
 _FINDING_STATUSES = {"positive_published", "positive_pending", "ambiguous_pending"}
 
@@ -615,6 +610,14 @@ def build_site(conn: sqlite3.Connection, out_dir: Path, *, approved_only: bool =
     # When set, pages carry canonical/OpenGraph URLs and the build emits
     # sitemap.xml + robots.txt. Leave unset for local/review builds so pending
     # detections are never described by public URLs.
+    if site_url and not approved_only:
+        # A site_url build IS a public build: its sitemap enumerates every
+        # rendered candidate page at public URLs. Combined with the review
+        # (unfiltered) view that would describe pending-detection candidates —
+        # unpublished allegations — at public URLs. Only cmd_publish happened
+        # to prevent this pairing; enforce it here so no other caller can
+        # produce a crawlable review build.
+        raise ValueError("site_url requires approved_only")
     global _SITE_URL
     _SITE_URL = (site_url or "").rstrip("/") or None
     out_dir = Path(out_dir)
@@ -630,9 +633,9 @@ def build_site(conn: sqlite3.Connection, out_dir: Path, *, approved_only: bool =
         # Public build keeps findings, dated negatives, and the no-allegation
         # coverage-gap statuses (their pages ARE the gap disclosure). Pending
         # and rejected detections are unpublished allegations — never render
-        # them or their candidates' pages publicly.
-        public = ("positive_published", "negative", "no_url",
-                  "blocked_by_robots", "fetch_failed", "not_scanned")
+        # them or their candidates' pages publicly. The allowlist derives from
+        # the STATUSES table's is-public flag.
+        public = {k for k, s in STATUSES.items() if s.public}
         views = [v for v in views if v.status in public]
         # A pending exhibit is an unpublished allegation even when the
         # candidate has a separate approved finding — never render it. Same
@@ -659,7 +662,17 @@ def build_site(conn: sqlite3.Connection, out_dir: Path, *, approved_only: bool =
                     src = Path(archive[key])
                     if src.exists():
                         dst = out_dir / "evidence" / src.name
-                        shutil.copy2(src, dst)
+                        # Skip the copy when the destination is already this
+                        # exact file: copy2 preserves size+mtime, so a match
+                        # means an earlier build copied it and the source
+                        # hasn't changed — archives are content-addressed and
+                        # immutable, and re-copying hundreds of screenshots
+                        # per build was pure I/O waste.
+                        s = src.stat()
+                        if not (dst.exists()
+                                and (d := dst.stat()).st_size == s.st_size
+                                and d.st_mtime_ns == s.st_mtime_ns):
+                            shutil.copy2(src, dst)
                         archive[rel_key] = f"evidence/{src.name}"
                         kept_evidence.add(src.name)
     # Sweep evidence this build no longer references. Without this the
@@ -683,36 +696,49 @@ def build_site(conn: sqlite3.Connection, out_dir: Path, *, approved_only: bool =
     index_views = sorted(views, key=_index_sort_key)
     size = max(1, int(page_size))
     pages = [index_views[i:i + size] for i in range(0, len(index_views), size)] or [[]]
+    # Full row set as one fragment; the index JS fetches it on first filter
+    # interaction so name/status/state filters search every page, not just the
+    # slice the visitor is on. Built BEFORE the pages so each page can embed a
+    # content hash and fetch index-data.json?v=<hash>: Pages serves assets
+    # with max-age=14400, and a bare fetch left the client-side filter on
+    # 4-hour-stale data after a deploy — stale enough to show a since-rejected
+    # candidate with a FINDING pill linking to a now-404 page.
+    index_data_json = json.dumps(
+        {"html": "".join(_index_row(v) for v in index_views)})
+    data_version = sha256_text(index_data_json)[:8]
     for pno, page in enumerate(pages, start=1):
         fname = "index.html" if pno == 1 else f"index-{pno}.html"
         (out_dir / fname).write_text(_render_index(
             page, approved_only, counts=counts, all_views=all_views,
-            page_no=pno, n_pages=len(pages)))
-    # Full row set as one fragment; the index JS fetches it on first filter
-    # interaction so name/status/state filters search every page, not just the
-    # slice the visitor is on.
-    (out_dir / "index-data.json").write_text(json.dumps(
-        {"html": "".join(_index_row(v) for v in index_views)}))
+            page_no=pno, n_pages=len(pages), data_version=data_version,
+            statuses_present={v.status for v in index_views}))
+    (out_dir / "index-data.json").write_text(index_data_json)
 
     (out_dir / "methodology.html").write_text(_render_methodology())
     (out_dir / "corrections.html").write_text(_render_corrections())
     (out_dir / "about.html").write_text(_render_about())
     (out_dir / "404.html").write_text(_render_404())
     (out_dir / "styles.css").write_text(CSS)
-    import base64
-    (out_dir / "favicon.svg").write_text(_FAVICON_SVG)
-    (out_dir / "favicon.png").write_bytes(base64.b64decode(_FAVICON_PNG48))
-    (out_dir / "favicon.ico").write_bytes(base64.b64decode(_FAVICON_ICO))
-    (out_dir / "apple-touch-icon.png").write_bytes(base64.b64decode(_FAVICON_PNG180))
+    (out_dir / "favicon.svg").write_text(FAVICON_SVG)
+    (out_dir / "favicon.png").write_bytes(FAVICON_PNG48)
+    (out_dir / "favicon.ico").write_bytes(FAVICON_ICO)
+    (out_dir / "apple-touch-icon.png").write_bytes(FAVICON_PNG180)
 
     if _SITE_URL:
-        paths = (["index"] + [f"index-{p}" for p in range(2, len(pages) + 1)]
-                 + ["methodology", "corrections", "about"]
-                 + [v.row["candidate_id"] for v in index_views])
+        # Per-page lastmod: candidate pages get the date their content last
+        # actually changed (_lastmod); index/static pages regenerate with the
+        # universe every build and keep the build date. Stamping every URL
+        # with today (the old behavior) made lastmod meaningless to crawlers.
         today = now_iso()[:10]
+        entries = ([("index", today)]
+                   + [(f"index-{p}", today) for p in range(2, len(pages) + 1)]
+                   + [("methodology", today), ("corrections", today),
+                      ("about", today)]
+                   + [(v.row["candidate_id"], _lastmod(v) or today)
+                      for v in index_views])
         urls = "".join(
-            f"<url><loc>{_h(_canonical(p))}</loc><lastmod>{today}</lastmod></url>"
-            for p in paths)
+            f"<url><loc>{_h(_canonical(p))}</loc><lastmod>{d}</lastmod></url>"
+            for p, d in entries)
         (out_dir / "sitemap.xml").write_text(
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
@@ -723,6 +749,20 @@ def build_site(conn: sqlite3.Connection, out_dir: Path, *, approved_only: bool =
     return out_dir
 
 
+def _lastmod(v: CandidateView) -> str | None:
+    """Sitemap lastmod for one candidate page: the date of the latest event
+    that changed the page's rendered content. That is the most recent of
+    (a) an exhibit approval — publishes or re-dates a finding, (b) a recorded
+    removal (gone_since) — adds the "No longer present" note, and (c) the last
+    scan — re-dates the negative's "as of" label and the pages-scanned meta
+    row. All are fields CandidateView already carries; None (never scanned)
+    falls back to the build date at the call site."""
+    dates = [(e["review"] or {}).get("reviewed_at") or "" for e in v.exhibits]
+    dates += [e.get("gone_since") or "" for e in v.exhibits]
+    dates += [(v.review or {}).get("reviewed_at") or "", v.last_scanned or ""]
+    return max(dates, default="")[:10] or None
+
+
 def _write_feeds(out_dir: Path, views: list[CandidateView]) -> None:
     """feed.xml (RSS 2.0) + feed.json (JSON Feed 1.1) of published findings.
 
@@ -731,10 +771,6 @@ def _write_feeds(out_dir: Path, views: list[CandidateView]) -> None:
     recent — the index stays the full ledger. Neither file is in the sitemap,
     and neither ends in .html, so the stale-page cleanup never touches them.
     """
-    import hashlib
-    from datetime import datetime, timezone
-    from email.utils import format_datetime
-
     def _approved_at(v: CandidateView) -> str:
         # Latest approval across the candidate's exhibits, so an update
         # re-dates (and re-sorts) the item; fall back to the representative
@@ -762,15 +798,28 @@ def _write_feeds(out_dir: Path, views: list[CandidateView]) -> None:
     for v in findings:
         cid = v.row["candidate_id"]
         url = _canonical(cid)
-        # One item per candidate, keyed by the SET of approved exhibits:
-        # approving a new distinct box changes the fingerprint and the item
+        # One item per candidate, keyed by the SET of approved exhibit BODIES
+        # (each exhibit's text_hash, NOT its primary page_url): approving a new
+        # or revised distinct box changes the fingerprint and the item
         # re-announces (feed readers/Bluesky see an update), while a
-        # re-detection of a known box (same URL/body, fresh detection_id)
-        # folds into its exhibit and stays silent — the double-announce the
-        # bare-candidate guid was introduced to prevent.
+        # re-detection of a known box (fresh detection_id) folds into its
+        # exhibit and stays silent — the double-announce the bare-candidate
+        # guid was introduced to prevent. The body hash rather than the URL
+        # because the primary URL is a rank artifact (final tiebreaker:
+        # detection_id DESC): approving a later re-detection of the SAME body
+        # on an alias URL flips which URL is primary, and a URL-keyed guid
+        # re-announced the unchanged finding on every such flip. Primary/alias
+        # churn must be silent; only the body set speaks. (Legacy detections
+        # with no text_hash fall back to the URL — still stable per exhibit.)
+        # NOTE: switching the sig input from URL to body hash changed every
+        # existing guid once; the bsky-poster worker treats a flood of re-keyed
+        # ids (known candidate prefix, new '#'-suffix) as a guid-scheme
+        # migration and absorbs them without posting.
         approved_ex = [e for e in v.exhibits if e.get("approved")]
         sig = (hashlib.sha1("|".join(sorted(
-                   e["detection"].get("page_url") or "" for e in approved_ex))
+                   e["detection"].get("page_text_hash")
+                   or e["detection"].get("page_url") or ""
+                   for e in approved_ex))
                .encode()).hexdigest()[:8] if approved_ex else "0")
         guid = f"{cid}#{sig}"
         n = len(approved_ex)
@@ -822,14 +871,14 @@ def _write_feeds(out_dir: Path, views: list[CandidateView]) -> None:
     (out_dir / "feed.xml").write_text(
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom"><channel>'
-        f"<title>Red Box Watch — Findings</title><link>{_h(_SITE_URL + '/')}</link>"
+        f"<title>RedBoxWatch — Findings</title><link>{_h(_SITE_URL + '/')}</link>"
         f'<atom:link href="{_h(_SITE_URL + "/feed.xml")}" rel="self" '
         'type="application/rss+xml"/>'
         f"<description>{_h(tagline)}</description>"
         f"{''.join(items_xml)}</channel></rss>\n")
     (out_dir / "feed.json").write_text(json.dumps({
         "version": "https://jsonfeed.org/version/1.1",
-        "title": "Red Box Watch — Findings",
+        "title": "RedBoxWatch — Findings",
         "home_page_url": _SITE_URL + "/",
         "feed_url": _SITE_URL + "/feed.json",
         "description": tagline,
@@ -855,21 +904,10 @@ def _pager(page_no: int, n_pages: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-STATUS_PILL = {
-    "positive_published": ("FINDING", "pill-pos"),
-    "positive_pending": ("PENDING REVIEW", "pill-pending"),
-    "ambiguous_pending": ("PENDING REVIEW", "pill-amb"),
-    "rejected": ("NOT A FINDING", "pill-neg"),
-    "negative": ("NONE DETECTED", "pill-neg"),
-    "not_scanned": ("NOT SCANNED", "pill-muted"),
-    "no_url": ("NO SITE FOUND", "pill-muted"),
-    "blocked_by_robots": ("BLOCKED (ROBOTS)", "pill-muted"),
-    "fetch_failed": ("FETCH FAILED", "pill-muted"),
-}
-
-
-def _h(s) -> str:
-    return html.escape(str(s if s is not None else ""))
+def _pill(status: str) -> tuple[str, str]:
+    """(pill text, css class) for a status, from the STATUSES table."""
+    spec = STATUSES.get(status)
+    return (spec.pill, spec.pill_class) if spec else ("—", "pill-muted")
 
 
 # ---------------------------------------------------------------------------
@@ -878,50 +916,18 @@ def _h(s) -> str:
 # Franklin), with the Sunlight state-grid heatmap on the index. The red box
 # itself is the brand mark. Chosen from design-concepts/ (2026-07-11).
 
-_FONTS = """<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..900;1,9..144,300..900&family=Libre+Franklin:ital,wght@0,300..700;1,300..700&family=Source+Serif+4:ital,opsz,wght@0,8..60,300..700;1,8..60,300..700&display=swap" rel="stylesheet">"""
-
 _MONTHS = ["January", "February", "March", "April", "May", "June", "July",
            "August", "September", "October", "November", "December"]
 
-# Favicon: the brand's red box as the tab icon, at ~62% of the canvas so it
-# doesn't dwarf neighboring tab icons. SVG for modern browsers; PNG fallbacks
-# (48px transparent-padded — Google wants ≥48px for search results — and
-# 180px apple-touch on paper; iOS blackens transparency) because Safari
-# ignores SVG favicons. A 16/32/48 favicon.ico sits at the root unlinked for
-# crawlers that request /favicon.ico directly (Cloudflare Pages otherwise
-# soft-404s it with the HTML fallback).
-_FAVICON_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">'
-                '<rect x="3" y="3" width="10" height="10" fill="#b93425"/></svg>')
-_FAVICON_PNG48 = ("iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAWElEQVR42u3YsQ0AIQwA"
-                  "sQSxChuwPNP9r4BEAQhfnQIrqcjRW9xcicsDAAAAAFiqTs59m96XTggAAAAAAAAAAAAA"
-                  "AAAAAAAAAAAAIN79nU4bAAAAAAA4sR847gJ3+WSMHgAAAABJRU5ErkJggg==")
-_FAVICON_ICO = ("AAABAAMAEBAAAAAAIABoAAAANgAAACAgAAAAACAAiwAAAJ4AAAAwMAAAAAAgALAAAAAp"
-                "AQAAiVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAL0lEQVR4nGPcaaLK"
-                "QAlgokg3NQxgQeP/J1IfI9VcwDRqAMNoGDBgpER4Chs6CQkA4rQCN+chrFoAAAAASUVO"
-                "RK5CYIKJUE5HDQoaCgAAAA1JSERSAAAAIAAAACAIBgAAAHN6evQAAABSSURBVHic7ZbR"
-                "CYAwFMTSo6u4gcs7nS4ggiAc2GSBhpf76Dj2jSapvo4CmID5sI/z470NR3hHKBMFMEGZ"
-                "KIAJykQBTLB6gvn2D/e7C0QBVk9wAXeKAlfsKSb7AAAAAElFTkSuQmCCiVBORw0KGgoA"
-                "AAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAd0lEQVR4nOXYsQ2AMAADwc+LVdiA5Zku"
-                "rIBEER6udmHJncd57JRJnMRJnMRJnMRJnMRtN3OTNcbnF5A4iZM4iZM4iZM4iZM4iZM4"
-                "iZM4iZM4iZM4iZM4iZM4iZM4iZM4iZM4iZM4+ck7PXgpiZM4iZM4iZM4iXN1gacuOO4C"
-                "d7DEROMAAAAASUVORK5CYII=")
-_FAVICON_PNG180 = ("iVBORw0KGgoAAAANSUhEUgAAALQAAAC0CAIAAACyr5FlAAABp0lEQVR42u3SMQ0AIBAE"
-                   "wTeDA8xji4pQvQEqQvEkk6yCu4m9pnQsTCA4BIfgEByCQ3AIDsEhOASHBIfgEByCQ3AI"
-                   "DsEhOASH4JDgEByCQ3AIDsEhOASH4BAcEhyCQ2VxjN70MDgEh+AQHHDAAQcccMABBxxw"
-                   "wAEHHHDAAYfgEByCAw444IADDjjggAMOOOCAAw444BAcgkNwwAEHHHDAAQcccMABBxxw"
-                   "wAEHHIJDcAgOj8IBBxxwwAEHHHDAAQcccMABBxxwCA7BITjggAMOOOCAAw444IADDjjg"
-                   "gAMOwSE4BAcccMABBxxwwAEHHHDAAQcccMAhOASH4PAoHHDAAQcccMABBxxwwAEHHHDA"
-                   "AYfgEByCAw444IADDjjggAMOOOCAAw444BAcgkNwwAEHHHDAAQcccMABBxxwwAEHHIJD"
-                   "cAgOd8IBBxxwwAEHHHDAAQcccMABBxxwCA7BITjggAMOOOCAAw444ICjFg79GByCQ3AI"
-                   "DsEhOASH4BAcgkNwSHAIDsEhOASH4BAcgkNwCA4JDsEhOASH4BAcgkNwCA7BIcEhOHRR"
-                   "Avk9tm3h8owWAAAAAElFTkSuQmCC")
+# Favicons (the brand's red box) live as real binary files in redbox/assets/
+# and are loaded by render.py; see the rationale comment there.
 
 
 def _pub_date() -> str:
-    iso = now_iso()
-    return f"{_MONTHS[int(iso[5:7]) - 1]} {int(iso[8:10])}, {iso[:4]}"
+    # Human-facing dates use Eastern time, not UTC: a post-8pm-ET build must
+    # not stamp the site (or the "as of" evidence statements) with tomorrow.
+    now = datetime.now(ZoneInfo("America/New_York"))
+    return f"{_MONTHS[now.month - 1]} {now.day}, {now.year}"
 
 
 # Canonical public URL (no trailing slash); set per-build by build_site from
@@ -959,7 +965,7 @@ def _seo_head(title: str, path: str, desc: str, og_image: str | None,
         tags.append(f'<link rel="canonical" href="{_h(url)}">')
     if desc:
         tags += [
-            '<meta property="og:site_name" content="Red Box Watch">',
+            '<meta property="og:site_name" content="RedBoxWatch">',
             f'<meta property="og:title" content="{_h(og_title or title)}">',
             f'<meta property="og:description" content="{_h(desc)}">',
             f'<meta property="og:type" content="{_h(og_type)}">',
@@ -972,23 +978,17 @@ def _seo_head(title: str, path: str, desc: str, og_image: str | None,
         else:
             tags.append('<meta name="twitter:card" content="summary">')
     # WebSite structured data on the homepage tells Google to show
-    # "Red Box Watch" as the site name in results instead of the bare domain.
+    # "RedBoxWatch" as the site name in results instead of the bare domain.
+    # alternateName keeps pre-rebrand press mentions tied to the same entity.
     if path == "index" and _SITE_URL:
         tags.append('<script type="application/ld+json">' + json.dumps({
             "@context": "https://schema.org",
             "@type": "WebSite",
-            "name": "Red Box Watch",
-            "alternateName": "RedBoxWatch",
+            "name": "RedBoxWatch",
+            "alternateName": "Red Box Watch",
             "url": f"{_SITE_URL}/",
         }) + "</script>")
     return "\n".join(tags)
-
-
-def _css_version() -> str:
-    """Content hash for cache-busting the stylesheet URL. Pages serves
-    styles.css with max-age=14400, so without this a deploy leaves visitors
-    on 4-hour-stale CSS while the HTML is already new."""
-    return sha256_text(CSS)[:8]
 
 
 def _layout(title: str, body: str, *, page_class: str = "", active: str = "",
@@ -1002,21 +1002,21 @@ def _layout(title: str, body: str, *, page_class: str = "", active: str = "",
         return f'<a href="{_href(page, root)}"{cur}>{label}</a>'
     return f"""<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{_h(title)} · Red Box Watch</title>
+<title>{_h(title)} · RedBoxWatch</title>
 {_seo_head(title, path, desc, og_image, og_type, og_title)}
 <link rel="icon" href="{root}favicon.svg" type="image/svg+xml">
 <link rel="icon" href="{root}favicon.png" type="image/png" sizes="48x48">
 <link rel="apple-touch-icon" href="{root}apple-touch-icon.png">
 {_FONTS}
-{f'<link rel="alternate" type="application/rss+xml" title="Red Box Watch — Findings" href="{_SITE_URL}/feed.xml">' if _SITE_URL else ''}
-<link rel="stylesheet" href="{root}styles.css?v={_css_version()}"></head><body>
+{f'<link rel="alternate" type="application/rss+xml" title="RedBoxWatch — Findings" href="{_SITE_URL}/feed.xml">' if _SITE_URL else ''}
+<link rel="stylesheet" href="{root}styles.css?v={CSS_VERSION}"></head><body>
 <header class="masthead">
   <div class="folio wrap">
     <span>Published {_h(_pub_date())}&ensp;·&ensp;Updated with each build</span>
     <nav>{nav('index', 'Index', 'index')}{nav('methodology', 'Methodology', 'methodology')}{nav('corrections', 'Corrections &amp; Appeals', 'corrections')}{nav('about', 'About', 'about')}</nav>
   </div>
   <div class="nameplate wrap">
-    <a class="brand" href="{_href('index', root)}"><span class="redbox"></span>Red&nbsp;Box&nbsp;Watch</a>
+    <a class="brand" href="{_href('index', root)}"><span class="redbox"></span>RedBoxWatch</a>
     <p class="tagline">A public ledger of red&#8209;boxing &#8212; campaign&#8209;site signals to super PACs</p>
   </div>
   <div class="wrap"><div class="double-rule"></div></div>
@@ -1080,8 +1080,7 @@ def _statemap_pop(st: str, finds: list["CandidateView"], row: int, col: int) -> 
                                           v.row.get("district") or "",
                                           v.row.get("name") or "")):
         c = v.row
-        seat = f"{_h(c.get('office'))}-{_h(c.get('state'))}" + (
-            f"-{_h(c.get('district'))}" if c.get("district") else "")
+        seat = _h(_seat_code(c))
         ie = ""
         if v.corroboration and v.corroboration.get("supporting_total"):
             ie = f'<span class="pop-ie">{_h(_money_compact(float(v.corroboration["supporting_total"])))}</span>'
@@ -1254,14 +1253,7 @@ def _display_name(name: str) -> str:
         if len(run) > 2 and run.startswith("MC"):
             return "Mc" + run[2:].capitalize()
         return run.capitalize()
-    import re as _re
-    return _re.sub(r"[A-Za-z]+", cap_run, name or "")
-
-
-# prose name == display name: _display_name already reorders 'LAST, FIRST',
-# strips titles, and re-seats suffixes, always returning a comma-free string —
-# the second reordering pass this alias used to carry was unreachable.
-_name_prose = _display_name
+    return re.sub(r"[A-Za-z]+", cap_run, name or "")
 
 
 def _ordinal(n: int) -> str:
@@ -1295,9 +1287,15 @@ def _seat_compact(c: dict) -> str:
     return f"{state}-{c.get('district')}" if c.get("district") else state
 
 
+def _seat_code(c: dict) -> str:
+    """Ledger-style seat code: "H-NC-04", "S-TX" (no district). Unescaped —
+    callers wrap in _h()."""
+    code = f"{c.get('office')}-{c.get('state')}"
+    return f"{code}-{c.get('district')}" if c.get("district") else code
+
+
 def _pretty_date(iso: str) -> str:
     """'2026-07-16...' -> 'July 16, 2026' (falls back to the raw date)."""
-    from datetime import date
     try:
         d = date.fromisoformat(iso[:10])
         return f"{d.strftime('%B')} {d.day}, {d.year}"
@@ -1308,7 +1306,9 @@ def _pretty_date(iso: str) -> str:
 def _render_index(views: list[CandidateView], approved_only: bool, *,
                   counts: dict[str, int] | None = None,
                   all_views: list[CandidateView] | None = None,
-                  page_no: int = 1, n_pages: int = 1) -> str:
+                  page_no: int = 1, n_pages: int = 1,
+                  data_version: str = "",
+                  statuses_present: set[str] | None = None) -> str:
     # ``views`` is this page's slice; counts/coverage, the stat deck, the state
     # heatmap and the state dropdown are global (over every candidate).
     if counts is None:
@@ -1317,6 +1317,8 @@ def _render_index(views: list[CandidateView], approved_only: bool, *,
             counts[v.status] = counts.get(v.status, 0) + 1
     if all_views is None:
         all_views = views
+    if statuses_present is None:
+        statuses_present = {v.status for v in views}
 
     mode = ("Public build — approved findings + dated negatives" if approved_only
             else "Review console — includes pending detections, not yet published")
@@ -1406,16 +1408,7 @@ def _render_index(views: list[CandidateView], approved_only: bool, *,
     <form class="controls" action="" onsubmit="return false">
       <label for="q">Filter</label>
       <input id="q" type="search" placeholder="Filter by name…" aria-label="Filter by name">
-      <select id="f-status" aria-label="Filter by status"><option value="">All statuses</option>
-        <option value="positive_published">Findings</option>
-        <option value="positive_pending">Pending (red-box)</option>
-        <option value="ambiguous_pending">Pending (ambiguous)</option>
-        <option value="negative">None detected</option>
-        <option value="rejected">Not a finding</option>
-        <option value="not_scanned">Not scanned</option>
-        <option value="no_url">No site found</option>
-        <option value="blocked_by_robots">Blocked by robots</option>
-        <option value="fetch_failed">Fetch failed</option></select>
+      <select id="f-status" aria-label="Filter by status"><option value="">All statuses</option>{_status_opts(statuses_present)}</select>
       <select id="f-state" aria-label="Filter by state"><option value="">All states</option>{_state_opts(all_views)}</select>
       {paged_note}
     </form>
@@ -1425,15 +1418,15 @@ def _render_index(views: list[CandidateView], approved_only: bool, *,
       <th data-sort="4" class="num">Aligned IE</th>
     </tr></thead><tbody id="rows">{''.join(rows)}</tbody></table>
     {pager}
-    <script>const PAGED={'true' if n_pages > 1 else 'false'};{INDEX_JS}</script>"""
-    desc = (f"Red Box Watch tracks red-boxing — public messaging and media-buy "
+    <script>const PAGED={'true' if n_pages > 1 else 'false'},DATA_V='{data_version}';{INDEX_JS}</script>"""
+    desc = (f"RedBoxWatch tracks red-boxing — public messaging and media-buy "
             f"guidance posted on federal campaign websites to signal super PACs. "
             f"{n_findings} human-reviewed findings across {total} candidates, "
             f"every claim linked to archived evidence.")
     return _layout("Candidate Index" if page_no == 1 else f"Candidate Index — page {page_no}",
                    body, page_class="page-index", active="index",
                    path="index" if page_no == 1 else f"index-{page_no}", desc=desc,
-                   og_title="Red Box Watch" if page_no == 1 else None)
+                   og_title="RedBoxWatch" if page_no == 1 else None)
 
 
 def _index_row(v: CandidateView) -> str:
@@ -1445,15 +1438,16 @@ def _index_row(v: CandidateView) -> str:
     # noise by _ledger_name; data-name carries the display form ("Haley
     # Stevens") so the filter matches either name order.
     c = v.row
-    pill_txt, pill_cls = STATUS_PILL.get(v.status, ("—", "pill-muted"))
+    pill_txt, pill_cls = _pill(v.status)
     ie = ""
     if v.corroboration and v.corroboration.get("supporting_total"):
         ie = f"${float(v.corroboration['supporting_total']):,.0f}"
+    # data-* attributes carry only what INDEX_JS reads (status/state/name);
+    # office and party once rode along too — ~70KB of dead markup per build.
     return f"""<tr data-status="{v.status}" data-state="{_h(c.get('state'))}"
-        data-office="{_h(c.get('office'))}" data-party="{_h(c.get('party'))}"
         data-name="{_h(_display_name(c.get('name')))}">
       <td class="cand"><a href="{_h(_href(c['candidate_id']))}">{_h(_ledger_name(c.get('name')))}</a></td>
-      <td class="seat">{_h(c.get('office'))}-{_h(c.get('state'))}{('-' + _h(c.get('district'))) if c.get('district') else ''}</td>
+      <td class="seat">{_h(_seat_code(c))}</td>
       <td class="party">{_h(c.get('party'))}</td>
       <td><a class="status {pill_cls}" href="{_h(_href(c['candidate_id']))}">{pill_txt}</a></td>
       <td class="num ie ie-col">{ie}</td>
@@ -1465,10 +1459,21 @@ def _state_opts(views):
     return "".join(f'<option value="{_h(s)}">{_h(s)}</option>' for s in states)
 
 
+def _status_opts(present: set[str]) -> str:
+    """Status-filter options, from the STATUSES table — but only for statuses
+    actually present in the rendered rows. The hardcoded full list once
+    offered "Pending"/"Rejected" on the public build, where those statuses are
+    filtered out before rendering: selecting one showed a silently empty
+    table on a site whose credibility rests on saying what it publishes."""
+    return "".join(
+        f'<option value="{k}">{_h(s.filter_label)}</option>'
+        for k, s in STATUSES.items() if k in present)
+
+
 def _render_candidate(v: CandidateView, *, public: bool = False) -> str:
     c = v.row
-    pill_txt, pill_cls = STATUS_PILL.get(v.status, ("—", "pill-muted"))
-    seat = f"{_h(c.get('office'))}-{_h(c.get('state'))}" + (f"-{_h(c.get('district'))}" if c.get("district") else "")
+    pill_txt, pill_cls = _pill(v.status)
+    seat = _h(_seat_code(c))
     office = _OFFICE_WORD.get(c.get("office") or "", c.get("office") or "")
     state_name = STATE_NAMES.get(c.get("state") or "", c.get("state") or "")
     party = _PARTY_WORD.get(c.get("party") or "", c.get("party") or "")
@@ -1523,33 +1528,15 @@ def _render_candidate(v: CandidateView, *, public: bool = False) -> str:
           <h2 class="section-head section-head-quiet">{_h(v.label)}</h2>
           <p class="rationale">Across {v.scan_count} pages scanned, no content matching the functional red-box pattern was detected. Absence of a finding is not proof — a box may have been removed, a page uncrawled, or a PDF unparsed.</p>
         </section>"""
-    elif v.status == "no_url":
-        detail = ('<section class="detection"><h2 class="section-head section-head-quiet">'
-                  'No campaign site found — not scanned</h2>'
-                  '<p class="rationale">No official campaign website could be resolved for '
-                  'this candidate (manual override, Wikipedia, FEC committee, and web search '
-                  'all returned nothing), so no pages were scanned. This is a coverage gap, '
-                  'not a finding of any kind — it does not indicate the presence or absence '
-                  'of red-boxing.</p></section>')
-    elif v.status == "blocked_by_robots":
+    elif (spec := STATUSES.get(v.status)) is not None and spec.gap_body:
+        # Coverage-gap statuses (no_url / blocked_by_robots / fetch_failed):
+        # one section shape, heading = the status row label, body from the
+        # STATUSES table with the resolved site linked in where relevant.
+        site = (f'<a href="{_h(c.get("website_url"))}" rel="nofollow noopener">'
+                f'{_h(c.get("website_url"))}</a>')
         detail = (f'<section class="detection"><h2 class="section-head section-head-quiet">'
-                  f'Site blocks automated access — not scanned</h2>'
-                  f'<p class="rationale">The candidate\'s site '
-                  f'(<a href="{_h(c.get("website_url"))}" rel="nofollow noopener">{_h(c.get("website_url"))}</a>) '
-                  f'disallows our crawler via robots.txt, so no pages were scanned. The pages '
-                  f'are public (a browser or major search engine can read them), but we respect '
-                  f'robots by default. This is a coverage gap, not a finding — and a candidate '
-                  f'site that blocks automated access can be added to the per-site override list '
-                  f'after review.</p></section>')
-    elif v.status == "fetch_failed":
-        detail = (f'<section class="detection"><h2 class="section-head section-head-quiet">'
-                  f'Site unreachable — fetch failed</h2>'
-                  f'<p class="rationale">We could not fetch any page from the resolved '
-                  f'site (<a href="{_h(c.get("website_url"))}" rel="nofollow noopener">{_h(c.get("website_url"))}</a>) '
-                  f'— it may be down, parked, moved, or the resolved URL may be wrong. '
-                  f'No pages were scanned. This is a coverage gap, not a finding; the '
-                  f'candidate can be re-scanned (the resolved URL is worth re-checking).'
-                  f'</p></section>')
+                  f'{_h(v.label)}</h2>'
+                  f'<p class="rationale">{spec.gap_body.format(site=site)}</p></section>')
 
     body = f"""
     <article class="article">
@@ -1559,7 +1546,7 @@ def _render_candidate(v: CandidateView, *, public: bool = False) -> str:
     {banner}{meta}{'' if public else _render_changes(v)}{detail}{_render_corroboration(v)}
     </article>"""
 
-    prose = _name_prose(c.get("name"))
+    prose = _display_name(c.get("name"))
     seat_short = _seat_compact(c)
     race = _race_phrase(c)
     sup = float(v.corroboration.get("supporting_total") or 0) if v.corroboration else 0
@@ -1608,6 +1595,37 @@ def _exhibit_label(e: dict) -> str:
     return POSITIVE_LABEL
 
 
+def _archive_figure(archive: dict | None, *, alt: str, what: str = "",
+                    figure_class: str = "exhibit") -> str:
+    """The archived-evidence block one archive row renders: the links line
+    (archived PDF / Wayback snapshot / raw-HTML note) plus, when a screenshot
+    exists, the framed figure. Shared by the current exhibit and each earlier
+    version so the two renderings can't drift again (they had: one lazy-loaded
+    its image, one omitted the raw-HTML note). Reconciled deliberately:
+    images lazy-load in both (all sit below the fold), and the raw-HTML note
+    appears in both (every archive preserves the HTML alongside the shot)."""
+    if not archive:
+        return ""
+    bits = []
+    if archive.get("pdf_rel"):
+        bits.append(f'<a href="{_h(archive["pdf_rel"])}" rel="noopener">Archived PDF (original)</a>')
+    if archive.get("wayback_url"):
+        bits.append(f'<a href="{_h(archive["wayback_url"])}" rel="noopener">Wayback snapshot</a>')
+    if archive.get("html_path"):
+        bits.append("Raw HTML preserved")
+    caption = " &#183; ".join(bits)
+    if archive.get("screenshot_rel"):
+        rel = _h(archive["screenshot_rel"])
+        cap = (what + ((" &#183; " + caption) if caption else "")) if what else caption
+        return f"""<figure class="{figure_class}">
+          <a class="exhibit-frame" href="{rel}"><img src="{rel}" alt="{alt}" loading="lazy"></a>
+          <figcaption><span class="exhibit-label">Archived at detection</span>{cap}</figcaption>
+        </figure>"""
+    if caption:
+        return f'<p class="evlinks"><span class="exhibit-label">Archived at detection</span>{caption}</p>'
+    return ""
+
+
 def _render_exhibit(e: dict, *, first: bool, label_override: str | None = None) -> str:
     """One detection section: label, source line, rationale, quoted evidence,
     archived exhibit, page text. Repeated per distinct guidance-carrying page —
@@ -1619,29 +1637,13 @@ def _render_exhibit(e: dict, *, first: bool, label_override: str | None = None) 
         for q in e["evidence"])
     exhibit = ""
     if archive:
-        is_pdf = bool(archive.get("pdf_rel"))
-        cap_bits = []
-        if is_pdf:
-            cap_bits.append(f'<a href="{_h(archive["pdf_rel"])}" rel="noopener">Archived PDF (original)</a>')
-        if archive.get("wayback_url"):
-            cap_bits.append(f'<a href="{_h(archive["wayback_url"])}" rel="noopener">Wayback snapshot</a>')
-        if archive.get("html_path"):
-            cap_bits.append("Raw HTML preserved")
-        caption = " &#183; ".join(cap_bits)
-        if archive.get("screenshot_rel"):
-            rel = _h(archive["screenshot_rel"])
-            if is_pdf:
-                alt = f"Rendered pages of the archived PDF from {_h(d.get('page_url'))}"
-                what = f"Pages rendered from the PDF at {_h(d.get('page_url'))}"
-            else:
-                alt = f"Archived screenshot of {_h(d.get('page_url'))}"
-                what = f"Full-page screenshot of {_h(d.get('page_url'))}"
-            exhibit = f"""<figure class="exhibit">
-          <a class="exhibit-frame" href="{rel}"><img src="{rel}" alt="{alt}"></a>
-          <figcaption><span class="exhibit-label">Archived at detection</span>{what}{(' &#183; ' + caption) if caption else ''}</figcaption>
-        </figure>"""
-        elif caption:
-            exhibit = f'<p class="evlinks"><span class="exhibit-label">Archived at detection</span>{caption}</p>'
+        if archive.get("pdf_rel"):
+            alt = f"Rendered pages of the archived PDF from {_h(d.get('page_url'))}"
+            what = f"Pages rendered from the PDF at {_h(d.get('page_url'))}"
+        else:
+            alt = f"Archived screenshot of {_h(d.get('page_url'))}"
+            what = f"Full-page screenshot of {_h(d.get('page_url'))}"
+        exhibit = _archive_figure(archive, alt=alt, what=what)
 
     also = "" if first else '<p class="exhibit-more">Additional page with guidance</p>'
     timeline = ""
@@ -1651,7 +1653,7 @@ def _render_exhibit(e: dict, *, first: bool, label_override: str | None = None) 
         vhref = f'#versions-{d["detection_id"]}' if e.get("versions") else None
 
         def _tl_label(kind: str) -> str:
-            lab = _TL_LABEL.get(kind, kind)
+            lab = _EVENT_LABEL.get(kind, (kind, ""))[0]
             if vhref and kind in ("revised", "changed", "updated"):
                 return f'<a href="{vhref}">{lab}</a>'
             return lab
@@ -1730,22 +1732,9 @@ def _render_versions(e: dict) -> str:
         diff = (f'<p class="v-diff">The next revision {"; ".join(diffbits)}.</p>'
                 if diffbits else "")
         arch = ver.get("archive") or {}
-        ev_bits = []
-        if arch.get("wayback_url"):
-            ev_bits.append(f'<a href="{_h(arch["wayback_url"])}" rel="noopener">Wayback snapshot</a>')
-        if arch.get("pdf_rel"):
-            ev_bits.append(f'<a href="{_h(arch["pdf_rel"])}" rel="noopener">Archived PDF (original)</a>')
-        shot = ""
-        if arch.get("screenshot_rel"):
-            rel = _h(arch["screenshot_rel"])
-            shot = (f'<figure class="exhibit v-exhibit"><a class="exhibit-frame" href="{rel}">'
-                    f'<img src="{rel}" loading="lazy" '
-                    f'alt="Archived screenshot of version {i} of {_h(d.get("page_url"))}"></a>'
-                    f'<figcaption><span class="exhibit-label">Archived at detection</span>'
-                    f'{(" &#183; ".join(ev_bits))}</figcaption></figure>')
-        elif ev_bits:
-            shot = (f'<p class="evlinks"><span class="exhibit-label">Archived at detection</span>'
-                    f'{" &#183; ".join(ev_bits)}</p>')
+        shot = _archive_figure(
+            arch, alt=f"Archived screenshot of version {i} of {_h(d.get('page_url'))}",
+            figure_class="exhibit v-exhibit")
         blocks.append(f"""<div class="version">
         <p class="v-span">Version {i}{(' &#183; ' + span) if span else ''}{pending}</p>
         <ul class="evidence">{quotes}</ul>
@@ -1779,34 +1768,31 @@ def _render_page_text(archive: dict | None) -> str:
     </details>"""
 
 
-# Short labels for the per-exhibit timeline strip.
-_TL_LABEL = {
-    "detected": "First detected",
-    "put_up": "Guidance posted",
-    "updated": "Page updated",
-    "revised": "Guidance revised",
-    "changed": "Guidance changed",
-    "take_down": "Guidance removed",
-    "gone": "No longer present",
-}
-
-_CHANGE_LABEL = {
-    "take_down": ("Guidance removed", "Messaging guidance previously detected on this page was no longer present on re-scan."),
+# One label table per change kind — (short label, long description) — shared
+# by the per-exhibit timeline strip (short) and the review-build change log
+# (both). 'changed' and 'modified' used to be two names for the same concept
+# split across two dicts; _change_key now yields 'changed' everywhere a
+# 'modified' event couldn't be refined.
+_EVENT_LABEL: dict[str, tuple[str, str]] = {
+    "detected": ("First detected", ""),
     "put_up": ("Guidance posted", "Messaging guidance appeared on this page that was not present on the prior scan."),
-    "modified": ("Guidance changed", "Previously-detected guidance on this page changed between scans."),
     # 'modified' refined by whether the quoted spans themselves changed:
     "updated": ("Page updated", "The page's text changed between scans; the quoted guidance spans are identical."),
     "revised": ("Guidance revised", "The quoted guidance spans on this page changed between scans."),
+    "changed": ("Guidance changed", "Previously-detected guidance on this page changed between scans."),
+    "take_down": ("Guidance removed", "Messaging guidance previously detected on this page was no longer present on re-scan."),
+    "gone": ("No longer present", ""),
 }
 
 
 def _change_key(ch: dict) -> str:
     """Event key for labeling: 'modified' refines to updated/revised when the
-    quote comparison could tell (guidance_same True/False)."""
+    quote comparison could tell (guidance_same True/False), and stays the
+    generic 'changed' when it couldn't."""
     if ch["event_type"] != "modified":
         return ch["event_type"]
     same = ch.get("guidance_same")
-    return "updated" if same else ("revised" if same is False else "modified")
+    return "updated" if same else ("revised" if same is False else "changed")
 
 
 def _render_changes(v: CandidateView) -> str:
@@ -1819,7 +1805,7 @@ def _render_changes(v: CandidateView) -> str:
     items = []
     for ch in v.changes:
         key = _change_key(ch)
-        title, desc = _CHANGE_LABEL.get(key, (key, ""))
+        title, desc = _EVENT_LABEL.get(key, (key, ""))
         cls = "chg-down" if ch["event_type"] == "take_down" else (
             "chg-up" if ch["event_type"] == "put_up" else "chg-mod")
         items.append(
@@ -1922,7 +1908,7 @@ def _render_methodology() -> str:
     </article>"""
     return _layout("Methodology", body, page_class="page-finding", active="methodology",
                    path="methodology",
-                   desc=("How Red Box Watch detects red-boxing: polite browser crawls "
+                   desc=("How RedBoxWatch detects red-boxing: polite browser crawls "
                          "of campaign sites, classification by function rather than "
                          "styling, archived evidence for every claim, and a human "
                          "review gate before anything is published."))
@@ -1957,7 +1943,7 @@ def _render_corrections() -> str:
     })();</script>"""
     return _layout("Corrections & appeals", body, page_class="page-finding", active="corrections",
                    path="corrections",
-                   desc=("How to request a correction or appeal a Red Box Watch "
+                   desc=("How to request a correction or appeal a RedBoxWatch "
                          "finding. Every published item links to archived evidence; "
                          "corrections are logged and dated."))
 
@@ -1967,7 +1953,7 @@ def _render_about() -> str:
     <article class="article">
     <p class="kicker">About <span class="redbox"></span> Who runs this</p>
     <h1 class="headline">Built by a volunteer who saw the box up close.</h1>
-    <p class="rationale">Red Box Watch is an independent, one-person monitoring project. It crawls the
+    <p class="rationale">RedBoxWatch is an independent, one-person monitoring project. It crawls the
     public websites of federal candidates nationwide, detects red-boxing &#8212; message
     guidance posted in plain sight for the super PACs that are barred from coordinating
     with campaigns directly &#8212; and publishes the evidence: the archived page, the exact
@@ -1983,7 +1969,7 @@ def _render_about() -> str:
     <h2 class="section-head"><span class="redbox"></span>Who&#8217;s behind it</h2>
     <p class="rationale">Charlie is a recent graduate of Davidson College with a degree 
     in Computer Science and Sociology. He believes technology can make democracy more
-    transparent. Red Box Watch is unaffiliated with any campaign, party, or PAC. Findings
+    transparent. RedBoxWatch is unaffiliated with any campaign, party, or PAC. Findings
     currently skew toward Democratic campaigns because the practice historically has; the
     scan covers every funded candidate of every party.</p>
     <h2 class="section-head"><span class="redbox"></span>Open source</h2>
@@ -1993,7 +1979,7 @@ def _render_about() -> str:
     (AGPL&#8209;3.0). A site that asks campaigns to work in the open should work in the
     open itself: the methodology can be read, checked, and re-run. Every finding
     published <em>here</em> passed human review before publication; output from other
-    deployments of the code is not a finding of Red Box Watch.</p>
+    deployments of the code is not a finding of RedBoxWatch.</p>
     <h2 class="section-head"><span class="redbox"></span>Contact</h2>
     <p class="rationale">Press and media inquiries:
     <a class="px-mail" href="#">press&nbsp;[at]&nbsp;redboxwatch&nbsp;[dot]&nbsp;org</a>.
@@ -2002,7 +1988,7 @@ def _render_about() -> str:
     </article>"""
     return _layout("About", body, page_class="page-finding", active="about",
                    path="about",
-                   desc=("Who runs Red Box Watch and why: an independent project by "
+                   desc=("Who runs RedBoxWatch and why: an independent project by "
                          "Charlie Garfield, a former campaign volunteer, tracking "
                          "red-boxing — public campaign-site signals to super PACs — "
                          "across federal races nationwide."))
@@ -2034,355 +2020,6 @@ def _render_404() -> str:
     return _layout("Page not found", body, page_class="page-finding", root="/")
 
 
-INDEX_JS = """
-const q=document.getElementById('q'),fs=document.getElementById('f-status'),
-  fst=document.getElementById('f-state'),tb=document.getElementById('rows'),
-  pager=document.querySelector('.pager'),pageRows=[...tb.querySelectorAll('tr')];
-let allRows=null,fetchStarted=false,shown=pageRows;
-function loadAll(){
-  // Full row set (every page) fetched once, on first filter use. If the fetch
-  // fails (e.g. file:// preview), filtering quietly stays page-local.
-  if(fetchStarted||!PAGED)return;fetchStarted=true;
-  fetch('index-data.json').then(r=>r.ok?r.json():Promise.reject())
-    .then(d=>{const t=document.createElement('template');t.innerHTML=d.html;
-      allRows=[...t.content.querySelectorAll('tr')];apply();})
-    .catch(()=>{});}
-function apply(){const t=q.value.trim().toLowerCase(),s=fs.value,st=fst.value,
-    active=!!(t||s||st);
-  if(active)loadAll();
-  const src=active&&allRows?allRows:pageRows;
-  if(shown!==src){shown=src;tb.replaceChildren(...src);}
-  shown.forEach(r=>{const name=r.children[0].textContent.toLowerCase(),
-    fec=(r.dataset.name||'').toLowerCase();
-    const ok=(!t||name.includes(t)||fec.includes(t))&&(!s||r.dataset.status===s)&&(!st||r.dataset.state===st);
-    r.style.display=ok?'':'none';});
-  if(pager)pager.style.display=active&&allRows?'none':'';}
-[q,fs,fst].forEach(e=>e.addEventListener('input',apply));
-document.querySelectorAll('th[data-sort]').forEach(th=>th.addEventListener('click',()=>{
-  const i=+th.dataset.sort,tb=document.getElementById('rows');
-  const sorted=[...tb.querySelectorAll('tr')].sort((a,b)=>{
-    // Candidate cells print the FEC "LAST, FIRST" form, so plain text
-    // comparison already sorts by surname.
-    const x=a.children[i].textContent.trim(),y=b.children[i].textContent.trim();
-    const nx=parseFloat(x.replace(/[$,]/g,'')),ny=parseFloat(y.replace(/[$,]/g,''));
-    if(!isNaN(nx)||!isNaN(ny)){return(isNaN(ny)?-Infinity:ny)-(isNaN(nx)?-Infinity:nx);}
-    return x.localeCompare(y);});
-  sorted.forEach(r=>tb.appendChild(r));}));
-document.querySelectorAll('.st.has-pop').forEach(el=>el.addEventListener('click',e=>{
-  if(e.target.closest('a'))return;
-  fst.value=el.dataset.state;apply();
-  document.querySelector('.agate').scrollIntoView({behavior:'smooth'});}));
-"""
 
-CSS = """
-/* BROADSHEET — editorial investigations-desk aesthetic. Warm paper, ink, one
-   decisive red; Fraunces / Source Serif 4 / Libre Franklin. The red box is the
-   brand mark. Heatmap grafted from the Sunlight concept. */
-:root{
-  --paper:#faf8f2;--paper-bright:#fffdf8;--ink:#1c1712;--ink-soft:#57503f;
-  --ink-faint:#8d8471;--red:#b93425;--red-deep:#8e2417;--amber:#9a6b1f;
-  --hair:rgba(28,23,18,.16);--hair-mid:rgba(28,23,18,.34);--hair-strong:rgba(28,23,18,.75);
-  --red-h1:#f4ded8;--red-h2:#dc9a8b;--red-h3:#c9604c;--red-h4:#b93425;
-  --display:"Fraunces","Iowan Old Style","Times New Roman",serif;
-  --text:"Source Serif 4",Georgia,serif;
-  --grot:"Libre Franklin","Helvetica Neue",Arial,sans-serif;
-  /* Aliases used by the exhibit timeline + review console. Undefined, these
-     were invalid-at-computed-value-time: borders fell back to currentColor
-     (ink instead of hairline) and the timeline connector gradient dropped. */
-  --line:var(--hair);--accent:var(--red);--pos:var(--red);
-}
-*{box-sizing:border-box}
-html{-webkit-text-size-adjust:100%}
-body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--text);font-size:1.0625rem;line-height:1.65;font-optical-sizing:auto}
-.wrap{max-width:68rem;margin:0 auto;padding:0 2rem}
-a{color:inherit;text-decoration-color:var(--hair-mid);text-underline-offset:3px}
-a:hover{color:var(--red-deep);text-decoration-color:var(--red)}
-::selection{background:var(--red);color:var(--paper-bright)}
-code{font-size:.85em;background:var(--paper-bright);border:1px solid var(--hair);padding:.05em .35em}
-
-/* the brand mark: a literal red box */
-.redbox{display:inline-block;width:.52em;height:.52em;background:var(--red);vertical-align:.06em}
-
-/* masthead */
-.masthead{padding-top:1.1rem}
-.folio{display:flex;justify-content:space-between;align-items:baseline;gap:1.5rem;border-bottom:1px solid var(--hair);padding-bottom:.6rem;font-family:var(--grot);font-size:.6875rem;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-soft)}
-.folio nav{display:flex;flex-wrap:wrap;gap:.4rem 1.75rem}
-.folio nav a{text-decoration:none;color:var(--ink-soft)}
-.folio nav a:hover{color:var(--red-deep)}
-.folio nav a[aria-current="page"]{color:var(--ink);font-weight:700;border-bottom:2px solid var(--red);padding-bottom:2px}
-.nameplate{text-align:center;padding:2.1rem 2rem 1.6rem}
-.brand{font-family:var(--display);font-size:clamp(2rem,5vw,3.1rem);font-weight:620;font-variation-settings:"opsz" 144,"WONK" 1;letter-spacing:-.01em;line-height:1;text-decoration:none;color:var(--ink);white-space:nowrap}
-.brand:hover{color:var(--ink)}
-.brand .redbox{width:.42em;height:.42em;margin-right:.34em;vertical-align:.05em}
-.brand:hover .redbox{background:var(--red-deep)}
-.tagline{margin:.75rem 0 0;font-family:var(--grot);font-size:.72rem;letter-spacing:.22em;text-transform:uppercase;color:var(--ink-soft)}
-.double-rule{border-top:3px solid var(--ink)}
-.double-rule::after{content:"";display:block;border-top:1px solid var(--ink);margin-top:2px}
-
-/* editorial furniture */
-.kicker{margin:0 0 1.1rem;font-family:var(--grot);font-size:.72rem;font-weight:600;letter-spacing:.2em;text-transform:uppercase;color:var(--ink-soft);display:flex;align-items:center;gap:.7em;flex-wrap:wrap}
-.kicker .redbox{width:.45em;height:.45em}
-.kicker .k-hot{color:var(--red-deep);font-weight:700}
-.headline{margin:0;font-family:var(--display);font-weight:540;font-variation-settings:"opsz" 144,"WONK" 1;font-size:clamp(2.5rem,6.4vw,4.15rem);line-height:1.01;letter-spacing:-.018em;text-wrap:balance;max-width:20ch}
-.headline-cand{font-size:clamp(2.1rem,5.4vw,3.4rem);max-width:none}
-.deck{margin:1.35rem 0 0;font-family:var(--display);font-weight:400;font-style:italic;font-variation-settings:"opsz" 34;font-size:clamp(1.15rem,2.4vw,1.45rem);line-height:1.45;color:var(--ink-soft);max-width:34em;text-wrap:pretty}
-/* Letter-spacing/gap leave ~40px headroom at the 64rem wrap width: the row
-   used to sit within a few px of overflow, and a universe count with wider
-   digit glyphs (1,114 -> 1,169) was enough to wrap it onto two lines. */
-.byline-row{margin:1.8rem 0 0;padding:.65rem 0;border-top:1px solid var(--hair);border-bottom:1px solid var(--hair);font-family:var(--grot);font-size:.72rem;letter-spacing:.085em;text-transform:uppercase;color:var(--ink-soft);display:flex;gap:.7em 1em;flex-wrap:wrap;align-items:baseline}
-.byline-row strong{color:var(--ink);font-weight:700}
-.byline-row .sep{color:var(--red)}
-.dropcap::first-letter{font-family:var(--display);font-weight:800;font-variation-settings:"opsz" 144;float:left;font-size:3.7em;line-height:.78;padding:.06em .12em 0 0;color:var(--ink)}
-.section-head{margin:0 0 .4rem;font-family:var(--display);font-weight:590;font-variation-settings:"opsz" 72;font-size:1.6rem;line-height:1.18;letter-spacing:-.008em;text-wrap:balance}
-.section-head .redbox{width:.42em;height:.42em;margin-right:.5em;vertical-align:.08em}
-.section-head-quiet{color:var(--ink-soft)}
-.article .section-head{margin-top:2.6rem}
-.srcline{margin:.35rem 0 0;font-family:var(--grot);font-size:.72rem;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-faint);line-height:1.9}
-.srcline a{color:var(--ink-soft);text-transform:none;letter-spacing:.01em;overflow-wrap:anywhere}
-.lbl{margin:0;font-family:var(--grot);font-size:.68rem;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--ink)}
-
-/* notices */
-.review-banner{margin:1.6rem 0 0;padding:1rem 1.3rem;border-top:1px solid var(--amber);border-bottom:1px solid var(--amber);font-style:italic;font-size:.97rem;color:var(--ink-soft)}
-.ended-banner{margin:1.6rem 0 0;padding:1rem 1.3rem;border-top:1px solid var(--line);border-bottom:1px solid var(--line);font-style:italic;font-size:.97rem;color:var(--ink-soft)}
-.review-banner strong{font-style:normal;color:var(--amber)}
-.gone-note{margin:1.2rem 0 0;padding:.6rem 1.1rem;border-left:3px solid var(--ink-faint);font-size:.94rem;font-style:italic;color:var(--ink-soft)}
-.versions{margin:1.8rem 0 0}
-/* Summary matches .pagetext summary exactly — the collapsed-section rows at
-   the bottom of an exhibit read as one set. */
-.versions summary{cursor:pointer;font-family:var(--grot);font-size:.7rem;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--red-deep)}
-.versions summary::marker{color:var(--red)}
-.versions[open] summary{margin-bottom:.7rem}
-.versions .v-note{font-size:.88rem;color:var(--ink-faint);margin:.6rem 0 0}
-.version{border-top:1px solid var(--line);margin-top:.9rem;padding-top:.7rem}
-.version .v-span{font-family:var(--grot);font-size:.72rem;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-faint);margin:0 0 .4rem}
-.version .v-pending{color:var(--red-deep);text-transform:none;letter-spacing:0}
-.version .v-diff{font-size:.92rem;color:var(--ink-soft);border-left:3px solid var(--amber);padding:.35rem .8rem;margin:.5rem 0}
-.version .v-exhibit img{max-width:100%}
-.tl .tl-l a{color:inherit;text-decoration:underline dotted}
-.gone-note strong{font-style:normal;color:var(--ink)}
-.tl{margin:1.15rem 0 0;padding:.65rem 0 .7rem;list-style:none;display:flex;flex-wrap:wrap;align-items:center;gap:.5rem 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
-.tl li{display:flex;align-items:center;gap:.6em;font-family:var(--grot);font-size:.72rem;letter-spacing:.07em;text-transform:uppercase;white-space:nowrap}
-.tl li::before{content:"";width:9px;height:9px;flex:none;background:var(--red-deep)}
-.tl li+li{margin-left:1.1rem;padding-left:1.35rem;background:linear-gradient(var(--line),var(--line)) no-repeat left center/.7rem 1px}
-.tl .tl-l{font-weight:700;color:var(--ink)}
-.tl .tl-d{color:var(--ink-faint);font-feature-settings:"tnum"}
-.tl li.tl-updated::before{background:transparent;border:1px solid var(--ink-faint)}
-.tl li.tl-revised::before,.tl li.tl-changed::before{background:var(--amber)}
-.tl li.tl-take_down::before,.tl li.tl-gone::before{background:transparent;border:2px solid var(--red-deep)}
-.tl li.tl-take_down .tl-l,.tl li.tl-gone .tl-l{color:var(--red-deep)}
-.review-only-tag{font-family:var(--grot);font-size:.62rem;font-weight:400;letter-spacing:.12em;color:var(--ink-faint);border:1px solid var(--line);padding:.15em .6em;margin-left:.8em;vertical-align:middle}
-.exhibit-more{margin:3rem 0 -1.4rem;font-size:.78rem;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-faint)}
-.coverage{margin:1.4rem 0 0;font-family:var(--grot);font-size:.8rem;line-height:1.75;color:var(--ink-soft)}
-.coverage strong{color:var(--ink)}
-
-/* index page */
-.page-index{padding:3.2rem 2rem 0}
-.lede-grid{display:grid;grid-template-columns:1.35fr 1fr;gap:0 3rem;margin-top:2.4rem}
-.lede-copy{padding-right:3rem;border-right:1px solid var(--hair)}
-.standfirst{margin:0;font-size:1.14rem;line-height:1.72;text-wrap:pretty}
-.standfirst+p{margin:1.1rem 0 0;color:var(--ink-soft);font-size:.98rem}
-.standfirst strong,.lede-copy strong{font-weight:640}
-.stat-deck{display:flex;flex-direction:column;justify-content:center}
-.stat{padding:.9rem 0;border-bottom:1px solid var(--hair);display:flex;align-items:baseline;gap:1rem}
-.stat:first-child{padding-top:.2rem}
-.stat:last-child{border-bottom:none}
-.stat b{font-family:var(--display);font-weight:620;font-variation-settings:"opsz" 144;font-size:2.55rem;line-height:1;letter-spacing:-.02em;font-feature-settings:"tnum";min-width:4.6ch}
-.stat.stat-hot b{color:var(--red)}
-.stat.stat-warm b{color:var(--amber)}
-.stat span{font-family:var(--grot);font-size:.7rem;font-weight:600;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-soft);line-height:1.5}
-
-/* findings-by-state heatmap (from the Sunlight concept, re-inked) */
-.map-band{display:grid;grid-template-columns:1.4fr 1fr;gap:0 3rem;margin-top:3rem;padding-top:1.4rem;border-top:2px solid var(--ink)}
-.map-cell{min-width:0}
-.statemap{margin-top:1.1rem;display:grid;grid-template-columns:repeat(11,minmax(0,1fr));grid-auto-rows:1fr;gap:4px;max-width:44rem}
-.st{aspect-ratio:1/1;position:relative;outline:1px solid var(--hair);outline-offset:-1px;font-family:var(--grot);font-size:clamp(8px,.95vw,11px);font-weight:600;letter-spacing:.04em;color:var(--ink-faint);padding:3px 0 0 4px}
-.st .n{position:absolute;right:4px;bottom:3px;font-size:.9em;font-feature-settings:"tnum";opacity:.9}
-.st.h1{background:var(--red-h1);outline-color:var(--red-h1);color:var(--red-deep)}
-.st.h2{background:var(--red-h2);outline-color:var(--red-h2);color:#fff}
-.st.h3{background:var(--red-h3);outline-color:var(--red-h3);color:#fff}
-.st.h4{background:var(--red-h4);outline-color:var(--red-h4);color:#fff}
-.statemap .st:hover,.statemap .st:focus-visible{outline:2px solid var(--ink);outline-offset:-2px;z-index:3}
-.st.has-pop{cursor:pointer}
-.st.has-pop:hover,.st.has-pop:focus-within{z-index:4}
-/* hover popup: the state's finding candidates */
-.pop{position:absolute;left:-1px;bottom:calc(100% + 2px);width:19rem;max-height:19rem;overflow-y:auto;
-  padding:.8rem .95rem .7rem;background:var(--paper-bright);border:1px solid var(--hair-strong);
-  box-shadow:0 2px 0 var(--hair),0 10px 26px rgba(28,23,18,.14);cursor:default;
-  visibility:hidden;opacity:0;transform:translateY(4px);transition:opacity .12s ease,transform .12s ease,visibility .12s;
-  font-family:var(--grot);text-transform:none;letter-spacing:normal;font-weight:400}
-.pop::after{content:"";position:absolute;left:0;right:0;bottom:-8px;height:8px}
-.pop-below{bottom:auto;top:calc(100% + 2px);transform:translateY(-4px)}
-.pop-below::after{bottom:auto;top:-8px}
-.pop-right{left:auto;right:-1px}
-.st:hover .pop,.st:focus-within .pop{visibility:visible;opacity:1;transform:translateY(0)}
-.pop-head{margin:0;font-size:.66rem;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:var(--ink);
-  display:flex;align-items:center;gap:.55em;padding-bottom:.5rem;border-bottom:1px solid var(--hair-strong)}
-.pop-head .redbox{width:.6em;height:.6em}
-.pop-list{list-style:none;margin:0;padding:0}
-.pop-list li{display:flex;align-items:baseline;gap:.7em;padding:.42rem 0;border-bottom:1px solid var(--hair);font-size:.78rem;line-height:1.4}
-.pop-list li:last-child{border-bottom:none}
-.pop-list a{font-weight:600;color:var(--ink);text-decoration:none;min-width:0}
-.pop-list a:hover{color:var(--red-deep);text-decoration:underline;text-decoration-color:var(--red)}
-.pop-seat{color:var(--ink-faint);font-size:.68rem;letter-spacing:.05em;white-space:nowrap}
-.pop-ie{margin-left:auto;font-weight:600;font-size:.72rem;font-feature-settings:"tnum";color:var(--red-deep);white-space:nowrap}
-.pop-foot{margin:.55rem 0 0;font-family:var(--text);font-style:italic;font-size:.72rem;color:var(--ink-faint)}
-.map-aside{display:flex;flex-direction:column;gap:1rem;justify-content:center;font-family:var(--grot)}
-.map-note{margin:.4rem 0 0;font-size:.8rem;line-height:1.7;color:var(--ink-soft)}
-.map-legend{display:flex;align-items:center;gap:1rem;flex-wrap:wrap}
-.map-legend .key{display:inline-flex;align-items:center;gap:.45em;font-size:.68rem;letter-spacing:.1em;color:var(--ink-soft)}
-.map-legend .key i{width:.85em;height:.85em;outline:1px solid var(--hair-mid);outline-offset:-1px}
-.map-legend .k1 i{background:var(--red-h1);outline:none}
-.map-legend .k2 i{background:var(--red-h2);outline:none}
-.map-legend .k3 i{background:var(--red-h3);outline:none}
-.map-legend .k4 i{background:var(--red-h4);outline:none}
-.map-offgrid{margin:0;font-size:.74rem;color:var(--ink-soft)}
-.map-count{margin:0;font-size:.68rem;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-faint);font-feature-settings:"tnum"}
-
-/* filters — wire-desk control strip */
-.controls{margin-top:3rem;padding:.9rem 0;border-top:2px solid var(--ink);border-bottom:1px solid var(--hair);display:flex;gap:.9rem;align-items:center;flex-wrap:wrap}
-.controls label{font-family:var(--grot);font-size:.65rem;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-soft);margin-right:.2rem}
-.controls input[type="search"],.controls select{appearance:none;-webkit-appearance:none;font-family:var(--grot);font-size:.8125rem;color:var(--ink);background:var(--paper-bright);border:1px solid var(--hair-mid);border-radius:0;padding:.5rem .8rem}
-.controls input[type="search"]{flex:1 1 14rem}
-.controls input[type="search"]::placeholder{color:var(--ink-faint);font-style:italic;font-family:var(--text)}
-.controls select{padding-right:2rem;background-image:linear-gradient(45deg,transparent 49%,var(--ink) 51%),linear-gradient(135deg,var(--ink) 49%,transparent 51%);background-position:right 1.05rem top 55%,right .75rem top 55%;background-size:.3rem .3rem;background-repeat:no-repeat}
-.controls input:focus,.controls select:focus{outline:none;border-color:var(--red);box-shadow:0 1px 0 var(--red)}
-.controls .paged-note{flex-basis:100%;margin:.15rem 0 0;font-family:var(--text);font-style:italic;font-size:.85rem;color:var(--ink-faint)}
-
-/* the agate table */
-.agate{width:100%;border-collapse:collapse;font-family:var(--grot);font-size:.84rem;font-feature-settings:"tnum";font-variant-numeric:tabular-nums}
-.agate thead th{font-size:.65rem;font-weight:700;letter-spacing:.13em;text-transform:uppercase;color:var(--ink);text-align:left;padding:.8rem .7rem .55rem;border-bottom:1px solid var(--hair-strong);white-space:nowrap;cursor:pointer;user-select:none}
-.agate td{padding:.58rem .7rem;border-bottom:1px solid var(--hair);vertical-align:baseline}
-.agate .num,.agate th.num{text-align:right}
-.agate td.cand{font-weight:600;letter-spacing:.015em}
-.agate td.cand a{text-decoration:none}
-.agate td.cand a:hover{text-decoration:underline;text-decoration-color:var(--red);color:var(--red-deep)}
-.agate td.seat,.agate td.party{color:var(--ink-soft);font-size:.78rem;letter-spacing:.04em}
-.src-tag{font-size:.6rem;font-weight:700;letter-spacing:.12em;color:var(--ink-faint);vertical-align:.08em;margin-left:.15em}
-.agate .ie{font-weight:600}
-.agate .conf,.agate .pages{color:var(--ink-soft);font-size:.8rem}
-
-/* status marks — small squares echoing the brand */
-.status{font-size:.66rem;font-weight:700;letter-spacing:.11em;text-transform:uppercase;white-space:nowrap}
-a.status{text-decoration:none}
-a.status:hover{text-decoration:underline;text-decoration-color:var(--red)}
-.status::before{content:"";display:inline-block;width:.75em;height:.75em;margin-right:.6em;vertical-align:-.02em}
-.status.pill-pos{color:var(--red-deep)}
-.status.pill-pos::before{background:var(--red)}
-.status.pill-pending,.status.pill-amb{color:var(--amber)}
-.status.pill-pending::before,.status.pill-amb::before{outline:1px solid var(--amber);outline-offset:-1px}
-.status.pill-neg{color:var(--ink-faint)}
-.status.pill-neg::before{outline:1px solid var(--hair-mid);outline-offset:-1px}
-.status.pill-muted{color:var(--ink-faint)}
-.status.pill-muted::before{outline:1px dashed var(--hair-mid);outline-offset:-1px}
-
-/* pager */
-.pager{display:flex;align-items:baseline;gap:1.1rem;flex-wrap:wrap;margin:1.6rem 0 0;font-family:var(--grot);font-size:.72rem;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-soft)}
-.pager a{text-decoration:none;color:var(--ink-soft)}
-.pager a:hover{color:var(--red-deep)}
-.pager .pg-nums{display:flex;gap:.8em;flex-wrap:wrap}
-.pager .pg-nums strong{color:var(--red-deep);border-bottom:2px solid var(--red)}
-.pager .pg-off{color:var(--hair-mid)}
-.pager .pg-of{color:var(--ink-faint);margin-left:auto;font-feature-settings:"tnum"}
-
-/* candidate / article pages */
-.page-finding{padding:2.6rem 2rem 0}
-.crumb{margin:0 0 2.2rem;font-family:var(--grot);font-size:.72rem;font-weight:600;letter-spacing:.14em;text-transform:uppercase}
-.crumb a{text-decoration:none;color:var(--ink-soft)}
-.crumb a:hover{color:var(--red-deep)}
-.article{max-width:46.5rem;margin:0 auto}
-.finding-tag{display:inline-flex;align-items:center;gap:.55em;font-family:var(--grot);font-size:.68rem;font-weight:700;letter-spacing:.2em;text-transform:uppercase;padding:.4em .85em;margin-left:.35rem;vertical-align:.55em;white-space:nowrap}
-.finding-tag.pill-pos{color:var(--red-deep);border:1px solid var(--red)}
-.finding-tag.pill-pos::before{content:"";width:.62em;height:.62em;background:var(--red)}
-.finding-tag.pill-pending,.finding-tag.pill-amb{color:var(--amber);border:1px solid var(--amber)}
-.finding-tag.pill-neg,.finding-tag.pill-muted{color:var(--ink-faint);border:1px solid var(--hair-mid)}
-.meta{margin:2.1rem 0 0;border-top:2px solid var(--ink);font-family:var(--grot);font-size:.85rem;display:grid;grid-template-columns:10.5rem 1fr}
-.meta dt{padding:.55rem .5rem .55rem 0;font-size:.65rem;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--ink-soft);border-bottom:1px solid var(--hair)}
-.meta dd{margin:0;padding:.55rem 0;border-bottom:1px solid var(--hair);font-feature-settings:"tnum";overflow-wrap:anywhere}
-.meta dd a{text-decoration-color:var(--hair-mid)}
-.detection{margin-top:3.6rem}
-.rationale{margin:1.7rem 0 0;font-size:1.1rem;line-height:1.72;text-wrap:pretty}
-.evidence-head{margin:3rem 0 .4rem;font-family:var(--grot);font-size:.7rem;font-weight:700;letter-spacing:.2em;text-transform:uppercase;color:var(--ink);display:flex;align-items:center;gap:.7em}
-.evidence-head::after{content:"";flex:1;border-top:1px solid var(--hair)}
-.evidence-head .redbox{width:.55em;height:.55em}
-.evidence{list-style:none;margin:0;padding:0}
-.evidence li{margin:2.4rem 0 0;padding-left:1.7rem;border-left:3px solid var(--red)}
-.evidence blockquote{margin:0;position:relative;font-family:var(--text);font-style:italic;font-weight:440;font-size:1.32rem;line-height:1.5;letter-spacing:-.004em;text-wrap:pretty}
-.evidence blockquote::before{content:"\\201C";position:absolute;left:-.62em;top:-.28em;font-family:var(--display);font-weight:800;font-style:normal;font-variation-settings:"opsz" 144;font-size:2.2em;line-height:1;color:var(--red);background:var(--paper);padding-bottom:.05em}
-.evidence .why{display:block;margin-top:.8rem;font-family:var(--grot);font-size:.68rem;font-weight:600;letter-spacing:.13em;text-transform:uppercase;line-height:1.8;color:var(--ink-soft)}
-.evidence .why::before{content:"\\2014\\2002";color:var(--red)}
-.exhibit{margin:3.4rem 0 0}
-.exhibit-frame{display:block;background:var(--paper-bright);border:1px solid var(--hair-mid);padding:.65rem;box-shadow:0 1px 0 var(--hair)}
-.exhibit-frame img{display:block;width:100%;height:auto}
-.exhibit figcaption{margin-top:.75rem;font-family:var(--grot);font-size:.74rem;line-height:1.75;color:var(--ink-soft);overflow-wrap:anywhere}
-.exhibit-label{font-weight:700;font-size:.65rem;letter-spacing:.18em;text-transform:uppercase;color:var(--red-deep);margin-right:.6em}
-.exhibit-label::before{content:"";display:inline-block;width:.55em;height:.55em;background:var(--red);margin-right:.55em}
-.pagetext{margin:1.8rem 0 0}
-.pagetext summary{cursor:pointer;font-family:var(--grot);font-size:.7rem;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--red-deep)}
-.pagetext summary::marker{color:var(--red)}
-.pagetext[open] summary{margin-bottom:.7rem}
-.pagetext pre{margin:0;max-height:460px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--paper-bright);border:2px solid var(--red);padding:1rem 1.2rem;font-size:.82rem;line-height:1.65}
-.evlinks{margin:1.6rem 0 0;font-family:var(--grot);font-size:.78rem;color:var(--ink-soft)}
-.corroboration{margin-top:4.2rem}
-.sequence{margin:1.6rem 0 0;font-size:1.06rem;line-height:1.7;text-wrap:pretty}
-.sequence strong{font-weight:700;font-feature-settings:"tnum"}
-.sequence .money-hot{color:var(--red-deep)}
-.ie-table{margin-top:1.8rem;font-size:.82rem}
-.ie-table td.committee{font-weight:600;letter-spacing:.02em}
-.ie-table td.range{color:var(--ink-soft);font-size:.76rem;white-space:nowrap}
-.ind{display:inline-flex;align-items:center;justify-content:center;width:1.35em;height:1.35em;font-size:.66rem;font-weight:700;line-height:1;font-family:var(--grot)}
-.ind-S{color:var(--paper-bright);background:var(--red)}
-.ind-O{color:var(--ink-soft);background:transparent;box-shadow:inset 0 0 0 1px var(--hair-mid)}
-.legend{margin:.7rem 0 0;font-family:var(--grot);font-size:.68rem;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-faint)}
-.caveat{margin:1.8rem 0 0;padding:1.1rem 1.4rem;border-top:1px solid var(--hair);border-bottom:1px solid var(--hair);font-style:italic;font-size:.94rem;line-height:1.7;color:var(--ink-soft)}
-.caveat strong{font-style:normal;color:var(--ink);font-feature-settings:"tnum"}
-
-/* change history */
-.changes{margin-top:3.6rem}
-.changelog{list-style:none;margin:1.4rem 0 0;padding:0;font-family:var(--grot);font-size:.85rem}
-.changelog li{padding:.7rem 0;border-bottom:1px solid var(--hair);line-height:1.7}
-.changelog li:first-child{border-top:2px solid var(--ink)}
-.chg-when{display:inline-block;min-width:6.5em;color:var(--ink-faint);font-feature-settings:"tnum";font-size:.78rem;letter-spacing:.06em}
-.changelog li.chg-down strong{color:var(--red-deep)}
-.changelog li.chg-up strong{color:var(--amber)}
-.chg-url{color:var(--ink-faint);font-size:.76rem;overflow-wrap:anywhere}
-
-/* standards list (corrections page) */
-.standards{margin:1.7rem 0 0;padding-left:1.2rem;font-size:1.02rem;line-height:1.72}
-.standards li{margin:.8rem 0;padding-left:.4rem}
-.standards li::marker{content:"\\25A0\\2002";color:var(--red);font-size:.6em}
-
-/* 404 — the one red box with nothing in it */
-.nf-box{display:flex;align-items:center;justify-content:center;max-width:26rem;height:9.5rem;margin:2.4rem 0;border:3px dashed var(--red);padding:1rem}
-.nf-box span{font-family:var(--grot);font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-faint)}
-
-/* footer */
-.site-foot{margin-top:5rem;padding-bottom:3rem}
-.site-foot .double-rule{margin-bottom:1.4rem}
-.site-foot p{margin:0;font-family:var(--grot);font-size:.76rem;line-height:1.8;color:var(--ink-soft);max-width:56rem}
-.site-foot strong{color:var(--ink)}
-.site-foot .foot-mark{margin-bottom:.9rem}
-.site-foot .foot-mark .redbox{width:.6em;height:.6em}
-
-/* responsive */
-@media (max-width:860px){
-  .lede-grid{grid-template-columns:1fr;gap:2.4rem 0}
-  .lede-copy{padding-right:0;border-right:none}
-  .stat-deck{border-top:1px solid var(--hair)}
-  .map-band{grid-template-columns:1fr;gap:1.6rem 0}
-  .agate .pages,.agate th:nth-child(7){display:none}
-}
-@media (max-width:640px){
-  .wrap,.page-index,.page-finding{padding-left:1.1rem;padding-right:1.1rem}
-  .folio{flex-direction:column;gap:.5rem;align-items:flex-start}
-  .folio nav{gap:.4rem 1.1rem}
-  .meta{grid-template-columns:8rem 1fr}
-  .agate .conf,.agate th:nth-child(5){display:none}
-  .evidence li{padding-left:1.1rem}
-  .evidence blockquote::before{display:none}
-  /* stat deck: 4-digit counts and $-figures at full display size crowd the
-     labels on narrow screens — step the numerals down and loosen the row */
-  .stat{padding:.7rem 0;gap:.85rem}
-  .stat b{font-size:1.9rem;min-width:3.8ch}
-  .stat span{font-size:.64rem;letter-spacing:.12em}
-}
-"""
+# INDEX_JS and CSS live in redbox/assets/ (index.js, site.css), loaded by
+# render.py and re-exported here.

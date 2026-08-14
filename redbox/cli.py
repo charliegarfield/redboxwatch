@@ -8,24 +8,53 @@ from __future__ import annotations
 
 import argparse
 import sys
+from contextlib import contextmanager
+from pathlib import Path
 
 from .config import load_config
 from .db import init_db
 from .discovery import Discovery
 from .fec import FECClient
 from .ratings.fixture import FixtureRatingAdapter
+from .util import now_iso
+
+
+@contextmanager
+def _open_db(cfg):
+    """Open the project database for the duration of a command.
+
+    Guarantees the connection is closed even on an error path (several
+    commands used to leak it when they raised before their ``conn.close()``).
+    """
+    conn = init_db(cfg.database_path)
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def _make_rating_adapter(cfg):
     # Only the offline fixture adapter ships with the repo; add live adapters
-    # (spec §3.1B) here when you have licensed access. cfg.rating_source is
+    # (spec §3.1B) here when you have licensed access. rating_source is
     # actually consulted, so a typo'd/unsupported value fails loudly instead
-    # of silently falling back to the fixture.
-    source = cfg.rating_source
+    # of silently falling back to the fixture. A missing/null value defaults
+    # to 'fixture' (matching config.yaml); the explicit string 'none' disables
+    # the ratings overlay entirely (Discovery accepts a None adapter).
+    source = cfg.get("rating_source") or "fixture"
+    if source == "none":
+        return None
     if source != "fixture":
         raise ValueError(f"rating_source {source!r} is not supported — only "
-                         f"'fixture' ships with the repo")
+                         f"'fixture' (or 'none' to disable) ships with the repo")
     return FixtureRatingAdapter()
+
+
+def _normalize_district(district: str | None) -> str | None:
+    """Zero-pad a district to the FEC weball form ('1' -> '01').
+
+    weball rows carry zero-padded districts, so an unpadded --district
+    silently matched nothing."""
+    return district.strip().zfill(2) if district else district
 
 
 def _build_token_limiter(cfg):
@@ -132,6 +161,21 @@ def _primary_dates() -> dict[str, str]:
     return out
 
 
+def _runoff_dates() -> dict[str, str]:
+    """Statewide primary-runoff dates from the calendar fixture (state -> ISO).
+
+    In a runoff state, first-round results can't say who lost a race that
+    advanced to the runoff — the state's races only count as settled once the
+    RUNOFF date has passed (see cmd_mark_primary_losers)."""
+    import json
+
+    from .scheduler import CALENDAR_FIXTURE
+
+    return {r["state"]: r["runoff_date"]
+            for r in json.loads(CALENDAR_FIXTURE.read_text())
+            if r.get("runoff_date")}
+
+
 def _build_archiver(cfg, push_wayback: bool):
     """Construct an Archiver, applying the optional ``screenshot`` config block
     (``lossless`` / ``quality``) used to transcode page captures to WebP."""
@@ -147,8 +191,8 @@ def _build_archiver(cfg, push_wayback: bool):
 
 
 def cmd_initdb(args, cfg) -> int:
-    conn = init_db(cfg.database_path)
-    conn.close()
+    with _open_db(cfg):
+        pass
     print(f"Initialised schema at {cfg.database_path}")
     return 0
 
@@ -199,7 +243,7 @@ def cmd_discover(args, cfg) -> int:
         weball_path=weball,
         use_cache=not getattr(args, "no_cache", False),
     )
-    district = getattr(args, "district", None)
+    district = _normalize_district(getattr(args, "district", None))
     mode = (getattr(args, "mode", None) or cfg.scan_mode).lower()
     if mode not in ("primary", "general", "full"):
         print(f"--mode must be primary | general | full (got {mode!r})")
@@ -228,16 +272,15 @@ def cmd_discover(args, cfg) -> int:
         offices=offices, states=states, district=district, mode=mode,
         nominee_resolver=nominee_resolver, today=today, primary_dates=primary_dates)
 
-    conn = init_db(cfg.database_path)
-    n = discovery.persist(conn, entries)
-    # Newly discovered rows are inserted with primary_date NULL, and the
-    # scheduler degrades unknown-date candidates to an unprioritized cadence —
-    # so refresh the calendar in the same run instead of relying on a manual
-    # `calendar` invocation that's easy to forget.
-    from .scheduler import backfill_primary_dates, load_calendar
-    load_calendar(conn, cycle=cfg.election_year)
-    n_dates = backfill_primary_dates(conn, cycle=cfg.election_year)
-    conn.close()
+    with _open_db(cfg) as conn:
+        n = discovery.persist(conn, entries)
+        # Newly discovered rows are inserted with primary_date NULL, and the
+        # scheduler degrades unknown-date candidates to an unprioritized cadence —
+        # so refresh the calendar in the same run instead of relying on a manual
+        # `calendar` invocation that's easy to forget.
+        from .scheduler import backfill_primary_dates, load_calendar
+        load_calendar(conn, cycle=cfg.election_year)
+        n_dates = backfill_primary_dates(conn, cycle=cfg.election_year)
 
     csv_path = cfg.repo_root / "data" / f"candidate_universe_{cfg.election_year}.csv"
     discovery.to_csv(entries, csv_path)
@@ -266,42 +309,40 @@ def cmd_mark_inactive(args, cfg) -> int:
     member now running for Senate whose old H record still shows cycle money.
     Inactive rows are kept for history but excluded from resolve/scan/publish.
     FEC-set flags (inactive=1) are cleared if the FEC un-flags them; human
-    calls from the review console (inactive=2) are never touched here.
+    calls from the review console (inactive=2) and primary-loser marks
+    (inactive=3) are never touched here — neither downgraded to 1 nor cleared.
     """
-    from .util import now_iso
-
-    conn = init_db(cfg.database_path)
-    ids = [r[0] for r in conn.execute("SELECT candidate_id FROM candidates")]
-    fec = FECClient(api_key=cfg.fec_api_key, cache_dir=cfg.fec_cache_dir,
-                    user_agent=cfg.user_agent)
-    inactive = fec.inactive_ids(ids, use_cache=not args.no_cache)
-    fec.close()
-    ts = now_iso()
-    ids_sorted = sorted(inactive)
-    marks = ",".join("?" * len(ids_sorted))
-    if ids_sorted:
-        flagged = conn.execute(
-            f"""UPDATE candidates SET inactive=1, updated_at=?
-                WHERE candidate_id IN ({marks}) AND COALESCE(inactive,0) != 1""",
-            (ts, *ids_sorted)).rowcount
-        cleared = conn.execute(
-            f"""UPDATE candidates SET inactive=NULL, updated_at=?
-                WHERE inactive=1 AND candidate_id NOT IN ({marks})""",
-            (ts, *ids_sorted)).rowcount
-    else:
-        flagged = 0
-        cleared = conn.execute(
-            "UPDATE candidates SET inactive=NULL, updated_at=? WHERE inactive=1",
-            (ts,)).rowcount
-    conn.commit()
-    for r in conn.execute(
-        """SELECT candidate_id, name, office, state, district FROM candidates
-           WHERE COALESCE(inactive,0)=1 ORDER BY state, name"""):
-        print(f"  inactive: {r['candidate_id']} {r['name']} "
-              f"({r['office']}-{r['state']}-{r['district']})")
-    n_total = conn.execute(
-        "SELECT COUNT(*) FROM candidates WHERE COALESCE(inactive,0)!=0").fetchone()[0]
-    conn.close()
+    with _open_db(cfg) as conn:
+        ids = [r[0] for r in conn.execute("SELECT candidate_id FROM candidates")]
+        fec = FECClient(api_key=cfg.fec_api_key, cache_dir=cfg.fec_cache_dir,
+                        user_agent=cfg.user_agent)
+        inactive = fec.inactive_ids(ids, use_cache=not args.no_cache)
+        fec.close()
+        ts = now_iso()
+        ids_sorted = sorted(inactive)
+        marks = ",".join("?" * len(ids_sorted))
+        if ids_sorted:
+            flagged = conn.execute(
+                f"""UPDATE candidates SET inactive=1, updated_at=?
+                    WHERE candidate_id IN ({marks}) AND COALESCE(inactive,0) = 0""",
+                (ts, *ids_sorted)).rowcount
+            cleared = conn.execute(
+                f"""UPDATE candidates SET inactive=NULL, updated_at=?
+                    WHERE inactive=1 AND candidate_id NOT IN ({marks})""",
+                (ts, *ids_sorted)).rowcount
+        else:
+            flagged = 0
+            cleared = conn.execute(
+                "UPDATE candidates SET inactive=NULL, updated_at=? WHERE inactive=1",
+                (ts,)).rowcount
+        conn.commit()
+        for r in conn.execute(
+            """SELECT candidate_id, name, office, state, district FROM candidates
+               WHERE COALESCE(inactive,0)=1 ORDER BY state, name"""):
+            print(f"  inactive: {r['candidate_id']} {r['name']} "
+                  f"({r['office']}-{r['state']}-{r['district']})")
+        n_total = conn.execute(
+            "SELECT COUNT(*) FROM candidates WHERE COALESCE(inactive,0)!=0").fetchone()[0]
     print(f"\n{len(inactive)} FEC-inactive candidacy(ies) ({flagged} newly flagged, "
           f"{cleared} cleared); {n_total} total excluded incl. human calls.")
     print("Inactive rows are excluded from resolve/scan-all/publish; re-run "
@@ -327,12 +368,31 @@ def cmd_mark_primary_losers(args, cfg) -> int:
     from datetime import date
 
     from .nominees import flag_primary_losers
-    from .util import now_iso
 
     today = date.fromisoformat(args.today) if args.today else date.today()
     dates = _primary_dates()
-    past = {k for k, d in dates.items() if ":" not in k
-            and d and date.fromisoformat(d[:10]) < today}
+    runoffs = _runoff_dates()
+    # A state is "past its primary" only once its LAST deciding round has
+    # passed: in a runoff state that's the runoff date, not the first round.
+    # Between the rounds, first-round results can't say who lost any race
+    # that advanced — marking losers there would knock runoff participants
+    # out of the universe.
+    past: set[str] = set()
+    runoff_pending: list[str] = []
+    for k, d in dates.items():
+        if ":" in k or not d:
+            continue
+        first = date.fromisoformat(d[:10])
+        runoff = runoffs.get(k)
+        settled = max(first, date.fromisoformat(runoff[:10])) if runoff else first
+        if settled < today:
+            past.add(k)
+        elif first < today:
+            runoff_pending.append(k)
+    if runoff_pending:
+        print(f"(holding {len(runoff_pending)} state(s) between first round and "
+              f"runoff — losers unknowable until the runoff passes: "
+              f"{', '.join(sorted(runoff_pending))})")
     # Races moved off their state's statewide date (override keys 'ST:H' /
     # 'ST:H:01') that have NOT voted yet: exclude them from the sweep — a
     # feed still carrying a voided earlier result must not mark losers in a
@@ -346,29 +406,29 @@ def cmd_mark_primary_losers(args, cfg) -> int:
         print("No state's primary is in the past — nothing to do.")
         return 0
 
-    conn = init_db(cfg.database_path)
-    resolver, feed_name = _build_nominee_resolver(
-        cfg, use_feed=not getattr(args, "no_feed", False))
-    from .nominees import TOP_TWO_STATES
-    skipped = sorted(past & TOP_TWO_STATES)
-    if skipped:
-        print(f"(skipping top-two state(s) {', '.join(skipped)} — the per-party "
-              f"nominee model can't express two same-party advancers; resolve "
-              f"those races via overrides or the review console)")
-    print(f"{len(past)} state(s) past their primary as of {today} "
-          f"(feed: {feed_name or 'none — override + uncontested only'})")
-    excl = sorted((o, s, d) for o, s, d in not_yet if s in past)
-    if excl:
-        pretty = ", ".join(f"{s}-{o}" + (f"-{d}" if d else "") for o, s, d in excl)
-        print(f"(excluding postponed race(s) not yet voted: {pretty})")
-    lost, cleared, unresolved, feed_failed = flag_primary_losers(
-        conn, resolver, states=past, ts=now_iso(), exclude=not_yet)
-    for c in lost:
-        print(f"  lost primary: {c['candidate_id']} {c['name']} "
-              f"({c.get('office')}-{c.get('state')}-{c.get('district')})")
-    n_total = conn.execute(
-        "SELECT COUNT(*) FROM candidates WHERE inactive=3").fetchone()[0]
-    conn.close()
+    with _open_db(cfg) as conn:
+        resolver, feed_name = _build_nominee_resolver(
+            cfg, use_feed=not getattr(args, "no_feed", False))
+        from .nominees import TOP_TWO_STATES
+        skipped = sorted(past & TOP_TWO_STATES)
+        if skipped:
+            print(f"(skipping top-two state(s) {', '.join(skipped)} — the per-party "
+                  f"nominee model can't express two same-party advancers; resolve "
+                  f"those races via overrides or the review console)")
+        print(f"{len(past)} state(s) past their primary as of {today} "
+              f"(feed: {feed_name or 'none — override + uncontested only'})")
+        excl = sorted((o, s, d) for o, s, d in not_yet if s in past)
+        if excl:
+            pretty = ", ".join(f"{s}-{o}" + (f"-{d}" if d else "") for o, s, d in excl)
+            print(f"(excluding postponed race(s) not yet voted: {pretty})")
+        lost, cleared, unresolved, feed_failed = flag_primary_losers(
+            conn, resolver, states=past, ts=now_iso(), exclude=not_yet,
+            allow_mass_clear=getattr(args, "allow_mass_clear", False))
+        for c in lost:
+            print(f"  lost primary: {c['candidate_id']} {c['name']} "
+                  f"({c.get('office')}-{c.get('state')}-{c.get('district')})")
+        n_total = conn.execute(
+            "SELECT COUNT(*) FROM candidates WHERE inactive=3").fetchone()[0]
     print(f"\n{len(lost)} newly marked lost-primary, {cleared} cleared; "
           f"{n_total} total inactive=3.")
     if feed_failed and feed_name:
@@ -393,102 +453,99 @@ def cmd_resolve(args, cfg) -> int:
     from collections import Counter
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    from .fec import FECClient
-    from .util import now_iso
     from .website import WebsiteResolver
 
-    conn = init_db(cfg.database_path)
-    where = "WHERE state=?" if args.state else ""
-    params = (args.state.upper(),) if args.state else ()
-    rows = [dict(r) for r in conn.execute(
-        f"SELECT * FROM candidates {where} ORDER BY state, district, name", params).fetchall()]
+    with _open_db(cfg) as conn:
+        where = "WHERE state=?" if args.state else ""
+        params = (args.state.upper(),) if args.state else ()
+        rows = [dict(r) for r in conn.execute(
+            f"SELECT * FROM candidates {where} ORDER BY state, district, name", params).fetchall()]
 
-    fec = FECClient(api_key=cfg.fec_api_key, cache_dir=cfg.fec_cache_dir, user_agent=cfg.user_agent)
-    use_search = cfg.enable_search_backup and not args.no_search
-    # --no-cache disables the resolution cache entirely (no read, no write).
-    cache_dir = None if args.no_cache else cfg.resolve_cache_dir
-    resolver = WebsiteResolver(
-        fec_client=fec, user_agent=cfg.user_agent,
-        anthropic_api_key=cfg.anthropic_api_key, enable_search=use_search,
-        search_model=cfg.search_model, serper_key=cfg.serper_key,
-        judge_model=cfg.judge_model, cache_dir=cache_dir)
-    if use_search:
-        backend = getattr(resolver.search, "name", None)
-        if backend == "serper":
-            print("(search backup: Serper + LLM judge — billable; use --no-search to disable)")
-        elif backend == "search":
-            print("(search backup: Claude web_search — billable; "
-                  "set SERPER_KEY for cheaper Serper; use --no-search to disable)")
-    if cache_dir:
-        print(f"(resolution cache: {cache_dir}; --force to re-resolve, --no-cache to bypass)")
+        fec = FECClient(api_key=cfg.fec_api_key, cache_dir=cfg.fec_cache_dir, user_agent=cfg.user_agent)
+        use_search = cfg.enable_search_backup and not args.no_search
+        # --no-cache disables the resolution cache entirely (no read, no write).
+        cache_dir = None if args.no_cache else cfg.resolve_cache_dir
+        resolver = WebsiteResolver(
+            fec_client=fec, user_agent=cfg.user_agent,
+            anthropic_api_key=cfg.anthropic_api_key, enable_search=use_search,
+            search_model=cfg.search_model, serper_key=cfg.serper_key,
+            judge_model=cfg.judge_model, cache_dir=cache_dir)
+        if use_search:
+            backend = getattr(resolver.search, "name", None)
+            if backend == "serper":
+                print("(search backup: Serper + LLM judge — billable; use --no-search to disable)")
+            elif backend == "search":
+                print("(search backup: Claude web_search — billable; "
+                      "set SERPER_KEY for cheaper Serper; use --no-search to disable)")
+        if cache_dir:
+            print(f"(resolution cache: {cache_dir}; --force to re-resolve, --no-cache to bypass)")
 
-    # Decide who to attempt up front; skipped (kept) candidates need no lookup.
-    by_source: Counter = Counter()
-    to_attempt: list[dict] = []
-    for c in rows:
-        # NEVER overwrite a human-verified URL — not even with --force. Verified
-        # attribution is human-owned; a forced rerun re-resolves auto-resolved
-        # rows only (a --force used to downgrade verified URLs to whatever the
-        # auto chain returned).
-        if c.get("url_verified"):
-            by_source["manual (kept)"] += 1
-            continue
-        # A human checked and found no site (review-console URL triage) — don't
-        # re-attempt, and never replace that call with an unverified auto-guess.
-        if c.get("url_source") == "human_none":
-            by_source["human_none (kept)"] += 1
-            continue
-        # Not actually running for this seat (FEC candidate_inactive or a human
-        # wrong-race call) — nothing to resolve for a phantom candidacy.
-        if c.get("inactive"):
-            by_source["inactive (skipped)"] += 1
-            continue
-        # Skip already-resolved (auto) candidates unless --force.
-        if c.get("website_url") and not args.force:
-            by_source[f"{c.get('url_source')} (kept)"] += 1
-            continue
-        to_attempt.append(c)
-
-    # Resolve concurrently (each lookup is independent network/LLM I/O), but apply
-    # all DB writes on this thread — the SQLite connection isn't thread-shareable.
-    # --force bypasses the cache read so a forced run actually re-resolves.
-    resolved = attempted = 0
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futs = {pool.submit(resolver.resolve, c, use_cache=not args.force): c
-                for c in to_attempt}
-        for fut in as_completed(futs):
-            c = futs[fut]
-            attempted += 1
-            try:
-                rr = fut.result()
-            except Exception as e:                  # defensive: chain steps already swallow
-                by_source["error"] += 1
-                print(f"  ! {c['name']:38s} resolve failed: {e}")
+        # Decide who to attempt up front; skipped (kept) candidates need no lookup.
+        by_source: Counter = Counter()
+        to_attempt: list[dict] = []
+        for c in rows:
+            # NEVER overwrite a human-verified URL — not even with --force. Verified
+            # attribution is human-owned; a forced rerun re-resolves auto-resolved
+            # rows only (a --force used to downgrade verified URLs to whatever the
+            # auto chain returned).
+            if c.get("url_verified"):
+                by_source["manual (kept)"] += 1
                 continue
-            if rr.url:
-                conn.execute(
-                    """UPDATE candidates SET website_url=?, url_source=?, url_verified=?,
-                           updated_at=? WHERE candidate_id=?""",
-                    (rr.url, rr.source, int(rr.verified), now_iso(), c["candidate_id"]))
-                resolved += 1
-                by_source[rr.source] += 1
-                print(f"  {c['name']:38s} {c.get('state')}-{c.get('district')} -> {rr.url}  [{rr.source}]")
-            else:
-                by_source["none"] += 1
-                # On a forced re-resolve that now yields nothing, clear a previously
-                # auto-resolved URL (never a human-verified one) so the DB reflects
-                # the current resolution rather than a stale guess.
-                if args.force and c.get("website_url") and not c.get("url_verified"):
+            # A human checked and found no site (review-console URL triage) — don't
+            # re-attempt, and never replace that call with an unverified auto-guess.
+            if c.get("url_source") == "human_none":
+                by_source["human_none (kept)"] += 1
+                continue
+            # Not actually running for this seat (FEC candidate_inactive or a human
+            # wrong-race call) — nothing to resolve for a phantom candidacy.
+            if c.get("inactive"):
+                by_source["inactive (skipped)"] += 1
+                continue
+            # Skip already-resolved (auto) candidates unless --force.
+            if c.get("website_url") and not args.force:
+                by_source[f"{c.get('url_source')} (kept)"] += 1
+                continue
+            to_attempt.append(c)
+
+        # Resolve concurrently (each lookup is independent network/LLM I/O), but apply
+        # all DB writes on this thread — the SQLite connection isn't thread-shareable.
+        # --force bypasses the cache read so a forced run actually re-resolves.
+        resolved = attempted = 0
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futs = {pool.submit(resolver.resolve, c, use_cache=not args.force): c
+                    for c in to_attempt}
+            for fut in as_completed(futs):
+                c = futs[fut]
+                attempted += 1
+                try:
+                    rr = fut.result()
+                except Exception as e:                  # defensive: chain steps already swallow
+                    by_source["error"] += 1
+                    print(f"  ! {c['name']:38s} resolve failed: {e}")
+                    continue
+                if rr.url:
                     conn.execute(
-                        """UPDATE candidates SET website_url=NULL, url_source='none',
+                        """UPDATE candidates SET website_url=?, url_source=?, url_verified=?,
                                updated_at=? WHERE candidate_id=?""",
-                        (now_iso(), c["candidate_id"]))
-            # Commit incrementally so a long run isn't lost if it crashes partway
-            # (each candidate's result is independent).
-            if attempted % 10 == 0:
-                conn.commit()
-    conn.commit()
-    conn.close()
+                        (rr.url, rr.source, int(rr.verified), now_iso(), c["candidate_id"]))
+                    resolved += 1
+                    by_source[rr.source] += 1
+                    print(f"  {c['name']:38s} {c.get('state')}-{c.get('district')} -> {rr.url}  [{rr.source}]")
+                else:
+                    by_source["none"] += 1
+                    # On a forced re-resolve that now yields nothing, clear a previously
+                    # auto-resolved URL (never a human-verified one) so the DB reflects
+                    # the current resolution rather than a stale guess.
+                    if args.force and c.get("website_url") and not c.get("url_verified"):
+                        conn.execute(
+                            """UPDATE candidates SET website_url=NULL, url_source='none',
+                                   updated_at=? WHERE candidate_id=?""",
+                            (now_iso(), c["candidate_id"]))
+                # Commit incrementally so a long run isn't lost if it crashes partway
+                # (each candidate's result is independent).
+                if attempted % 10 == 0:
+                    conn.commit()
+        conn.commit()
     fec.close()
     print(f"\nResolved {resolved}/{attempted} attempted "
           f"({len(rows)} candidates total). By source: {dict(by_source)}")
@@ -497,16 +554,19 @@ def cmd_resolve(args, cfg) -> int:
 
 
 def _scan_one_candidate(candidate: dict, cfg, *, push_wayback: bool, rate_limiter=None,
-                        chunk_executor=None, watchdog_registry: dict | None = None):
+                        chunk_executor=None, watchdog_registry: dict | None = None,
+                        watchdog_lock=None, domain_limiter=None):
     """Scan a single candidate in an isolated context (own browser + DB conn).
 
     Designed to run in a worker thread: Playwright's sync API is not thread-safe
     across a shared browser, and SQLite connections are not thread-shareable, so
     each call creates its own. ``rate_limiter`` (if given) is the SHARED token
-    limiter and ``chunk_executor`` the SHARED chunk-classification pool — every
-    worker passes the same instances so the org tokens/min ceiling and the global
-    in-flight LLM-call count are both enforced across the whole run. Returns the
-    ScanOutcome (or raises).
+    limiter, ``chunk_executor`` the SHARED chunk-classification pool, and
+    ``domain_limiter`` the SHARED per-domain politeness limiter — every worker
+    passes the same instances so the org tokens/min ceiling, the global
+    in-flight LLM-call count, and the per-host crawl delay are all enforced
+    across the whole run (a per-worker DomainRateLimiter let concurrent workers
+    hit one host without sharing the delay). Returns the ScanOutcome (or raises).
     """
     from .archiver import Archiver
     from .classifier import Classifier, build_llm
@@ -521,9 +581,13 @@ def _scan_one_candidate(candidate: dict, cfg, *, push_wayback: bool, rate_limite
     models = cfg.models
     conn = connect(cfg.database_path)          # own connection for this thread
     if watchdog_registry is not None:
+        import contextlib
         import time as _time
-        watchdog_registry[candidate["candidate_id"]] = (candidate.get("name", ""),
-                                                        _time.monotonic())
+        # Insert/pop under the shared lock: the watchdog thread iterates this
+        # dict, and an unlocked resize mid-iteration raises RuntimeError there.
+        with (watchdog_lock or contextlib.nullcontext()):
+            watchdog_registry[candidate["candidate_id"]] = (candidate.get("name", ""),
+                                                            _time.monotonic())
     try:
         with PlaywrightFetcher(user_agent=cfg.user_agent) as fetcher:
             crawler = Crawler(
@@ -532,7 +596,8 @@ def _scan_one_candidate(candidate: dict, cfg, *, push_wayback: bool, rate_limite
                     default=robots_cfg.get("default", "respect"),
                     per_domain=robots_cfg.get("per_domain", {}),
                     user_agent=cfg.user_agent),
-                rate_limiter=DomainRateLimiter(rl.get("default_min_delay_seconds", 2.0)),
+                rate_limiter=(domain_limiter if domain_limiter is not None else
+                              DomainRateLimiter(rl.get("default_min_delay_seconds", 2.0))),
                 common_paths=cfg.common_paths, crawl_depth=cfg.crawl_depth,
                 user_agent=cfg.user_agent,
                 max_pages=cfg.get("max_pages_per_site", 150))
@@ -560,8 +625,23 @@ def _scan_one_candidate(candidate: dict, cfg, *, push_wayback: bool, rate_limite
                                       "candidate_wallclock_seconds", 1500))
     finally:
         if watchdog_registry is not None:
-            watchdog_registry.pop(candidate["candidate_id"], None)
+            import contextlib
+            with (watchdog_lock or contextlib.nullcontext()):
+                watchdog_registry.pop(candidate["candidate_id"], None)
         conn.close()
+
+
+def _watchdog_overdue(in_flight: dict, lock, ceiling: float,
+                      now: float) -> list[tuple[str, str, float]]:
+    """Snapshot ``in_flight`` under ``lock`` and return (cid, name, minutes
+    running) for every candidate past the wall-clock ceiling (+2 min grace),
+    sorted by candidate id. The snapshot is what makes the watchdog safe
+    against workers resizing the dict mid-iteration."""
+    with lock:
+        snapshot = list(in_flight.items())
+    return [(cid, name, (now - started) / 60)
+            for cid, (name, started) in sorted(snapshot)
+            if now - started > ceiling + 120]
 
 
 def cmd_scan_all(args, cfg) -> int:
@@ -573,56 +653,51 @@ def cmd_scan_all(args, cfg) -> int:
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    conn = init_db(cfg.database_path)
     # inactive = withdrawn/superseded candidacy (FEC flag or human wrong-race
-    # call) — never scan a phantom record.
-    where = ["website_url IS NOT NULL", "COALESCE(inactive,0) = 0"]
-    params: list = []
+    # call) — never scan a phantom record. This base predicate is shared by the
+    # selection query and the skipped-already-attempted count below, so the two
+    # can never disagree about which candidates are in scope.
+    base_where = ["website_url IS NOT NULL", "COALESCE(inactive,0) = 0"]
+    base_params: list = []
     if args.state:
-        where.append("state = ?"); params.append(args.state.upper())
+        base_where.append("state = ?"); base_params.append(args.state.upper())
     if cfg.require_verified_url:
-        where.append("url_verified = 1")
-    # Restart safety: by default skip candidates already attempted (scan_status
-    # set to 'scanned' | 'robots_blocked' | 'fetch_failed'), so an interrupted
-    # nationwide run resumes where it left off instead of re-crawling everything.
-    # --rescan re-attempts all matching candidates (incl. prior failures).
-    # --due instead takes the scheduler's cadence-due set, which already encodes
-    # "needs a scan now" from the scans table — the scan_status restart filter
-    # would wrongly exclude previously-scanned candidates, so it doesn't apply.
-    due_rank: dict | None = None
-    if args.due:
-        from .scheduler import due_candidates
-        # Same cadence config as `schedule` — the two must agree on the due set.
-        cad = cfg.get("scan_cadence", {}) or {}
-        due_rank = {d.candidate["candidate_id"]: i for i, d in enumerate(
-            due_candidates(conn,
-                           daily_window_days=cad.get("daily_window_days", 21),
-                           default_interval_days=cad.get("default_interval_days", 7),
-                           require_verified=cfg.require_verified_url))}
-    elif not args.rescan:
-        where.append("scan_status IS NULL")
-    rows = [dict(r) for r in conn.execute(
-        f"SELECT * FROM candidates WHERE {' AND '.join(where)} ORDER BY state, district, name",
-        params).fetchall()]
-    if due_rank is not None:
-        # Soonest-primary-first, matching the scheduler's priority order.
-        rows = sorted((r for r in rows if r["candidate_id"] in due_rank),
-                      key=lambda r: due_rank[r["candidate_id"]])
-    # How many already-done candidates we're skipping (for an honest summary) —
-    # under the SAME filters as the selection query, or the count disagrees
-    # with what the run would actually have picked.
-    skip_where = ["website_url IS NOT NULL", "scan_status IS NOT NULL",
-                  "COALESCE(inactive,0) = 0"]
-    skip_params: list = []
-    if args.state:
-        skip_where.append("state = ?"); skip_params.append(args.state.upper())
-    if cfg.require_verified_url:
-        skip_where.append("url_verified = 1")
-    already = conn.execute(
-        f"SELECT COUNT(*) FROM candidates WHERE {' AND '.join(skip_where)}",
-        skip_params).fetchone()[0]
-    cost_summary = _estimate_scan_cost(conn, len(rows), cfg)
-    conn.close()
+        base_where.append("url_verified = 1")
+
+    with _open_db(cfg) as conn:
+        # Restart safety: by default skip candidates already attempted (scan_status
+        # set to 'scanned' | 'robots_blocked' | 'fetch_failed'), so an interrupted
+        # nationwide run resumes where it left off instead of re-crawling everything.
+        # --rescan re-attempts all matching candidates (incl. prior failures).
+        # --due instead takes the scheduler's cadence-due set, which already encodes
+        # "needs a scan now" from the scans table — the scan_status restart filter
+        # would wrongly exclude previously-scanned candidates, so it doesn't apply.
+        due_rank: dict | None = None
+        where = list(base_where)
+        if args.due:
+            from .scheduler import due_candidates
+            # Same cadence config as `schedule` — the two must agree on the due set.
+            cad = cfg.get("scan_cadence", {}) or {}
+            due_rank = {d.candidate["candidate_id"]: i for i, d in enumerate(
+                due_candidates(conn,
+                               daily_window_days=cad.get("daily_window_days", 21),
+                               default_interval_days=cad.get("default_interval_days", 7),
+                               require_verified=cfg.require_verified_url))}
+        elif not args.rescan:
+            where.append("scan_status IS NULL")
+        rows = [dict(r) for r in conn.execute(
+            f"SELECT * FROM candidates WHERE {' AND '.join(where)} ORDER BY state, district, name",
+            base_params).fetchall()]
+        if due_rank is not None:
+            # Soonest-primary-first, matching the scheduler's priority order.
+            rows = sorted((r for r in rows if r["candidate_id"] in due_rank),
+                          key=lambda r: due_rank[r["candidate_id"]])
+        # How many already-done candidates we're skipping (for an honest summary).
+        already = conn.execute(
+            f"SELECT COUNT(*) FROM candidates "
+            f"WHERE {' AND '.join(base_where + ['scan_status IS NOT NULL'])}",
+            base_params).fetchone()[0]
+        cost_summary = _estimate_scan_cost(conn, len(rows), cfg)
 
     if not rows:
         if args.due:
@@ -666,6 +741,13 @@ def cmd_scan_all(args, cfg) -> int:
     print(f"Classify pool: up to {pool_size} concurrent chunk calls "
           f"(shared across {args.workers} workers).")
 
+    # ONE per-domain politeness limiter shared by every worker (thread-safe), so
+    # concurrent workers that land on the same host still honor the crawl delay
+    # between them — per-worker limiters each kept their own last-hit clock.
+    from .ratelimit import DomainRateLimiter
+    domain_limiter = DomainRateLimiter(
+        (cfg.get("rate_limit", {}) or {}).get("default_min_delay_seconds", 2.0))
+
     # Stuck-scan watchdog: a daemon thread that names any candidate running past
     # the wall-clock ceiling. The ceiling itself is enforced cooperatively
     # between pages (pipeline) and per fetch (drip-feed guards) — a candidate
@@ -674,18 +756,20 @@ def cmd_scan_all(args, cfg) -> int:
     import threading
     import time as _time
     in_flight: dict[str, tuple[str, float]] = {}
+    # Workers insert/pop while the watchdog iterates: snapshot under this lock,
+    # or a concurrent resize raises RuntimeError mid-iteration and silently
+    # kills the watchdog thread for the rest of the run.
+    in_flight_lock = threading.Lock()
     ceiling = cfg.get("candidate_wallclock_seconds", 1500)
     stop_watchdog = threading.Event()
 
     def _watchdog():
         while not stop_watchdog.wait(60):
-            now = _time.monotonic()
-            for cid, (name, started) in sorted(in_flight.items()):
-                mins = (now - started) / 60
-                if now - started > ceiling + 120:
-                    print(f"  ⏱ WATCHDOG: {cid} {name[:30]} running {mins:.0f}m "
-                          f"(ceiling {ceiling/60:.0f}m) — likely wedged in a "
-                          f"blocking call; investigate this site")
+            for cid, name, mins in _watchdog_overdue(
+                    in_flight, in_flight_lock, ceiling, _time.monotonic()):
+                print(f"  ⏱ WATCHDOG: {cid} {name[:30]} running {mins:.0f}m "
+                      f"(ceiling {ceiling/60:.0f}m) — likely wedged in a "
+                      f"blocking call; investigate this site")
 
     threading.Thread(target=_watchdog, daemon=True).start()
 
@@ -695,7 +779,9 @@ def cmd_scan_all(args, cfg) -> int:
          ThreadPoolExecutor(max_workers=args.workers) as pool:
         futs = {pool.submit(_scan_one_candidate, c, cfg,
                             push_wayback=args.push_wayback, rate_limiter=limiter,
-                            chunk_executor=chunk_pool, watchdog_registry=in_flight): c
+                            chunk_executor=chunk_pool, watchdog_registry=in_flight,
+                            watchdog_lock=in_flight_lock,
+                            domain_limiter=domain_limiter): c
                 for c in rows}
         try:
             for fut in as_completed(futs):
@@ -748,10 +834,10 @@ def cmd_scan(args, cfg) -> int:
     (set require_verified_url in config.yaml to restore the spec §3.1 gate).
     Wayback pushes require --push-wayback.
     """
-    conn = init_db(cfg.database_path)
-    row = conn.execute(
-        "SELECT * FROM candidates WHERE candidate_id=?", (args.candidate,)
-    ).fetchone()
+    with _open_db(cfg) as conn:
+        row = conn.execute(
+            "SELECT * FROM candidates WHERE candidate_id=?", (args.candidate,)
+        ).fetchone()
     if not row:
         print(f"No candidate {args.candidate} in DB. Run `discover` first.")
         return 1
@@ -777,7 +863,6 @@ def cmd_scan(args, cfg) -> int:
               f"to proceed (add --push-wayback to also archive to the Wayback Machine).")
         return 0
 
-    conn.close()
     # Same stack (and, crucially, the same token-rate limiter) as a scan-all
     # worker — the single-candidate path was building its own duplicate stack
     # and had drifted to running completely unmetered.
@@ -804,10 +889,9 @@ def cmd_calendar(args, cfg) -> int:
     """Load the per-state primary calendar and backfill candidate primary dates (phase 7)."""
     from .scheduler import backfill_primary_dates, load_calendar
 
-    conn = init_db(cfg.database_path)
-    n = load_calendar(conn, cycle=cfg.election_year)
-    m = backfill_primary_dates(conn, cycle=cfg.election_year)
-    conn.close()
+    with _open_db(cfg) as conn:
+        n = load_calendar(conn, cycle=cfg.election_year)
+        m = backfill_primary_dates(conn, cycle=cfg.election_year)
     print(f"Loaded {n} state primary dates into `elections`; "
           f"backfilled primary_date onto {m} candidates.")
     return 0
@@ -819,15 +903,14 @@ def cmd_schedule(args, cfg) -> int:
 
     from .scheduler import due_candidates
 
-    conn = init_db(cfg.database_path)
     cadence = cfg.get("scan_cadence", {}) or {}
     today = date.fromisoformat(args.today) if args.today else None
-    due = due_candidates(
-        conn, today=today,
-        daily_window_days=cadence.get("daily_window_days", 21),
-        default_interval_days=cadence.get("default_interval_days", 7),
-        require_verified=cfg.require_verified_url)
-    conn.close()
+    with _open_db(cfg) as conn:
+        due = due_candidates(
+            conn, today=today,
+            daily_window_days=cadence.get("daily_window_days", 21),
+            default_interval_days=cadence.get("default_interval_days", 7),
+            require_verified=cfg.require_verified_url)
     if not due:
         print("No candidates with a resolved URL are due for a scan today.")
         return 0
@@ -850,46 +933,50 @@ def cmd_schedule(args, cfg) -> int:
 def cmd_corroborate(args, cfg) -> int:
     """Schedule E corroboration for candidates with a positive detection (phase 4)."""
     from .corroboration import candidates_with_positive, run
-    from .fec import FECClient
 
-    conn = init_db(cfg.database_path)
-    if args.candidate:
-        targets = [args.candidate]
-    else:
-        targets = candidates_with_positive(conn)
-    if not targets:
-        print("No candidates with a positive detection to corroborate.")
-        conn.close()
-        return 0
+    with _open_db(cfg) as conn:
+        if args.candidate:
+            targets = [args.candidate]
+        else:
+            targets = candidates_with_positive(conn)
+        if not targets:
+            print("No candidates with a positive detection to corroborate.")
+            return 0
 
-    fec = FECClient(api_key=cfg.fec_api_key, cache_dir=cfg.fec_cache_dir,
-                    user_agent=cfg.user_agent)
-    for cid in targets:
-        corr = run(conn, fec, candidate_id=cid, cycle=cfg.election_year,
-                   use_cache=not args.no_cache)
-        name = conn.execute("SELECT name FROM candidates WHERE candidate_id=?", (cid,)).fetchone()
-        print(f"\n{name['name'] if name else cid} ({cid})")
-        print(f"  {corr.headline}")
-        if corr.ie_filing_count:
-            print(f"  supporting: ${corr.supporting_total:,.0f} | opposing: "
-                  f"${corr.opposing_total:,.0f} | {corr.ie_filing_count} filings")
-            if corr.guidance_first_detected:
-                print(f"  guidance first detected (by us): {corr.guidance_first_detected[:10]} "
-                      f"| supporting IE dated on/after: ${corr.supporting_after_detection:,.0f}")
-            for s in corr.committees[:6]:
-                print(f"    [{s.indicator}] {s.committee_name}: ${s.amount:,.0f} "
-                      f"({s.count} filings, {s.first_date}..{s.last_date})")
-    fec.close()
-    conn.close()
+        fec = FECClient(api_key=cfg.fec_api_key, cache_dir=cfg.fec_cache_dir,
+                        user_agent=cfg.user_agent)
+        for cid in targets:
+            corr = run(conn, fec, candidate_id=cid, cycle=cfg.election_year,
+                       use_cache=not args.no_cache)
+            name = conn.execute("SELECT name FROM candidates WHERE candidate_id=?", (cid,)).fetchone()
+            print(f"\n{name['name'] if name else cid} ({cid})")
+            print(f"  {corr.headline}")
+            if corr.ie_filing_count:
+                print(f"  supporting: ${corr.supporting_total:,.0f} | opposing: "
+                      f"${corr.opposing_total:,.0f} | {corr.ie_filing_count} filings")
+                if corr.guidance_first_detected:
+                    print(f"  guidance first detected (by us): {corr.guidance_first_detected[:10]} "
+                          f"| supporting IE dated on/after: ${corr.supporting_after_detection:,.0f}")
+                for s in corr.committees[:6]:
+                    print(f"    [{s.indicator}] {s.committee_name}: ${s.amount:,.0f} "
+                          f"({s.count} filings, {s.first_date}..{s.last_date})")
+        fec.close()
     return 0
 
 
 def cmd_review(args, cfg) -> int:
     """Human gate on positives (spec §3.7). List pending, or approve/reject one."""
-    from .util import now_iso
+    if args.action is not None and args.detection is None:
+        # Without this, `review --action approve` silently printed the queue
+        # and exited 0 — the operator believed the approval was recorded.
+        print("--action requires --detection <ID>; nothing recorded.")
+        return 2
+    with _open_db(cfg) as conn:
+        return _cmd_review_body(args, conn)
 
-    conn = init_db(cfg.database_path)
-    if args.list or not args.detection:
+
+def _cmd_review_body(args, conn) -> int:
+    if args.list or args.detection is None:
         # Latest review wins — the same convention as the web console and the
         # publisher. (Joining ANY review row re-listed already-decided
         # detections whose history was needs_more -> approve/reject.)
@@ -940,11 +1027,25 @@ def cmd_review(args, cfg) -> int:
                               f"the guidance targets.")
             print("\nApprove/reject:  python -m redbox review --detection <ID> "
                   "--action approve|reject|needs_more [--group]")
-        conn.close()
         return 0
 
     if args.action not in ("approve", "reject", "needs_more"):
         print("--action must be approve | reject | needs_more")
+        return 2
+    row = conn.execute(
+        "SELECT classification FROM detections WHERE detection_id = ?",
+        (args.detection,)).fetchone()
+    if row is None:
+        print(f"Detection #{args.detection} does not exist; nothing recorded.")
+        return 2
+    if row["classification"] not in ("red_box_guidance", "ambiguous"):
+        # A review row on a negative detection is a foot-gun: the publisher's
+        # inactive-candidate exemption keys on action='approve' alone, so
+        # approving a no_guidance_detected row can resurrect an inactive
+        # candidate onto the public site.
+        print(f"Detection #{args.detection} is classified "
+              f"'{row['classification']}' — only red_box_guidance or ambiguous "
+              f"detections are reviewable; nothing recorded.")
         return 2
     targets = [args.detection]
     if args.group:
@@ -967,7 +1068,6 @@ def cmd_review(args, cfg) -> int:
            VALUES (?,?,?,?,?)""",
         [(d, args.reviewer, args.action, args.notes, ts) for d in targets])
     conn.commit()
-    conn.close()
     verb = {"approve": "approved (will publish)", "reject": "rejected (recorded, not published)",
             "needs_more": "marked needs-more (re-scan/expand)"}[args.action]
     extra = f" (+{len(targets)-1} identical alias detection(s))" if len(targets) > 1 else ""
@@ -1001,15 +1101,14 @@ def cmd_publish(args, cfg) -> int:
     """Generate the static review/results site (spec §3.8)."""
     from .publisher import build_site
 
-    conn = init_db(cfg.database_path)
     out = cfg.repo_root / "site"
     pub_cfg = cfg.get("publish", {}) or {}
     # Canonical URL (and thus sitemap/robots/canonical tags) only for the public
     # build — review-console pages must never carry public URLs.
     site_url = pub_cfg.get("site_url") if args.approved_only else None
-    build_site(conn, out, approved_only=args.approved_only,
-               page_size=pub_cfg.get("page_size", 500), site_url=site_url)
-    conn.close()
+    with _open_db(cfg) as conn:
+        build_site(conn, out, approved_only=args.approved_only,
+                   page_size=pub_cfg.get("page_size", 500), site_url=site_url)
     index = out / "index.html"
     mode = "public (approved findings + dated negatives)" if args.approved_only else "review console (includes pending)"
     print(f"Built {mode} site → {index}")
@@ -1046,74 +1145,71 @@ def cmd_backfill_pdf_evidence(args, cfg) -> int:
     from .archiver import Archiver
     from .crawler import fetch_pdf
 
-    conn = init_db(cfg.database_path)
-    rows = conn.execute("""
-        SELECT d.detection_id, d.candidate_id, d.scan_id, s.url, s.text_hash,
-               c.name, COALESCE(r.action, 'pending') AS action
-        FROM detections d
-        JOIN scans s USING(scan_id)
-        JOIN candidates c USING(candidate_id)
-        LEFT JOIN (SELECT detection_id, action, ROW_NUMBER() OVER (
-                       PARTITION BY detection_id
-                       ORDER BY reviewed_at DESC, review_id DESC) rn
-                   FROM reviews) r
-               ON r.detection_id = d.detection_id AND r.rn = 1
-        WHERE s.render_mode = 'pdf'
-          AND d.classification != 'no_guidance_detected'
-          AND COALESCE(r.action, 'pending') IN ('approve', 'pending')
-          AND NOT EXISTS (SELECT 1 FROM archives a
-                          WHERE a.detection_id = d.detection_id
-                            AND a.pdf_path IS NOT NULL)
-        ORDER BY d.candidate_id""").fetchall()
-    if not rows:
-        print("Nothing to backfill — every PDF-sourced detection has an archived PDF.")
-        conn.close()
-        return 0
-    if not args.authorize:
-        print(f"Would refetch {len(rows)} PDF(s) for archiving:")
-        for r in rows:
-            print(f"  {r['candidate_id']}  {r['name']}  [{r['action']}]  {r['url']}")
-        print("Live fetching is gated — re-run with --authorize to proceed "
-              "(add --push-wayback to also archive to the Wayback Machine).")
-        conn.close()
-        return 0
+    with _open_db(cfg) as conn:
+        rows = conn.execute("""
+            SELECT d.detection_id, d.candidate_id, d.scan_id, s.url, s.text_hash,
+                   c.name, COALESCE(r.action, 'pending') AS action
+            FROM detections d
+            JOIN scans s USING(scan_id)
+            JOIN candidates c USING(candidate_id)
+            LEFT JOIN (SELECT detection_id, action, ROW_NUMBER() OVER (
+                           PARTITION BY detection_id
+                           ORDER BY reviewed_at DESC, review_id DESC) rn
+                       FROM reviews) r
+                   ON r.detection_id = d.detection_id AND r.rn = 1
+            WHERE s.render_mode = 'pdf'
+              AND d.classification != 'no_guidance_detected'
+              AND COALESCE(r.action, 'pending') IN ('approve', 'pending')
+              AND NOT EXISTS (SELECT 1 FROM archives a
+                              WHERE a.detection_id = d.detection_id
+                                AND a.pdf_path IS NOT NULL)
+            ORDER BY d.candidate_id""").fetchall()
+        if not rows:
+            print("Nothing to backfill — every PDF-sourced detection has an archived PDF.")
+            return 0
+        if not args.authorize:
+            print(f"Would refetch {len(rows)} PDF(s) for archiving:")
+            for r in rows:
+                print(f"  {r['candidate_id']}  {r['name']}  [{r['action']}]  {r['url']}")
+            print("Live fetching is gated — re-run with --authorize to proceed "
+                  "(add --push-wayback to also archive to the Wayback Machine).")
+            return 0
 
-    archiver = _build_archiver(cfg, args.push_wayback)
-    done = mismatched = failed = 0
-    for r in rows:
-        try:
-            res = fetch_pdf(r["url"], user_agent=cfg.user_agent)
-        except Exception as e:
-            print(f"  FAIL {r['candidate_id']}  {r['url']}  ({e})")
-            failed += 1
-            continue
-        if not res.pdf_bytes:
-            print(f"  FAIL {r['candidate_id']}  {r['url']}  (HTTP {res.status})")
-            failed += 1
-            continue
-        if res.text_hash != r["text_hash"] and not args.force:
-            # The document no longer matches what the classifier saw — an
-            # archive made now would misrepresent the evidence. Skip unless
-            # the operator explicitly accepts the current version (--force).
-            print(f"  SKIP {r['candidate_id']}  {r['url']}  "
-                  f"(content changed since detection; use --force to archive anyway)")
-            mismatched += 1
-            continue
-        rec = archiver.archive(res, candidate_id=r["candidate_id"])
-        Archiver.persist(conn, rec, candidate_id=r["candidate_id"],
-                         scan_id=r["scan_id"], detection_id=r["detection_id"])
-        note = "" if res.text_hash == r["text_hash"] else "  (content changed — forced)"
-        print(f"  OK   {r['candidate_id']}  {r['url']}"
-              f"{'' if rec.screenshot_path else '  (render failed; raw PDF kept)'}{note}")
-        done += 1
-        time.sleep(2.0)  # polite pacing across campaign domains
-    conn.close()
+        archiver = _build_archiver(cfg, args.push_wayback)
+        done = mismatched = failed = 0
+        for r in rows:
+            try:
+                res = fetch_pdf(r["url"], user_agent=cfg.user_agent)
+            except Exception as e:
+                print(f"  FAIL {r['candidate_id']}  {r['url']}  ({e})")
+                failed += 1
+                continue
+            if not res.pdf_bytes:
+                print(f"  FAIL {r['candidate_id']}  {r['url']}  (HTTP {res.status})")
+                failed += 1
+                continue
+            if res.text_hash != r["text_hash"] and not args.force:
+                # The document no longer matches what the classifier saw — an
+                # archive made now would misrepresent the evidence. Skip unless
+                # the operator explicitly accepts the current version (--force).
+                print(f"  SKIP {r['candidate_id']}  {r['url']}  "
+                      f"(content changed since detection; use --force to archive anyway)")
+                mismatched += 1
+                continue
+            rec = archiver.archive(res, candidate_id=r["candidate_id"])
+            Archiver.persist(conn, rec, candidate_id=r["candidate_id"],
+                             scan_id=r["scan_id"], detection_id=r["detection_id"])
+            note = "" if res.text_hash == r["text_hash"] else "  (content changed — forced)"
+            print(f"  OK   {r['candidate_id']}  {r['url']}"
+                  f"{'' if rec.screenshot_path else '  (render failed; raw PDF kept)'}{note}")
+            done += 1
+            time.sleep(2.0)  # polite pacing across campaign domains
     print(f"Backfilled {done}, skipped {mismatched} changed, {failed} failed. "
           f"Re-run `publish --approved-only` to surface the new exhibits.")
     return 0
 
 
-def _clean_stale_pages(site: "Path", site_url: str) -> list[str]:
+def _clean_stale_pages(site: Path, site_url: str) -> list[str]:
     """Delete site *.html files absent from the freshly built sitemap.
 
     The sitemap lists extensionless clean URLs; map each back to its .html
@@ -1164,8 +1260,8 @@ def cmd_deploy(args, cfg) -> int:
     """One-shot public release: run the offline test suite, publish
     --approved-only, sweep stale pages, deploy to Cloudflare Pages (wrangler),
     and smoke-check the live site."""
+    import shutil
     import subprocess
-    import sys
 
     from .publisher import build_site
 
@@ -1186,11 +1282,10 @@ def cmd_deploy(args, cfg) -> int:
                   "Fix the failures or re-run with --skip-tests.")
             return r.returncode
 
-    conn = init_db(cfg.database_path)
     out = cfg.repo_root / "site"
-    build_site(conn, out, approved_only=True,
-               page_size=pub_cfg.get("page_size", 500), site_url=site_url)
-    conn.close()
+    with _open_db(cfg) as conn:
+        build_site(conn, out, approved_only=True,
+                   page_size=pub_cfg.get("page_size", 500), site_url=site_url)
     try:
         stale = _clean_stale_pages(out, site_url)
     except ValueError as e:
@@ -1198,9 +1293,42 @@ def cmd_deploy(args, cfg) -> int:
         return 1
     print(f"Built public site ({len(list(out.glob('*.html')))} pages); "
           f"removed {len(stale)} stale: {', '.join(stale) or 'none'}")
+
+    # Wrangler uploads the whole directory, and Pages' always-ignore list does
+    # NOT cover .wrangler/ — its cache carries Cloudflare account metadata.
+    # Purge known non-content entries, then refuse on anything dot-named left.
+    purged = []
+    if (out / ".wrangler").exists():
+        shutil.rmtree(out / ".wrangler", ignore_errors=True)
+        purged.append(".wrangler/")
+    for ds in sorted(out.rglob(".DS_Store")):
+        ds.unlink()
+        purged.append(str(ds.relative_to(out)))
+    if purged:
+        print(f"Purged non-content entries from site/: {', '.join(purged)}")
+    leftover = sorted(p.name for p in out.iterdir() if p.name.startswith("."))
+    if leftover:
+        print(f"Unexpected dot-entries in site/: {', '.join(leftover)} — "
+              "refusing to upload them. Nothing deployed.")
+        return 1
+
     if args.dry_run:
         print("Dry run — site built and swept, nothing deployed.")
         return 0
+
+    # Per-build fingerprint: every page footer embeds "Generated YYYY-MM-DD
+    # HH:MM UTC" (publisher._layout). Capture it from the freshly built index
+    # BEFORE uploading — the live check must see THIS build, not merely a 200
+    # with the nameplate (which the previous deploy also satisfies, so a no-op
+    # or mis-targeted deploy would pass silently).
+    import re
+    _fp_re = r"Generated \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC"
+    m = re.search(_fp_re, (out / "index.html").read_text(encoding="utf-8"))
+    if not m:
+        print("Built index.html carries no 'Generated … UTC' build fingerprint "
+              "— cannot verify the deploy would land. Nothing deployed.")
+        return 1
+    fingerprint = m.group(0)
 
     r = subprocess.run(
         ["npx", "wrangler", "pages", "deploy", str(out), "--project-name", project,
@@ -1209,56 +1337,97 @@ def cmd_deploy(args, cfg) -> int:
         print("wrangler deploy failed — site/ is built; re-run `redbox deploy` to retry.")
         return r.returncode
 
-    # Smoke-check: the deployed index must answer 200 and carry the nameplate.
+    # Smoke-check: poll until the live index serves THIS build's fingerprint
+    # (Pages propagation can lag a little), ~30s total before giving up.
+    import time
+
     import httpx
 
-    try:
-        resp = httpx.get(site_url, follow_redirects=True, timeout=30)
-        ok = resp.status_code == 200 and "Red Box Watch" in resp.text
-        print(f"Live check {site_url}: HTTP {resp.status_code} "
-              f"{'OK' if ok else 'UNEXPECTED — verify manually'}")
-        return 0 if ok else 1
-    except Exception as e:
-        print(f"Live check failed ({e}) — deploy reported success; verify manually.")
-        return 1
+    attempts, delay = 6, 5
+    last_status: object = None
+    last_live_fp: str | None = None
+    for attempt in range(attempts):
+        try:
+            resp = httpx.get(site_url, follow_redirects=True, timeout=30)
+            last_status = resp.status_code
+            if resp.status_code == 200 and fingerprint in resp.text:
+                print(f"Live check {site_url}: HTTP 200 serving this build "
+                      f"({fingerprint}) OK")
+                return 0
+            lm = re.search(_fp_re, resp.text)
+            last_live_fp = lm.group(0) if lm else None
+        except Exception as e:
+            last_status = f"error: {e}"
+        if attempt < attempts - 1:
+            time.sleep(delay)
+    print(f"Live check FAILED: {site_url} never served this build "
+          f"(expected '{fingerprint}', live page shows "
+          f"'{last_live_fp or 'no fingerprint'}', last status {last_status}) "
+          f"after {attempts} attempts — stale or mis-targeted deploy; "
+          f"verify manually.")
+    return 1
+
+
+# Junk 404/410 scans: page-absent fetches of a (candidate, url) pair that never
+# ONCE served usable content — probe noise from guessed common paths, not
+# evidence of anything. A 404 on a URL that EVER had a usable scan is take-down
+# evidence and must be kept, as must any row something else still references
+# (detections / archives / change_events). ``pipeline.usable_scan_sql`` supplies
+# the same notion of "usable" the diff logic uses.
+_JUNK_404_WHERE_TMPL = """http_status IN (404, 410)
+      AND NOT EXISTS (SELECT 1 FROM detections d WHERE d.scan_id = scans.scan_id)
+      AND NOT EXISTS (SELECT 1 FROM archives a WHERE a.scan_id = scans.scan_id)
+      AND NOT EXISTS (SELECT 1 FROM change_events ce
+                      WHERE ce.prev_scan_id = scans.scan_id
+                         OR ce.new_scan_id = scans.scan_id)
+      AND NOT EXISTS (SELECT 1 FROM scans u
+                      WHERE u.candidate_id = scans.candidate_id
+                        AND u.url = scans.url AND {usable})"""
 
 
 def cmd_vacuum(args, cfg) -> int:
-    """Reclaim disk space: null out the deprecated scans.raw_html and VACUUM.
+    """Reclaim disk space: strip deprecated raw_html, sweep junk 404 scans, VACUUM.
 
     New scans no longer store raw_html, but legacy rows still hold it (~98% of an
-    older DB). This strips that column and compacts the file. The full HTML of any
-    archived page is preserved on disk by the archiver, so nothing of evidentiary
-    value is lost. Make a backup first; VACUUM rewrites the whole file.
+    older DB). This strips that column, deletes historical 404/410 scans of URLs
+    that never had content (phantom common-path probes — the pipeline no longer
+    inserts new ones), and compacts the file. The full HTML of any archived page
+    is preserved on disk by the archiver, so nothing of evidentiary value is
+    lost. Make a backup first; VACUUM rewrites the whole file.
     """
-    from pathlib import Path
+    from .pipeline import usable_scan_sql
 
     db_path = Path(cfg.database_path)
     before = db_path.stat().st_size if db_path.exists() else 0
-    conn = init_db(db_path)
-    # Fresh databases no longer create the deprecated column at all.
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(scans)")}
-    if "raw_html" not in cols:
-        print("No raw_html column (fresh schema) — nothing to reclaim.")
-        conn.close()
-        return 0
-    row = conn.execute(
-        "SELECT COUNT(*), COALESCE(SUM(LENGTH(raw_html)),0) FROM scans WHERE raw_html IS NOT NULL"
-    ).fetchone()
-    n_rows, html_bytes = row[0], row[1]
-    print(f"DB file: {before/1e6:.1f} MB")
-    print(f"Legacy rows with raw_html: {n_rows:,}  (~{html_bytes/1e6:.1f} MB of inline HTML)")
-    if args.dry_run:
-        print("Dry run — nothing changed. Re-run without --dry-run to reclaim.")
-        conn.close()
-        return 0
-    if n_rows:
-        conn.execute("UPDATE scans SET raw_html = NULL WHERE raw_html IS NOT NULL")
+    junk_where = _JUNK_404_WHERE_TMPL.format(usable=usable_scan_sql("u"))
+    with _open_db(cfg) as conn:
+        print(f"DB file: {before/1e6:.1f} MB")
+        # Fresh databases no longer create the deprecated column at all.
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(scans)")}
+        n_html = 0
+        if "raw_html" in cols:
+            row = conn.execute(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(raw_html)),0) FROM scans "
+                "WHERE raw_html IS NOT NULL").fetchone()
+            n_html, html_bytes = row[0], row[1]
+            print(f"Legacy rows with raw_html: {n_html:,}  "
+                  f"(~{html_bytes/1e6:.1f} MB of inline HTML)")
+        else:
+            print("No raw_html column (fresh schema) — no inline HTML to strip.")
+        n_junk = conn.execute(
+            f"SELECT COUNT(*) FROM scans WHERE {junk_where}").fetchone()[0]
+        print(f"Junk 404/410 scans (URL never served usable content): {n_junk:,}")
+        if args.dry_run:
+            print("Dry run — nothing changed. Re-run without --dry-run to reclaim.")
+            return 0
+        if n_html:
+            conn.execute("UPDATE scans SET raw_html = NULL WHERE raw_html IS NOT NULL")
+        if n_junk:
+            conn.execute(f"DELETE FROM scans WHERE {junk_where}")
         conn.commit()
-    # VACUUM can't run inside a transaction and needs no WAL; isolation_level=None.
-    conn.isolation_level = None
-    conn.execute("VACUUM")
-    conn.close()
+        # VACUUM can't run inside a transaction and needs no WAL; isolation_level=None.
+        conn.isolation_level = None
+        conn.execute("VACUUM")
     after = db_path.stat().st_size
     print(f"Done. DB file: {before/1e6:.1f} MB → {after/1e6:.1f} MB "
           f"({100 - 100*after/before:.0f}% smaller)" if before else "Done.")
@@ -1273,27 +1442,36 @@ def cmd_backfill_changes(args, cfg) -> int:
     """
     from .pipeline import backfill_change_events
 
-    conn = init_db(cfg.database_path)
-    result = backfill_change_events(conn, apply=args.apply)
-    names = {r["candidate_id"]: r["name"]
-             for r in conn.execute("SELECT candidate_id, name FROM candidates")}
+    with _open_db(cfg) as conn:
+        result = backfill_change_events(conn, apply=args.apply)
+        names = {r["candidate_id"]: r["name"]
+                 for r in conn.execute("SELECT candidate_id, name FROM candidates")}
 
     def _show(events):
         for ev in events:
             print(f"  {ev['detected_at'][:10]}  {ev['event_type']:<9}  "
                   f"{names.get(ev['candidate_id'], ev['candidate_id']):<28}  {ev['url']}")
 
-    missing, spurious = result["missing"], result["spurious"]
+    missing, spurious, mismatched = (result["missing"], result["spurious"],
+                                     result["mismatched"])
     if missing:
         print("Missing (the fixed rules would have recorded these):")
         _show(missing)
     if spurious:
         print("Spurious (recorded from an error/blocked fetch, not a page change):")
         _show(spurious)
+    if mismatched:
+        print("Mismatched (recorded at the right scan but with the wrong "
+              "event/classifications; apply mode corrects them in place):")
+        for ev in mismatched:
+            print(f"  {ev['detected_at'][:10]}  {ev['recorded_event_type']:>9} "
+                  f"-> {ev['event_type']:<9}  "
+                  f"{names.get(ev['candidate_id'], ev['candidate_id']):<28}  "
+                  f"{ev['url']}")
     verb = ("applied" if args.apply
-            else "found — re-run with --apply to insert/delete")
-    print(f"{len(missing)} missing, {len(spurious)} spurious change event(s) {verb}.")
-    conn.close()
+            else "found — re-run with --apply to insert/delete/correct")
+    print(f"{len(missing)} missing, {len(spurious)} spurious, "
+          f"{len(mismatched)} mismatched change event(s) {verb}.")
     return 0
 
 
@@ -1302,21 +1480,45 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", default=None, help="path to config.yaml")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("initdb", help="create the database schema")
+    # Flags shared by several commands, defined once (argparse parent parsers).
+    fec_cache = argparse.ArgumentParser(add_help=False)
+    fec_cache.add_argument("--no-cache", action="store_true",
+                           help="bypass FEC response cache")
+    live = argparse.ArgumentParser(add_help=False)
+    live.add_argument("--authorize", action="store_true",
+                      help="confirm live fetching of real campaign domains "
+                           "(without this, just lists what would be fetched)")
+    live.add_argument("--push-wayback", action="store_true",
+                      help="also push fetched evidence to the Internet Archive "
+                           "(Wayback Machine)")
+    today = argparse.ArgumentParser(add_help=False)
+    today.add_argument("--today", default=None,
+                       help="override today's date (YYYY-MM-DD)")
+    def port_flag(default: int) -> argparse.ArgumentParser:
+        # A fresh parent per use: parents=[] shares action objects, so a single
+        # shared --port action can't carry two different per-command defaults.
+        pp = argparse.ArgumentParser(add_help=False)
+        pp.add_argument("--port", type=int, default=default,
+                        help="listen port (always binds 127.0.0.1)")
+        return pp
+
+    sub.add_parser("initdb", help="create the database schema"
+                   ).set_defaults(func=cmd_initdb)
 
     ff = sub.add_parser("fetch-fec",
                         help="download the FEC bulk candidate file into data/ "
                              "(keeps the old one as .old-YYYYMMDD)")
     ff.add_argument("--cycle", type=int, default=None,
                     help="election cycle, e.g. 2026 (default: config election_year)")
+    ff.set_defaults(func=cmd_fetch_fec)
 
-    d = sub.add_parser("discover", help="build the candidate universe (phase 1)")
+    d = sub.add_parser("discover", parents=[fec_cache],
+                       help="build the candidate universe (phase 1)")
     d.add_argument("--fetch", action="store_true",
                    help="first re-download the FEC bulk file (fetch-fec)")
     d.add_argument("--states", default=None, help="comma list, e.g. NC,TX (default: all)")
     d.add_argument("--offices", default="H,S,P", help="comma list of H,S,P")
-    d.add_argument("--district", default=None, help="two-digit district, e.g. 12 (requires a single state)")
-    d.add_argument("--no-cache", action="store_true", help="bypass FEC response cache")
+    d.add_argument("--district", default=None, help="district, e.g. 12 (requires a single state)")
     d.add_argument("--no-bulk", action="store_true",
                    help="use the openFEC API instead of the bulk weball file")
     d.add_argument("--mode", default=None, choices=["primary", "general", "full"],
@@ -1326,17 +1528,24 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--no-feed", action="store_true",
                    help="general/full: skip the results feed (civicAPI); use only "
                         "uncontested-auto + the manual nominees override file")
+    d.set_defaults(func=cmd_discover)
 
-    mi = sub.add_parser("mark-inactive",
-                        help="flag FEC-inactive (withdrawn/superseded) candidacies")
-    mi.add_argument("--no-cache", action="store_true", help="bypass FEC response cache")
+    sub.add_parser("mark-inactive", parents=[fec_cache],
+                   help="flag FEC-inactive (withdrawn/superseded) candidacies"
+                   ).set_defaults(func=cmd_mark_inactive)
 
-    ml = sub.add_parser("mark-primary-losers",
+    ml = sub.add_parser("mark-primary-losers", parents=[today],
                         help="flag primary losers in states whose primary has passed")
-    ml.add_argument("--today", default=None, help="override today's date (YYYY-MM-DD)")
     ml.add_argument("--no-feed", action="store_true",
                     help="skip the results feed; use only manual overrides + "
                          "uncontested-auto (which alone marks no one)")
+    ml.add_argument("--allow-mass-clear", action="store_true",
+                    help="bypass the mass-clear safety guard, which refuses to "
+                         "clear more than max(5, 20%%) of a state's existing "
+                         "lost-primary marks in one run (a feed going quiet is "
+                         "not evidence a race un-resolved); pass this to apply "
+                         "a large correction deliberately")
+    ml.set_defaults(func=cmd_mark_primary_losers)
 
     rs = sub.add_parser("resolve", help="backfill campaign URLs onto existing candidates (phase 1)")
     rs.add_argument("--state", default=None, help="limit to one state, e.g. NC")
@@ -1344,34 +1553,35 @@ def main(argv: list[str] | None = None) -> int:
     rs.add_argument("--no-search", action="store_true", help="disable the billable web-search backup")
     rs.add_argument("--workers", type=int, default=8, help="candidates resolved concurrently")
     rs.add_argument("--no-cache", action="store_true", help="bypass the resolution cache (no read, no write)")
+    rs.set_defaults(func=cmd_resolve)
 
-    s = sub.add_parser("scan", help="walk one candidate end-to-end (phases 2-3)")
+    s = sub.add_parser("scan", parents=[live],
+                       help="walk one candidate end-to-end (phases 2-3)")
     s.add_argument("--candidate", required=True, help="FEC candidate_id from the universe")
-    s.add_argument("--authorize", action="store_true",
-                   help="confirm live crawling of this real domain")
-    s.add_argument("--push-wayback", action="store_true",
-                   help="also push positives to the Internet Archive")
+    s.set_defaults(func=cmd_scan)
 
-    sa = sub.add_parser("scan-all", help="scan many candidates concurrently (phase 1 scale)")
+    sa = sub.add_parser("scan-all", parents=[live],
+                        help="scan many candidates concurrently (phase 1 scale)")
     sa.add_argument("--state", default=None, help="limit to one state, e.g. NY")
     sa.add_argument("--workers", type=int, default=4, help="candidates scanned concurrently")
-    sa.add_argument("--authorize", action="store_true", help="confirm live crawling")
-    sa.add_argument("--push-wayback", action="store_true",
-                    help="also push positives to the Internet Archive")
     sa.add_argument("--rescan", action="store_true",
                     help="re-scan candidates already attempted (default: skip them)")
     sa.add_argument("--due", action="store_true",
                     help="limit to candidates due under the cadence rules "
                          "(see `schedule`; re-scans them even if already attempted)")
+    sa.set_defaults(func=cmd_scan_all)
 
-    sub.add_parser("calendar", help="load per-state primary calendar (phase 7)")
+    sub.add_parser("calendar", help="load per-state primary calendar (phase 7)"
+                   ).set_defaults(func=cmd_calendar)
 
-    sch = sub.add_parser("schedule", help="list candidates due for a scan (phase 7)")
-    sch.add_argument("--today", default=None, help="override today's date (YYYY-MM-DD)")
+    sub.add_parser("schedule", parents=[today],
+                   help="list candidates due for a scan (phase 7)"
+                   ).set_defaults(func=cmd_schedule)
 
-    cor = sub.add_parser("corroborate", help="Schedule E corroboration (phase 4)")
+    cor = sub.add_parser("corroborate", parents=[fec_cache],
+                         help="Schedule E corroboration (phase 4)")
     cor.add_argument("--candidate", default=None, help="candidate_id (default: all with a positive)")
-    cor.add_argument("--no-cache", action="store_true", help="bypass FEC response cache")
+    cor.set_defaults(func=cmd_corroborate)
 
     r = sub.add_parser("review", help="human gate on positives (phase 5)")
     r.add_argument("--list", action="store_true", help="list detections pending review")
@@ -1382,27 +1592,29 @@ def main(argv: list[str] | None = None) -> int:
                         "with an identical page body (template aliases)")
     r.add_argument("--reviewer", default=None, help="reviewer name/id")
     r.add_argument("--notes", default=None, help="review notes")
+    r.set_defaults(func=cmd_review)
 
-    rw = sub.add_parser("review-web", help="serve the local web review console (phase 5)")
-    rw.add_argument("--port", type=int, default=8001,
-                    help="port for the console (always binds 127.0.0.1)")
+    sub.add_parser("review-web", parents=[port_flag(8001)],
+                   help="serve the local web review console (phase 5)"
+                   ).set_defaults(func=cmd_review_web)
 
-    vac = sub.add_parser("vacuum", help="reclaim DB space: strip deprecated raw_html + compact")
+    vac = sub.add_parser("vacuum",
+                         help="reclaim DB space: strip deprecated raw_html, "
+                              "sweep junk 404 scans + compact")
     vac.add_argument("--dry-run", action="store_true", help="report what would be reclaimed, change nothing")
+    vac.set_defaults(func=cmd_vacuum)
 
-    bf = sub.add_parser("backfill-pdf-evidence",
+    bf = sub.add_parser("backfill-pdf-evidence", parents=[live],
                         help="refetch + archive PDFs behind existing PDF-sourced detections")
-    bf.add_argument("--authorize", action="store_true",
-                    help="actually fetch (without this, just lists what would be fetched)")
-    bf.add_argument("--push-wayback", action="store_true",
-                    help="also push each PDF URL to the Wayback Machine")
     bf.add_argument("--force", action="store_true",
                     help="archive even if the PDF's text no longer matches the detection")
+    bf.set_defaults(func=cmd_backfill_pdf_evidence)
 
     bc = sub.add_parser("backfill-changes",
                         help="reconstruct put-up/take-down history the pre-fix diff missed")
     bc.add_argument("--apply", action="store_true",
                     help="insert the reconstructed events (default: dry-run listing)")
+    bc.set_defaults(func=cmd_backfill_changes)
 
     dp = sub.add_parser("deploy",
                         help="test + publish --approved-only + stale-page sweep + Cloudflare Pages deploy")
@@ -1410,54 +1622,18 @@ def main(argv: list[str] | None = None) -> int:
                     help="build and sweep only; skip the wrangler deploy")
     dp.add_argument("--skip-tests", action="store_true",
                     help="deploy without running the offline test suite first")
+    dp.set_defaults(func=cmd_deploy)
 
-    p = sub.add_parser("publish", help="build the static review/results site (phase 6)")
+    p = sub.add_parser("publish", parents=[port_flag(8000)],
+                       help="build the static review/results site (phase 6)")
     p.add_argument("--approved-only", action="store_true",
                    help="strict public build: approved findings + dated negatives only")
     p.add_argument("--serve", action="store_true", help="serve the site locally after building")
-    p.add_argument("--port", type=int, default=8000, help="port for --serve")
+    p.set_defaults(func=cmd_publish)
 
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
-
-    if args.command == "initdb":
-        return cmd_initdb(args, cfg)
-    if args.command == "fetch-fec":
-        return cmd_fetch_fec(args, cfg)
-    if args.command == "discover":
-        return cmd_discover(args, cfg)
-    if args.command == "mark-inactive":
-        return cmd_mark_inactive(args, cfg)
-    if args.command == "mark-primary-losers":
-        return cmd_mark_primary_losers(args, cfg)
-    if args.command == "resolve":
-        return cmd_resolve(args, cfg)
-    if args.command == "scan":
-        return cmd_scan(args, cfg)
-    if args.command == "scan-all":
-        return cmd_scan_all(args, cfg)
-    if args.command == "calendar":
-        return cmd_calendar(args, cfg)
-    if args.command == "schedule":
-        return cmd_schedule(args, cfg)
-    if args.command == "corroborate":
-        return cmd_corroborate(args, cfg)
-    if args.command == "review":
-        return cmd_review(args, cfg)
-    if args.command == "review-web":
-        return cmd_review_web(args, cfg)
-    if args.command == "vacuum":
-        return cmd_vacuum(args, cfg)
-    if args.command == "backfill-pdf-evidence":
-        return cmd_backfill_pdf_evidence(args, cfg)
-    if args.command == "backfill-changes":
-        return cmd_backfill_changes(args, cfg)
-    if args.command == "publish":
-        return cmd_publish(args, cfg)
-    if args.command == "deploy":
-        return cmd_deploy(args, cfg)
-    parser.error(f"unknown command {args.command}")
-    return 2
+    return args.func(args, cfg)
 
 
 if __name__ == "__main__":

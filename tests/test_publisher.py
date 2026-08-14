@@ -271,6 +271,47 @@ def test_review_build_has_no_seo_footprint(tmp_path):
     conn.close()
 
 
+def test_site_url_without_approved_only_is_refused(tmp_path):
+    # site_url means "this build is public": its sitemap enumerates every
+    # rendered page at public URLs. Paired with the unfiltered review view it
+    # would advertise pending-detection candidates — unpublished allegations —
+    # to crawlers. build_site itself must refuse the pairing, not rely on
+    # cmd_publish happening to never construct it.
+    import pytest
+    conn = init_db(tmp_path / "db.sqlite")
+    _seed(conn)
+    with pytest.raises(ValueError, match="approved_only"):
+        build_site(conn, tmp_path / "site",
+                   site_url="https://redboxwatch.org/")
+    conn.close()
+
+
+def test_index_data_fetch_is_cache_busted(tmp_path):
+    # Pages serves assets with max-age=14400. styles.css is already versioned;
+    # the filter's index-data.json fetch must be too, or for up to 4h after a
+    # deploy the client-side filter can resurrect a since-rejected candidate
+    # with a FINDING pill linking to a now-404 page. The version is a content
+    # hash of the exact JSON written, so it changes iff the data changes.
+    import re as _re
+    conn = init_db(tmp_path / "db.sqlite")
+    _seed_universe(conn, 3)
+    ver = lambda out: _re.search(r"DATA_V='([0-9a-f]{8})'",
+                                 (out / "index.html").read_text()).group(1)
+    out = build_site(conn, tmp_path / "site")
+    assert "index-data.json?v='+DATA_V" in (out / "index.html").read_text()
+    v1 = ver(out)
+    # Same data, fresh build: version is stable (no gratuitous cache busts).
+    assert ver(build_site(conn, tmp_path / "site2")) == v1
+    # Changed data: version changes.
+    conn.execute("""INSERT INTO candidates (candidate_id,name,office,state,district,
+        party,cycle,universe_reason,website_url,url_verified,receipts,created_at,updated_at)
+        VALUES ('H9999','NEW ROW','H','CA','01','DEM',2026,'contested_primary',
+                'https://example.net',0,500000,'t','t')""")
+    conn.commit()
+    assert ver(build_site(conn, tmp_path / "site3")) != v1
+    conn.close()
+
+
 def test_display_name_natural_order():
     # FEC 'LAST, FIRST [SUFFIX]' renders first-name-first on every display
     # surface; the raw string stays the DB/matching key.
@@ -790,6 +831,38 @@ def test_feed_guid_is_stable_per_candidate(tmp_path):
     conn.close()
 
 
+def test_feed_guid_survives_primary_url_flip(tmp_path):
+    # An alias group's PRIMARY URL is a rank artifact (final tiebreaker:
+    # detection_id DESC): approving a later re-detection of the SAME body on
+    # an alias URL flips which URL is primary. The guid is keyed on the body
+    # hash, not the primary URL, so the flip must be silent — a URL-keyed
+    # guid re-announced the unchanged finding to Bluesky on every flip.
+    import re as _re
+    conn = init_db(tmp_path / "db.sqlite")
+    det_id = _seed(conn)                              # /media, hash 'abc'
+    _review(conn, det_id, "approve")
+    conn.commit()
+    guid = lambda p: _re.search(r'<guid isPermaLink="false">([^<]+)</guid>',
+                                (p / "feed.xml").read_text()).group(1)
+    out = build_site(conn, tmp_path / "site", approved_only=True,
+                     site_url="https://redboxwatch.org/")
+    first = guid(out)
+    # Same body on an alias URL: later detection_id + higher confidence,
+    # approved — it outranks the original detection and becomes primary.
+    re_det = _add_scan_det(conn, "H1", "https://example.org/press", "abc",
+                           conf=0.99,
+                           evidence='[{"quote":"younger voters should see","why":"directive"}]')
+    _review(conn, re_det, "approve")
+    conn.commit()
+    out2 = build_site(conn, tmp_path / "site2", approved_only=True,
+                      site_url="https://redboxwatch.org/")
+    cand = (out2 / "H1.html").read_text()
+    # The flip really happened: the old primary now renders as the alias.
+    assert "example.org/media" in cand.split("also served at", 1)[1][:300]
+    assert guid(out2) == first
+    conn.close()
+
+
 def test_alias_urls_collapse_to_one_exhibit(tmp_path):
     # Catch-all routes serving the SAME body under several URLs (re-detected
     # across separate scan runs, so the pipeline's in-run dedup never saw them
@@ -1199,3 +1272,179 @@ def test_single_version_exhibit_has_no_version_block(tmp_path):
     out = build_site(conn, tmp_path / "site", approved_only=True)
     assert "Earlier version" not in (out / "H1.html").read_text()
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# P2 fixes + simplification pass (assets extraction, STATUSES table).
+
+def test_mobile_css_hides_ie_column_via_ie_col_class():
+    # The <=640px rule used to hide `.agate .conf` (a class no element
+    # carries) plus the 5th header — leaving the money column header-less on
+    # phones while its cells stayed. It now targets the .ie-col cells the
+    # rows actually emit, scoped to the index table so the candidate page's
+    # corroboration table keeps its own 5th column (Date range).
+    from redbox.publisher import CSS, _index_row  # noqa: F401
+    assert ".page-index .agate .ie-col,.page-index .agate th:nth-child(5){display:none}" in CSS
+    # The phantom selectors and the entirely dead 7-column rules are gone.
+    assert ".conf" not in CSS
+    assert ".pages" not in CSS
+    assert "nth-child(7)" not in CSS
+
+
+def test_public_filter_options_match_present_statuses(tmp_path):
+    # The status filter must offer exactly the statuses present in the
+    # rendered rows: the old hardcoded list offered "Pending"/"Not a finding"
+    # on public builds, where those candidates are filtered out — selecting
+    # one showed a silently empty table.
+    import re as _re
+    conn = init_db(tmp_path / "db.sqlite")
+    det_id = _seed(conn)                       # H1: positive
+    _review(conn, det_id, "approve")
+    conn.execute("""INSERT INTO candidates (candidate_id,name,office,state,district,
+        party,cycle,universe_reason,website_url,url_source,url_verified,receipts,
+        created_at,updated_at)
+        VALUES ('H2','GAP, GRETA','H','OH','03','DEM',2026,'contested_primary',
+                NULL,'none',0,300000,'t','t')""")
+    conn.execute("""INSERT INTO candidates (candidate_id,name,office,state,district,
+        party,cycle,universe_reason,website_url,url_verified,receipts,
+        created_at,updated_at)
+        VALUES ('H3','PENDING, PAULA','H','PA','07','DEM',2026,'contested_primary',
+                'https://paula.example',1,400000,'t','t')""")
+    cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash,
+        http_status,raw_text)
+        VALUES ('H3','https://paula.example/media','2026-06-01T00:00:00+00:00','ph',
+                200,'page body')""")
+    conn.execute("""INSERT INTO detections (scan_id,candidate_id,classification,
+        confidence,evidence,rationale,model,classified_at)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        (cur.lastrowid, "H3", "red_box_guidance", 0.9, "[]", "r", "m",
+         "2026-06-01T00:00:00+00:00"))
+    conn.commit()
+
+    def options(out):
+        sel = (out / "index.html").read_text().split('id="f-status"', 1)[1]
+        return set(_re.findall(r'<option value="([a-z_]*)"', sel.split("</select>")[0]))
+
+    pub = build_site(conn, tmp_path / "site", approved_only=True)
+    # Exactly what the public build renders: findings, the gap page, and the
+    # all-statuses blank — no pending/rejected options that can never match.
+    assert options(pub) == {"", "positive_published", "no_url"}
+    rev = build_site(conn, tmp_path / "site2")
+    assert options(rev) == {"", "positive_published", "positive_pending", "no_url"}
+    conn.close()
+
+
+def test_sitemap_lastmod_is_per_page_not_build_date(tmp_path):
+    # Every URL used to be stamped with the build date, making lastmod
+    # meaningless. Candidate pages now carry the date their content last
+    # changed (latest approval / removal / scan); index/static pages keep the
+    # build date.
+    import re as _re
+    from redbox.util import now_iso
+    conn = init_db(tmp_path / "db.sqlite")
+    det_id = _seed(conn)                                  # scanned 2026-05-29
+    _review(conn, det_id, "approve")                      # approved 2026-06-02
+    conn.execute("""INSERT INTO candidates (candidate_id,name,office,state,district,
+        party,cycle,universe_reason,website_url,url_verified,receipts,created_at,updated_at)
+        VALUES ('H2','NEG, NORA','H','OH','03','DEM',2026,'contested_primary',
+                'https://nora.example',1,300000,'t','t')""")
+    cur = conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,text_hash,
+        http_status,raw_text)
+        VALUES ('H2','https://nora.example/','2026-04-10T00:00:00+00:00','nh',
+                200,'page body')""")
+    conn.execute("""INSERT INTO detections (scan_id,candidate_id,classification,
+        confidence,evidence,rationale,model,classified_at)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        (cur.lastrowid, "H2", "no_guidance_detected", 0.1, "[]", "r", "m",
+         "2026-04-10T00:00:00+00:00"))
+    conn.commit()
+    out = build_site(conn, tmp_path / "site", approved_only=True,
+                     site_url="https://redboxwatch.org/")
+    sitemap = (out / "sitemap.xml").read_text()
+    lastmod = dict(_re.findall(r"<url><loc>([^<]+)</loc><lastmod>([^<]+)</lastmod></url>",
+                               sitemap))
+    today = now_iso()[:10]
+    assert lastmod["https://redboxwatch.org/H1"] == "2026-06-02"   # approval date
+    assert lastmod["https://redboxwatch.org/H2"] == "2026-04-10"   # last scan
+    assert lastmod["https://redboxwatch.org/"] == today            # index: build date
+    assert len(set(lastmod.values())) > 1                          # not uniform
+    conn.close()
+
+
+def test_unchanged_evidence_copy_is_skipped(tmp_path, monkeypatch):
+    # The per-build copy into site/evidence/ must be idempotent: copy2
+    # preserves size+mtime, so a destination matching both is already this
+    # exact file and is not re-copied.
+    import shutil as _shutil
+
+    from redbox import publisher as pub
+    conn = init_db(tmp_path / "db.sqlite")
+    det_id = _seed(conn)
+    shot = tmp_path / "shot9.webp"
+    shot.write_bytes(b"RIFFfakeWEBP")
+    conn.execute("""INSERT INTO archives (detection_id,candidate_id,url,archived_at,
+        screenshot_path) VALUES (?,?,?,?,?)""",
+        (det_id, "H1", "https://example.org/media",
+         "2026-05-29T00:00:00+00:00", str(shot)))
+    _review(conn, det_id, "approve")
+    conn.commit()
+
+    calls = []
+    real = _shutil.copy2
+    monkeypatch.setattr(pub.shutil, "copy2",
+                        lambda *a, **k: (calls.append(a), real(*a, **k))[1])
+    out = build_site(conn, tmp_path / "site", approved_only=True)
+    assert len(calls) == 1                       # first build copies
+    assert (out / "evidence" / "shot9.webp").exists()
+    calls.clear()
+    build_site(conn, tmp_path / "site", approved_only=True)
+    assert calls == []                           # unchanged: copy skipped
+    # ...and the page still references the (kept) copy.
+    assert 'src="evidence/shot9.webp"' in (out / "H1.html").read_text()
+    # A changed source (new mtime) is re-copied.
+    shot.write_bytes(b"RIFFotherWEBP")
+    build_site(conn, tmp_path / "site", approved_only=True)
+    assert len(calls) == 1
+    assert (out / "evidence" / "shot9.webp").read_bytes() == b"RIFFotherWEBP"
+    conn.close()
+
+
+def test_assets_load_from_package_files():
+    # The stylesheet, index script, and favicons live as real files under
+    # redbox/assets/, loaded once at import; publisher re-exports the same
+    # names, so reviewweb's `from redbox.publisher import CSS` still works.
+    from redbox import publisher, render
+    assert render.CSS and ".agate" in render.CSS
+    assert render.INDEX_JS and "f-status" in render.INDEX_JS
+    assert publisher.CSS is render.CSS
+    assert publisher.INDEX_JS is render.INDEX_JS
+    assert render.FAVICON_SVG.startswith("<svg")
+    assert render.FAVICON_PNG48.startswith(b"\x89PNG")     # decoded, not base64
+    assert render.FAVICON_PNG180.startswith(b"\x89PNG")
+    assert render.FAVICON_ICO.startswith(b"\x00\x00\x01\x00")
+    assert len(render.CSS_VERSION) == 8
+
+
+def test_statuses_table_covers_all_nine_and_consumers_derive():
+    from redbox.publisher import _STATUS_RANK, STATUSES, _pill
+    expected = {"positive_published", "positive_pending", "ambiguous_pending",
+                "rejected", "negative", "not_scanned", "no_url",
+                "blocked_by_robots", "fetch_failed"}
+    assert set(STATUSES) == expected
+    # Rank is a permutation of 0..8 and _STATUS_RANK derives from it.
+    assert sorted(s.rank for s in STATUSES.values()) == list(range(9))
+    assert _STATUS_RANK == {k: s.rank for k, s in STATUSES.items()}
+    # The public-build allowlist derives from the is-public flag.
+    assert {k for k, s in STATUSES.items() if s.public} == {
+        "positive_published", "negative", "no_url", "blocked_by_robots",
+        "fetch_failed", "not_scanned"}
+    # Pills and filter labels exist for every status; _pill reads the table.
+    for k, s in STATUSES.items():
+        assert s.pill and s.pill_class and s.filter_label
+        assert _pill(k) == (s.pill, s.pill_class)
+    assert _pill("nonsense") == ("—", "pill-muted")
+    # The never-scanned buckets carry their row label (also the page heading);
+    # the three site-level gaps carry the page body too.
+    for k in ("no_url", "blocked_by_robots", "fetch_failed"):
+        assert STATUSES[k].row_label and STATUSES[k].gap_body
+    assert STATUSES["not_scanned"].row_label == "Not yet scanned"

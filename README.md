@@ -9,13 +9,23 @@ filings, **gates every positive finding behind human review**, and publishes
 careful, evidence-linked per-candidate status. The public build runs at
 **[redboxwatch.org](https://redboxwatch.org)**.
 
-This README is a front-to-back usage guide and the current source of truth on
-behavior (alongside the code). The original build spec,
+This README is a front-to-back usage guide. Where any document conflicts with
+the code, **the code wins**; mechanical drift guards
+(`tests/test_docs_drift.py`) keep the command tables, flags, and config keys
+here and in `docs/` in sync with the code, while the narrative is maintained by
+hand and verified best-effort. The original build spec,
 [`redbox-tracker-spec.md`](redbox-tracker-spec.md), is kept as a historical
-design document — where it conflicts with the code, the code wins. For the
-crawler posture see [`ROBOTS_POLICY.md`](ROBOTS_POLICY.md); for the
-database tables and their semantic enums (`inactive`, `scan_status`, change
-event types) see [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md).
+design document. Companion references:
+
+- [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) — every config key and
+  secret, `--config`/local-layer semantics.
+- [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — scaling up (a state / the
+  country), timeouts & watchdogs, deploy operations, maintenance, and the
+  project's limitations.
+- [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) — tables and the semantic enums
+  (`inactive`, `scan_status`, `url_source`, change event types, publish
+  statuses).
+- [`ROBOTS_POLICY.md`](ROBOTS_POLICY.md) — the crawler posture.
 
 > ### ⚠️ Read this first — ethics & legal safety
 > Red-boxing is **not per se unlawful**; it exploits the rules openly. This tool
@@ -52,7 +62,7 @@ event types) see [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md).
 >   sensible default models; the production deployment's tuned prompt and model
 >   selection live in untracked local files (`data/prompts/classifier.txt`,
 >   `config.local.yaml`).
-> - **Forks are not Red Box Watch.** This code is open source (AGPL-3.0), but
+> - **Forks are not RedBoxWatch.** This code is open source (AGPL-3.0), but
 >   the human-review discipline above is a practice, not a technical guarantee —
 >   nothing stops a fork from publishing unreviewed output. Findings published
 >   anywhere other than **redboxwatch.org** are not findings of this project,
@@ -89,8 +99,9 @@ WAYBACK_S3_KEY=your_archive_org_access_key
 WAYBACK_S3_SECRET=your_archive_org_secret
 ```
 
-- The **FEC key** is free from api.data.gov. Without one, the code falls back to
-  `DEMO_KEY` (30 req/hr).
+- The **FEC key** is free from api.data.gov (the env vars `DATA_GOV_API_KEY`
+  and `OPENFEC_API_KEY` are accepted as aliases). Without one, the code falls
+  back to `DEMO_KEY` (30 req/hr).
 - The **Anthropic key** powers the classifier (cheap first pass, stronger
   escalation), the Serper judge, and the `web_search` fallback. You are billed
   per classification (pages are short and cheap; a full site scan is a few
@@ -107,14 +118,15 @@ WAYBACK_S3_SECRET=your_archive_org_secret
   **https://archive.org/account/s3.php** (log in → "Generate"). No code change —
   the archiver auto-detects them.
 
-Everything non-secret is configured in [`config.yaml`](config.yaml) — see
-[§8 Configuration](#8-configuration). The defaults are sensible; you can run the
-whole walkthrough below without touching it.
+Everything non-secret is configured in [`config.yaml`](config.yaml) — the full
+knob reference (and the `--config` / `config.local.yaml` layering rules) is
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md). The defaults are sensible;
+you can run the whole walkthrough below without touching it.
 
 ### Verify the install
 
 ```bash
-python -m pytest tests/ -q        # ~290 offline tests, no API calls, no network
+python -m pytest tests/ -q        # the offline test suite: no API calls, no network
 python -m redbox --help           # list all commands
 ```
 
@@ -147,11 +159,16 @@ discover ─► resolve ─► scan ──────► corroborate ─► rev
 | 5. Publish | `publish` | Build the local review-console / results site. |
 | 5b. Deploy | `deploy` | One-shot public release: approved-only build → stale-page sweep → Cloudflare Pages → live smoke check. |
 | — Schedule | `calendar`, `schedule` | Per-state primary calendar + scan cadence for ongoing operation. |
-| — Maintain | `vacuum`, `backfill-pdf-evidence`, `backfill-changes` | Reclaim DB space; re-archive PDFs behind older PDF-sourced detections; reconstruct put-up/take-down history from stored scans (dry-run by default). |
+| — Maintain | `vacuum`, `backfill-pdf-evidence`, `backfill-changes` | Reclaim DB space (incl. the phantom-404 sweep); re-archive PDFs behind older PDF-sourced detections; reconstruct put-up/take-down history from stored scans (dry-run by default). |
 
 > Optionally pre-verify a URL by hand in `data/websites.json` (untracked)
 > (it then shows as "verified" in review). This is not required to scan unless
 > `require_verified_url: true` is set in `config.yaml`.
+
+For bulk runs — a whole state or the country — follow this same pipeline via
+the field guide in [`docs/OPERATIONS.md`](docs/OPERATIONS.md), which also
+covers the concurrency/rate-limit knobs and the gotchas that only show up at
+scale.
 
 ---
 
@@ -173,7 +190,7 @@ applies any schema migrations).
 
 Pull funded candidates from FEC and group them into contested primaries,
 competitive/contested generals, and the baseline cohort (all incumbents +
-sole funded nominees — see [§7](#7-how-discovery-decides-spec-31)). Scope it to
+sole funded nominees — see [§6](#6-how-discovery-decides-spec-31)). Scope it to
 keep the FEC calls (and rate limit) modest:
 
 ```bash
@@ -185,12 +202,20 @@ python -m redbox discover --states NY --district 12 --offices H
 python -m redbox discover --states NC --offices H,S
 ```
 
+(`--district` is zero-padded for you — `--district 1` matches the FEC's
+two-digit `01` form, which used to silently match nothing unpadded.)
+
 Output:
 - the `candidates` table in the DB, and
 - `data/candidate_universe_2026.csv` (sortable summary).
 
+Re-runs also print an **orphan report**: active candidates in the DB that this
+run's universe did not produce (scoped to the run's states/offices). It is
+report-only — a row may be a hand-inserted nominee or a filer who dipped below
+the floor; the human decides.
+
 FEC responses are cached under `data/.fec_cache/`, so re-runs are fast and don't
-re-spend your rate limit. (See [§7 How discovery decides](#7-how-discovery-decides-spec-31)
+re-spend your rate limit. (See [§6 How discovery decides](#6-how-discovery-decides-spec-31)
 for the grouping logic.)
 
 **Bulk file (recommended at scale).** If a FEC "weball" candidate-summary file
@@ -228,7 +253,14 @@ python -m redbox mark-primary-losers    # candidates defeated in a state whose p
   uncontested-auto → results feed) against past-primary states: in each race
   where a nominee is affirmatively resolved, everyone else lost (`inactive=3`).
   Unresolved races are left alone — a coverage gap must not invent losers.
-  `--no-feed` skips the civicAPI feed; `--today YYYY-MM-DD` overrides the date.
+  A **runoff state** doesn't count as past-primary until its *runoff* date
+  (`runoff_date` in `fixtures/primary_calendar_2026.json`) has passed —
+  between the rounds, first-round results can't say who lost a race that
+  advanced, and the command prints which states it is holding. Clearing marks
+  is likewise guarded: a run that would clear more than max(5, 20%) of a
+  state's marks refuses unless you pass `--allow-mass-clear` (a feed going
+  quiet is not evidence a race un-resolved). `--no-feed` skips the civicAPI
+  feed; `--today YYYY-MM-DD` overrides the date.
 - Human wrong-race calls from the review console set `inactive=2` and are never
   touched by either command.
 
@@ -273,9 +305,11 @@ office pages excluded) — it's what resolves our walkthrough candidate to
 
 The backup only fires for candidates the free sources miss; disable per-run with
 `--no-search` or globally with `enable_search_backup: false`. Each resolved URL
-records which backend found it (`url_source`: `wikipedia` / `serper` / `search`).
-Resolved URLs are **unverified** — scanning works anyway, and attribution is
-confirmed at the human review/publish gate.
+records which backend found it (`url_source`: `wikipedia` / `committee` /
+`serper` / `search` — the full enum is in
+[`docs/DATA_MODEL.md`](docs/DATA_MODEL.md)). Resolved URLs are **unverified** —
+scanning works anyway, and attribution is confirmed at the human review/publish
+gate.
 
 Candidates the whole chain comes up empty for land in the review console's
 **website triage queue** (`review-web` → `/urls`, richest-first) where a human
@@ -313,9 +347,13 @@ What a live scan does, per page:
    crawl, linked PDFs), render each with headless Chromium and extract visible
    *and* hidden DOM text (text nodes only — `<script>`/`<style>` config is
    stripped, so a red box in a hidden div is caught but framework/theme JSON
-   isn't). Respects robots + per-domain rate limits; each fetch class (ordinary
+   isn't). Respects robots + per-domain rate limits (with 429/503 backoff — see
+   [`ROBOTS_POLICY.md`](ROBOTS_POLICY.md)); each fetch class (ordinary
    pages, media-kit-style pages, PDFs) is budgeted at `max_pages_per_site`, so a
-   sprawling blog can't crowd out the high-value pages.
+   sprawling blog can't crowd out the high-value pages. A merely-slow site ends
+   as a clean partial at the per-candidate wall-clock ceiling
+   (`candidate_wallclock_seconds`; see
+   [`docs/OPERATIONS.md`](docs/OPERATIONS.md)).
 2. **Pre-filter** — a cheap regex/URL gate skips the LLM on obviously-empty
    boilerplate pages (donate, privacy, careers, 404s with no red-box terms),
    cutting LLM calls and cost. It is conservative by design: media-kit pages
@@ -378,28 +416,49 @@ rationale and confidence, the archived screenshot / raw HTML / extracted text,
 the Wayback link, the IE corroboration, and a prominent warning when the site
 URL was auto-resolved (confirm attribution before approving!). Approve, reject,
 or mark needs-more with a reviewer name and notes; after each decision it jumps
-to the next pending finding. Group actions cover all alias pages at once.
-Decisions are **append-only history** — re-review a detection to change its
-outcome; the latest decision wins.
+to the next pending finding.
+
+Group actions cover all alias pages at once — with a safety rail: the
+"apply to all aliases" box is pre-checked only while **every** sibling is
+undecided. Once any alias already has a decision on record, the console shows
+each sibling's current state and unchecks the box by default, so a group
+fan-out never silently overrides an earlier judgment. Decisions are
+**append-only history** — re-review a detection to change its outcome; the
+latest decision wins.
+
+**Multi-committee duplicates.** Occasionally the *same page body* is detected
+under two different committees (e.g. one person's House and Senate records, or
+a shared vendor template) — only one race's attribution can be right. Both the
+console and `review --list` flag these with a MULTI-COMMITTEE warning naming
+the twin detection(s) and their review state; the workflow is
+**approve the committee whose race the guidance targets, reject the other**.
 
 The console has a second queue at **`/urls` — website triage**: every candidate
 the resolution chain came up empty for, richest first. Paste a hand-found URL
-(recorded as human-verified), mark "no campaign site exists" (a dated coverage
-note, not a clean negative), or flag a wrong-race/phantom record (sets
-`inactive=2`).
+(recorded as human-verified, appended to `data/websites.json`, and the
+candidate's `scan_status` is cleared so the next `scan-all` re-crawls the
+corrected address), mark "no campaign site exists" (a dated coverage note, not
+a clean negative), or flag a wrong-race/phantom record (sets `inactive=2`).
+If the candidate already *has* a URL, the form shows it and requires an
+explicit "replace the existing URL" confirmation — a human correction is never
+silent. No-site and wrong-race calls are appended to `data/url_triage.json`
+(outcome, reviewer, timestamp) as the durable human record.
 
 Built for fast triage from the keyboard: on the queue <kbd>j</kbd>/<kbd>k</kbd>
 select and <kbd>Enter</kbd> opens; on a detection <kbd>a</kbd>/<kbd>r</kbd>/<kbd>n</kbd>
 pick approve/reject/needs-more, <kbd>g</kbd> toggles the alias-group checkbox,
 <kbd>Enter</kbd> submits, and <kbd>q</kbd> returns to the queue (keys are inert
 while typing in a form field). The console binds to **127.0.0.1 only**
-(pending detections are unpublished allegations) and never publishes anything
-itself — the site is still built explicitly in Step 6.
+(pending detections are unpublished allegations), and POSTs are additionally
+guarded by Host/Origin loopback checks — a malicious page in the reviewer's
+browser can't fire a cross-origin form POST at the console, and a DNS-rebound
+hostname is refused. It never publishes anything itself — the site is still
+built explicitly in Step 6.
 
 The same gate is scriptable from the CLI:
 
 ```bash
-python -m redbox review --list                              # detections awaiting review
+python -m redbox review --list                              # detections awaiting review (incl. multi-committee warnings)
 python -m redbox review --detection 2 --action approve      # -> becomes a published finding
 python -m redbox review --detection 2 --action reject       # -> recorded, never published
 python -m redbox review --detection 2 --action needs_more   # -> re-scan / expand
@@ -418,18 +477,44 @@ python -m redbox publish                    # build only
 open site/index.html                        # open the static site directly
 ```
 
-The site is self-contained (no server needed). It shows a sortable/filterable
-candidate index (status, classifier confidence, aligned-IE total, pages scanned)
-and a page per candidate with the quoted evidence, the archived screenshot, the
-Wayback link, the IE corroboration, and any put-up/take-down history. It also
-generates **methodology** and **corrections/appeals** pages.
+The site is self-contained (no server needed). The index is a
+sortable/filterable table with five columns — **Candidate, Seat, Party,
+Status, Aligned IE** — and a page per candidate carrying the rest: classifier
+confidence, pages scanned, the quoted evidence, the archived screenshot, the
+Wayback link, the IE corroboration, and a put-up/take-down timeline. A
+candidate with boxes on several pages shows one **exhibit** per distinct page
+body (template-alias URLs collapsed), and an exhibit whose guidance was
+*revised* links its **earlier versions** — each with its own archived
+evidence, lifespan, and a quote-level diff. It also generates **about**,
+**methodology**, and **corrections/appeals** pages.
 
 - Default build is the **review console** (includes pending detections, clearly
   marked).
 - `python -m redbox publish --approved-only` is the **strict public build** —
-  approved findings + dated negatives only. With `publish.site_url` set it also
-  emits `sitemap.xml`, `robots.txt`, canonical/OpenGraph tags, and the
+  approved findings + dated negatives only, applied per detection: a pending
+  exhibit (or an unapproved earlier version) never renders even when the
+  candidate has a separate approved finding. With `publish.site_url` set it
+  also emits `sitemap.xml`, `robots.txt`, canonical/OpenGraph tags, and the
   new-findings feeds (`feed.xml` RSS 2.0 + `feed.json` JSON Feed 1.1).
+- **Internal links** are extensionless (`/S6MI00426`) on public builds — the
+  form Cloudflare Pages actually serves — and plain `.html` on local builds so
+  the output still browses from `file://`.
+
+Every build (review builds included) re-syncs `site/evidence/` to exactly the
+evidence the current build references, so a rejected detection's screenshot
+doesn't stay on disk (or deployed) after its page is gone.
+
+**Feeds & syndication.** The public feeds carry the 50 most recently approved
+findings (the index stays the full ledger). Each item's guid is the candidate
+id plus a fingerprint of the *approved exhibit bodies* (their text hashes), so
+approving a new or revised box **re-announces** the candidate, while
+re-detections of a known box and primary/alias URL flips stay silent. The
+`feed.json` drives a small Cloudflare Worker
+([`workers/bsky-poster`](workers/bsky-poster)) that posts each newly published
+finding to **@redboxwatch.bsky.social** — it dedupes via KV and absorbs
+guid-scheme migrations without posting (see its README). Because the feeds are
+generated only from the approved-only build, nothing can reach social media
+that a human didn't approve.
 
 ### Step 7 — Deploy the public site
 
@@ -441,21 +526,22 @@ python -m redbox deploy                     # the real release
 `deploy` is the one-shot public release: it first runs the **full test suite**
 (a deploy can happen between commits, so CI alone can't guarantee the code
 being deployed is green — a failure aborts the release; `--skip-tests`
-bypasses), rebuilds the **approved-only** site, sweeps **stale pages and
-unreferenced evidence** out of `site/` (candidates removed since the last
-build don't linger at old URLs, and a rejected detection's screenshot doesn't
-stay publicly served), deploys via `npx wrangler pages deploy` to the
+bypasses), rebuilds the **approved-only** site into the same `site/` directory
+`publish` uses, sweeps **stale HTML pages** out of it (any page absent from
+the freshly built sitemap — so candidates removed since the last build don't
+linger at old URLs), deploys via `npx wrangler pages deploy` to the
 Cloudflare Pages project in `publish.pages_project`, then **smoke-checks** the
-live URL (HTTP 200 + nameplate). It requires `publish.site_url` and
+live URL until it serves *this build's* footer fingerprint (a bare 200 would
+also pass for the previous deploy). It requires `publish.site_url` and
 `publish.pages_project` in `config.yaml` and a wrangler login
-(`npx wrangler login`). If the wrangler step fails, `site/` is already built —
-re-run `deploy` to retry.
+(`npx wrangler login`).
 
-**Syndication.** The public build's `feed.json` drives a small Cloudflare
-Worker ([`workers/bsky-poster`](workers/bsky-poster)) that posts each *newly
-published* finding to **@redboxwatch.bsky.social**. Because the feeds are
-generated only from the approved-only build, nothing can reach social media
-that a human didn't approve.
+If the stale sweep **refuses** — sitemap missing/empty, or the sweep would
+delete most of the site — deploy exits 1 and **nothing is deployed**; that
+almost always means `publish.site_url` doesn't match the built sitemap. If the
+wrangler step fails, `site/` is already built — re-run `deploy` to retry.
+Deploy-operations details (dot-entry purge, fingerprint check) are in
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md).
 
 ### Ongoing operation — scheduling
 
@@ -473,149 +559,52 @@ through election day. Candidates still active past their primary are presumed
 advancers (losers get marked inactive) and stay on cadence keyed to the
 general; a candidate with an unknown primary date falls back to
 general-election cadence rather than dropping to the bottom of the queue.
-Never schedules a candidate with no resolved URL (add
-`require_verified_url: true` to also require human-verified URLs). `schedule`
-prints the due list; `scan-all --due --authorize` scans exactly that set in
-priority order. As primaries pass, re-run `mark-primary-losers` so defeated
-candidates drop out of the rotation. States that moved individual races off
-their statewide date (AL's rescheduled CDs, LA's postponed House primary) are
-handled per-race via `overrides` in `fixtures/primary_calendar_2026.json`.
+Cadence is measured from the last **attempt** (`last_attempt_at`), so a
+robots-blocked or unreachable site waits out its interval like everyone else
+instead of being re-hit daily. Never schedules a candidate with no resolved
+URL (add `require_verified_url: true` to also require human-verified URLs).
+`schedule` prints the due list; `scan-all --due --authorize` scans exactly
+that set in priority order — including previously-scanned candidates (unlike
+plain `scan-all`, which skips anything already attempted; that matters for
+partial scans — see [`docs/OPERATIONS.md`](docs/OPERATIONS.md)). As primaries
+pass, re-run `mark-primary-losers` so defeated candidates drop out of the
+rotation. States that moved individual races off their statewide date (AL's
+rescheduled CDs, LA's postponed House primary) are handled per-race via
+`overrides` in `fixtures/primary_calendar_2026.json`; runoff states carry a
+`runoff_date` and aren't treated as settled until it passes.
 
 ---
 
-## 4. Scaling up — a whole state (or the country)
-
-The walkthrough above is one candidate. For a state or a nationwide sweep, the
-same pipeline runs in bulk. This section is the field guide — including the
-gotchas that only show up at scale.
-
-### The flow
-
-```bash
-# 1. Discover from the FEC bulk file (no per-candidate API calls; seconds, free).
-#    --fetch re-downloads data/webl26.txt from fec.gov first (backing up the
-#    old file); drop it to reuse the file already on disk. Builds the
-#    universe only; URL resolution is the separate next step.
-python -m redbox discover --fetch --states NY --offices H,S
-
-# 2. Prune before spending anything on the dead weight.
-python -m redbox mark-inactive
-python -m redbox mark-primary-losers
-
-# 3. Resolve URLs. The search backup is billable but cheap with Serper
-#    (~$0.002/candidate); runs concurrently (--workers). --no-search = free only.
-python -m redbox resolve --state NY
-
-# 4. Dry-run first — lists exactly which candidates/domains will be hit and
-#    prints a cost preflight (pages x models, from the `pricing` config block).
-python -m redbox scan-all --state NY --workers 2
-
-# 5. The real run. Scans candidates concurrently across domains. Safe to Ctrl-C
-#    and re-run: already-attempted candidates are skipped (use --rescan to redo).
-python -m redbox scan-all --state NY --workers 2 --authorize --push-wayback
-
-# 6. Corroborate every positive at once, review, then release.
-python -m redbox corroborate
-python -m redbox review-web
-python -m redbox deploy --dry-run && python -m redbox deploy
-```
-
-### Concurrency & rate limits (read before a big run)
-
-`scan-all --workers N` runs N candidates at once. Long pages are split into chunks
-that classify concurrently through **one shared pool** (`models.classify_pool_size`),
-so total in-flight LLM calls stay bounded instead of growing as `workers ×
-concurrency`. The real ceiling is **not** request count — it's your
-**input-tokens-per-minute** limit, enforced **per model** (provider limits are
-per-model): a token bucket each for the first-pass and escalation models gates
-classification across all workers, so sustained scanning doesn't trigger 429s.
-Three rules of thumb:
-
-- **Set `models.tokens_per_minute_by_model` to your actual provider tiers** (a bit
-  under each model's ceiling for margin; keys must match the model strings,
-  including any provider prefix). This is the single most important knob at
-  scale — too high and you get 429s and dropped pages; too low and the run crawls.
-  (`models.tokens_per_minute` is a scalar fallback applied to both models.)
-- **`models.classify_pool_size`** caps concurrent chunk calls globally; raise it
-  only if long pages dominate and you have token headroom.
-- **Start with `--workers 2`**, confirm a clean run (no 429 churn in the output),
-  then raise. More workers don't help once the token budget is the bottleneck.
-
-### What to expect (measured on NY: 62 candidates, ~5,700 pages)
-
-- **Cost**: with the Serper backend, URL resolution is ~$0.002 × the candidates
-  the free sources miss — cheap. Scanning is also cheap (prefilter + a budget
-  first-pass model). A statewide scan is a dollar or two; nationwide (the
-  current universe is ~1,500 candidates) is tens of dollars. The `scan-all`
-  dry run prints a per-run estimate before you commit. (The old Claude
-  `web_search` resolution backend made that the dominant cost at ~$0.07 each —
-  Serper is ~50× cheaper there.)
-- **Time** is throttle-bound, not compute-bound: a token-limited statewide scan
-  runs a few hours. Discovery is seconds (bulk file); resolution runs
-  concurrently (`--workers`, default 8 — one search + judge per candidate the
-  free sources miss).
-- **Coverage gaps are surfaced, not hidden.** Candidates with no resolvable site,
-  or whose `robots.txt` blocks our crawler, show distinct **"No site found"** /
-  **"Site blocks automated access"** statuses on the published index with a
-  coverage-gap banner — never a misleading clean negative. The `/urls` triage
-  queue in `review-web` works those gaps down by hand, richest-first.
-
-### Gotchas the NY run surfaced (all handled, worth knowing)
-
-- **Sprawling sites.** One site crawled to 1,100+ pages (blog/calendar links).
-  `max_pages_per_site` (default 150) is a **per-class fetch budget** — ordinary
-  pages, media-kit-style pages, and PDFs each get their own 150 (hard total 3×),
-  with high-value pages fetched first — so a giant blog can't starve out a
-  likely red box.
-- **AI-crawler-blocking robots.txt.** Some campaigns allowlist Google/Bing and
-  block everyone else; we respect that and mark them "blocked." If you want to
-  scan a specific public site anyway, add it to `robots_policy.per_domain` as a
-  logged per-site override (one such block was hiding a real red box).
-- **Unverified URLs.** At scale most URLs come from web search and are
-  *unverified* — attribution is confirmed by a human at the review gate, and
-  nothing publishes without approval. Spot-check a few before trusting the set.
-- **Interrupting a scan.** Safe to Ctrl-C and re-run. The first Ctrl-C cancels
-  every queued candidate and lets the in-flight scans finish cleanly (a second
-  Ctrl-C abandons them mid-scan). Each page is persisted atomically — the scan
-  row and its detection are written together *after* classification — so an
-  interrupt never leaves a fetched-but-unclassified row for hash-dedup to
-  silently skip. `scan-all` skips candidates already attempted (`scan_status`
-  set) and resumes a half-finished candidate page-by-page (done pages are
-  hash-skipped, the rest are scanned). Use `--rescan` to force a redo.
-- **Disk growth.** Archived evidence adds up; screenshots are transcoded to
-  WebP (typically 70–90% smaller than PNG), and `vacuum` reclaims space from
-  deprecated columns + compacts the DB (`--dry-run` reports first).
-
----
-
-## 5. Command reference
+## 4. Command reference
 
 | Command | Key flags | Purpose |
 |---|---|---|
 | `initdb` | — | Create the SQLite schema. |
-| `discover` | `--fetch` `--states NC,TX` `--district 12` `--offices H,S,P` `--mode primary\|general\|full` `--no-feed` `--no-cache` `--no-bulk` | Build the candidate universe (from the FEC bulk file if present, else the API). `--mode` picks contested-primary / nominee / per-race-phase selection; `--no-feed` skips the civicAPI results feed for nominees. |
+| `discover` | `--fetch` `--states NC,TX` `--district 12` `--offices H,S,P` `--mode primary\|general\|full` `--no-feed` `--no-cache` `--no-bulk` | Build the candidate universe (from the FEC bulk file if present, else the API). `--mode` picks contested-primary / nominee / per-race-phase selection; `--no-feed` skips the civicAPI results feed for nominees. Prints an orphan report for rows the run no longer produces. |
 | `mark-inactive` | `--no-cache` | Flag FEC-inactive (withdrawn/superseded) candidacies (`inactive=1`); cleared if the FEC un-flags them. |
-| `mark-primary-losers` | `--today YYYY-MM-DD` `--no-feed` | Flag primary losers in past-primary states (`inactive=3`) via the nominee machinery; never guesses unresolved races. |
+| `mark-primary-losers` | `--today YYYY-MM-DD` `--no-feed` `--allow-mass-clear` | Flag primary losers in past-primary states (`inactive=3`) via the nominee machinery; never guesses unresolved races, holds runoff states until the runoff passes, and refuses mass-clears of existing marks without `--allow-mass-clear`. |
 | `resolve` | `--state NC` `--workers 8` `--force` `--no-search` `--no-cache` | Backfill campaign URLs onto existing candidates (manual → Wikipedia → FEC committee → Serper+judge search); concurrent + disk-cached. |
 | `scan` | `--candidate ID` `--authorize` `--push-wayback` | Crawl → classify → archive one candidate's site. |
-| `scan-all` | `--state NY` `--workers 4` `--authorize` `--push-wayback` `--rescan` `--due` | Scan many candidates concurrently across domains (dry-run without `--authorize` lists targets + cost preflight). `--due` scans exactly the scheduler's cadence-due set, priority-ordered. |
+| `scan-all` | `--state NY` `--workers 4` `--authorize` `--push-wayback` `--rescan` `--due` | Scan many candidates concurrently across domains (dry-run without `--authorize` lists targets + cost preflight). `--due` scans exactly the scheduler's cadence-due set, priority-ordered, re-scanning already-attempted candidates; plain runs skip them (`--rescan` to redo). |
 | `corroborate` | `--candidate ID` `--no-cache` | FEC Schedule E alignment (omit `--candidate` for all positives). |
-| `review` | `--list` `--detection N` `--action approve\|reject\|needs_more` `--group` `--reviewer` `--notes` | Human gate on positives (CLI); `--group` applies to all template-alias pages. |
-| `review-web` | `--port 8001` | Serve the local web review console (detections queue + `/urls` website triage; binds 127.0.0.1 only). |
+| `review` | `--list` `--detection N` `--action approve\|reject\|needs_more` `--group` `--reviewer` `--notes` | Human gate on positives (CLI); `--group` applies to all template-alias pages; `--list` flags multi-committee duplicate detections. |
+| `review-web` | `--port 8001` | Serve the local web review console (detections queue + `/urls` website triage; binds 127.0.0.1 only, loopback-checked POSTs). |
 | `publish` | `--approved-only` `--serve` `--port 8000` | Build (and optionally serve) the static site locally. |
-| `deploy` | `--dry-run` `--skip-tests` | Public release: full test suite (aborts the release on failure; `--skip-tests` bypasses) → approved-only build → stale-page + evidence sweep → Cloudflare Pages deploy → live smoke check. |
-| `calendar` | — | Load per-state primary dates (incl. per-race `overrides`) into the DB and backfill them onto candidates. `discover` also runs this automatically. |
+| `deploy` | `--dry-run` `--skip-tests` | Public release: full test suite (aborts the release on failure; `--skip-tests` bypasses) → approved-only build → stale-page sweep → Cloudflare Pages deploy → live build-fingerprint smoke check. |
+| `calendar` | — | Load per-state primary dates (incl. per-race `overrides` and `runoff_date`) into the DB and backfill them onto candidates. `discover` also runs this automatically. |
 | `fetch-fec` | `--cycle 2026` | Download the FEC bulk candidate file to `data/` (validated, previous file kept as a dated backup). |
 | `schedule` | `--today YYYY-MM-DD` | List candidates due for a scan. |
-| `vacuum` | `--dry-run` | Reclaim DB space (strip deprecated raw_html, compact). |
+| `vacuum` | `--dry-run` | Reclaim DB space: strip deprecated raw_html, sweep phantom 404/410 scans of never-usable URLs, compact. |
 | `backfill-pdf-evidence` | `--authorize` `--push-wayback` `--force` | Refetch + archive PDFs behind existing PDF-sourced detections. Skips any whose text hash no longer matches (the archive would misrepresent the evidence); `--force` overrides that guard. |
-| `backfill-changes` | `--apply` | Reconcile `change_events` against a replay of the whole scan history under the current diff rules: inserts events old logic dropped AND deletes ones manufactured from error/blocked fetches. Dry-run by default. |
+| `backfill-changes` | `--apply` | Reconcile `change_events` against a replay of the whole scan history under the current diff rules: inserts events old logic dropped, deletes ones manufactured from error/blocked fetches, corrects mismatched ones. Dry-run by default. |
 
-Global: `python -m redbox --config path/to/config.yaml <command>`.
+Global: `python -m redbox --config <file> <command>` — see
+[`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) for how an explicit `--config`
+interacts with the local overlay layer.
 
 ---
 
-## 6. What gets written where
+## 5. What gets written where
 
 | Path | Contents |
 |---|---|
@@ -624,14 +613,15 @@ Global: `python -m redbox --config path/to/config.yaml <command>`.
 | `data/artifacts/<candidate_id>/` | Archived evidence: `<hash>.webp` / `.html` / `.txt`, plus `<hash>.pdf` for PDF-sourced evidence (screenshot falls back to `.png` without Pillow). |
 | `data/.fec_cache/` | Cached FEC API responses. |
 | `data/.resolve_cache/` | Cached URL-resolution results (`resolve`). |
-| `site/` | Generated static site (`publish`/`deploy`): per-candidate pages, `index.html` (+`index-2.html`… when paginated), `index-data.json`, `about`/`methodology`/`corrections` pages, `404.html` (its presence disables the Pages soft-200 SPA fallback), `evidence/` (swept to match the build), plus `sitemap.xml`, `robots.txt`, `feed.xml`, `feed.json` on public builds. |
+| `data/websites.json`, `data/url_triage.json` | Untracked human-owned sidecars: manual URL overrides; the `/urls` triage decisions (no-site / wrong-race calls). |
+| `site/` | Generated static site (`publish`/`deploy`): per-candidate pages, `index.html` (+`index-2.html`… when paginated), `index-data.json`, `about`/`methodology`/`corrections` pages, `404.html` (its presence disables the Pages soft-200 SPA fallback), `styles.css`, the favicons (`favicon.svg`/`favicon.png`/`favicon.ico`/`apple-touch-icon.png`), `evidence/` (re-synced on every build to exactly what the build references), plus `sitemap.xml`, `robots.txt`, `feed.xml`, `feed.json` on public builds. |
 
 `data/` and `site/` are gitignored (they hold scraped evidence and build output);
 regenerate them from the commands above.
 
 ---
 
-## 7. How discovery decides (spec §3.1)
+## 6. How discovery decides (spec §3.1)
 
 1. Pull active, fund-raising candidates per office from openFEC. (Presidential
    (`P`) records are only considered in presidential cycles.)
@@ -647,8 +637,11 @@ regenerate them from the commands above.
    general — those candidates enter even with uncontested primaries. Pure FEC
    data: red-boxing follows money, not ratings.
 6. **Competitive-general ratings overlay:** candidates in districts a pluggable
-   ratings adapter marks Tilt/Lean/Toss-up (the offline fixture adapter ships
-   with the repo; add a live adapter when you have licensed ratings access).
+   ratings adapter marks Tilt/Lean/Toss-up. Only the offline fixture adapter
+   ships with the repo, and its data (`fixtures/ratings/2026.json`) is a
+   **5-row demo file**, not real coverage — replace it, or add a live adapter
+   when you have licensed ratings access (`rating_source: none` disables the
+   overlay).
 7. **Baseline coverage** (people look up safe-seat members too):
    `include_incumbents` puts every sitting incumbent in the universe even with
    no funded opposition — "scanned, clean" is itself the answer visitors want —
@@ -677,7 +670,7 @@ regenerate them from the commands above.
    2. **Wikipedia** — campaign site from the candidate's infobox, via the open
       MediaWiki API → *unverified*
    3. **FEC committee metadata** → *unverified* (free; FEC's `website` field is
-      almost always empty, so this rarely fires)
+      almost always empty, so this rarely fires; source tag `committee`)
    4. **search backup** → *unverified* (**billable**; last resort, only for
       candidates the free sources missed). Two backends: **Serper.dev (Google) +
       a cheap Haiku judge** when `SERPER_KEY` is set (preferred — ~84% recall,
@@ -697,55 +690,17 @@ regenerate them from the commands above.
 
 ---
 
-## 8. Configuration
-
-All non-secret settings are in [`config.yaml`](config.yaml). Highlights:
-
-| Key | Default | Meaning |
-|---|---|---|
-| `election_year` | `2026` | Cycle to operate on. |
-| `receipts_floor` | `50000` | Minimum FEC receipts to keep a candidate. |
-| `general_receipts_floor` | `100000` | Contested-general money screen: ≥2 parties over this ⇒ the district's candidates enter. `0` disables. |
-| `include_incumbents` / `include_funded_nominees` | `true` | Baseline coverage: every incumbent; every sole funded nominee over `receipts_floor`. |
-| `rating_threshold` | `[Tilt, Lean, Toss-up]` | Ratings kept for the competitive overlay. |
-| `rating_source` | `fixture` | Rating adapter; only the offline `fixture` adapter ships with the repo. |
-| `scan_mode` | `primary` | Universe to build: `primary` (contested primaries), `general` (primary winners / nominees), or `full` (per-race phase). Override per run with `discover --mode`. |
-| `nominees.feed` | `civicapi` | Results feed for nominee resolution (general/full modes + `mark-primary-losers`): `civicapi` (free, key-less) or `none` (uncontested-auto + manual override only). |
-| `require_verified_url` | `false` | If `true`, refuse to scan a candidate whose URL isn't human-verified (spec §3.1). |
-| `crawl_depth` | `2` | Link-crawl depth. |
-| `max_pages_per_site` | `150` | **Per-class** fetch budget: ordinary pages, media-kit-style pages, and PDFs each get this many (hard total 3×); high-value pages fetch first. |
-| `common_paths` | `/media`, `/press`, … | Paths probed on every site. |
-| `robots_policy` | `respect` | Per-domain `respect`/`override` — see `ROBOTS_POLICY.md`. |
-| `enable_search_backup` | `true` | Use the billable search resolver when free sources miss a URL (Serper if `SERPER_KEY` set, else Claude `web_search`). |
-| `models.first_pass` / `.escalation` | `claude-haiku-4-5` → `claude-sonnet-4-6` | Classifier models. Strings are `provider/model`; unprefixed = Anthropic; `fireworks/` and `openai/` supported. Starting defaults — set production choices in `config.local.yaml`. |
-| `models.judge` | `claude-haiku-4-5` | Cheap model that picks the candidate's site from Serper results. |
-| `models.search` | `claude-sonnet-4-6` | Model used for the Claude `web_search` resolution fallback (when no `SERPER_KEY`). |
-| `models.chunk_chars` | `40000` | Chars per classification chunk (most pages → one call). |
-| `models.concurrency` | `8` | Chunks classified concurrently within one page. |
-| `models.classify_pool_size` | `12` | Global cap on concurrent chunk-classify calls across all `scan-all` workers (one shared pool). Defaults to `concurrency`. |
-| `models.tokens_per_minute` | `300000` | Scalar **input-tokens/min ceiling**, applied to first-pass and escalation as independent buckets. `0` disables. |
-| `models.tokens_per_minute_by_model` | per-model | **Per-model** input-tokens/min ceilings (keys match model strings incl. provider prefix). Overrides the scalar; the accurate way to set them. |
-| `confidence_thresholds` | `escalate_below: 0.75`, `negative_floor: 0.6` | When to escalate to the stronger model; minimum confidence for an auto-negative to be trusted. |
-| `pricing` | per-model $/M input tokens | Drives the `scan-all` dry-run **cost preflight** only — not billing-accurate; verify current prices and override. |
-| `screenshot` | `lossless: true`, `quality: 80` | Evidence screenshots transcode PNG→WebP (~70–90% smaller); set `lossless: false` + quality for lossy. |
-| `scan_cadence` | daily 21d / weekly | Pre-primary daily window + default interval. |
-| `publish.site_url` | `https://redboxwatch.org` | Canonical public origin; enables sitemap/robots/canonical/OG tags + feeds on approved-only builds. |
-| `publish.pages_project` | `redboxwatch` | Cloudflare Pages project for `redbox deploy`. |
-| `publish.page_size` | `500` | Rows per generated `index.html` page; the index paginates (findings-first) past this. |
-| `resolve_cache_dir` | `data/.resolve_cache` | Disk cache for `resolve` results so reruns don't re-search. |
-| `user_agent`, `rate_limit` | identifiable UA, 2s/domain | Crawler politeness. |
-
----
-
-## 9. Testing
+## 7. Testing
 
 ```bash
-python -m pytest tests/ -q                  # ~290 offline tests (no network, no API spend)
+python -m pytest tests/ -q                  # the offline suite (no network, no API spend)
 ```
 
 The same suite runs in GitHub Actions on every push/PR
 (`.github/workflows/tests.yml`) — it needs no browsers or API keys. CI cannot
-deploy: the DB and archived evidence are local-only/gitignored by design.
+deploy: the DB and archived evidence are local-only/gitignored by design. The
+suite includes drift guards (`tests/test_docs_drift.py`) that fail when a CLI
+command/flag or config key falls out of sync with this documentation.
 
 The classifier's labeled-fixture acceptance test hits the live model APIs and
 is therefore opt-in:
@@ -761,90 +716,41 @@ any model or prompt change with it before switching production over.
 
 ---
 
-## 10. Limitations & honesty notes
-
-- **Person-dedup** uses identical receipts as the shared-committee signal; a
-  genuinely distinct same-name candidate with coincidentally identical receipts
-  (vanishingly unlikely) would be merged.
-- **Website resolution** covers manual overrides → Wikipedia → FEC committee →
-  search backup. Wikipedia covers candidates with a Wikipedia page (incumbents +
-  notable names); the **search backup** (Serper + LLM judge, or Claude
-  `web_search`) catches most of the rest but is **billable** and only as good as
-  the search results. The judge is deliberately conservative — it returns NONE
-  rather than risk a misattribution, so some resolvable sites are left as coverage
-  gaps for the `/urls` triage queue. A candidate no source resolves isn't scanned
-  (no target). Whether a resolved URL is actually the candidate's is confirmed
-  by a human at the review/publish gate (or up front via
-  `require_verified_url`).
-- **Rating adapters** other than the fixture are best-effort HTML scrapes and may
-  break when source markup changes.
-- **Absence of a finding is not proof** — a box may have been removed, a page
-  uncrawled, or a PDF unparsed. Negatives are always dated.
-- **The classifier is not perfectly deterministic.** Even at temperature 0,
-  borderline pages (long fundraising/gaming pages, ambiguous press kits) can flip
-  between `red_box_guidance` and `no_guidance_detected` across runs, so a single
-  scan's positive set isn't perfectly stable. This is exactly what the human
-  review gate absorbs — treat low-confidence detections as "needs a look," not
-  as settled. Clear red boxes (the `/media` kits) reproduce reliably. Any
-  first-pass model should be validated against all ground truths before
-  adoption (`scripts/eval_classifier_models.py`); keep escalation on the
-  strongest model you trust — escalations are rare and are the
-  accuracy-critical judgment.
-- **Nominee/primary-loser resolution is only as good as its feed.** civicAPI
-  coverage varies by state; unresolved races are surfaced, never guessed, and
-  fall to the manual override file.
-- **Some sites sit behind a WAF** that blocks non-browser fetchers; the crawler
-  uses a real Chromium context (per the spec) but does not spoof identity to
-  evade blocks.
-- **robots.txt-blocked sites are not scanned by default.** Some campaign sites
-  allowlist Google/Bing but disallow other crawlers — we respect that, so they
-  scan zero pages and are surfaced with a distinct **"Site blocks automated
-  access"** status (not a clean negative). The pages are public; you can opt in
-  per-site via `robots_policy.per_domain: { host: override }` after review. (Seen
-  live: one such block was hiding a real red box.)
-- **Scale & rate limits.** `scan-all` runs candidates concurrently; per-model
-  token buckets (`models.tokens_per_minute_by_model`) keep classification under
-  each provider's per-minute ceiling. Crawls are budgeted per fetch class at
-  `max_pages_per_site` so one sprawling site can't dominate — but media-kit
-  pages and PDFs have their own budgets and high-value pages fetch first. Set
-  the token budgets to *your* provider tiers; provider limits are sliding
-  windows, so leave real headroom.
-
----
-
-## 11. Project layout
+## 8. Project layout
 
 ```
 redbox/
   cli.py            # command-line entry point (python -m redbox)
-  config.py         # config.yaml + .env loading
-  db.py             # SQLite schema + migrations
+  config.py         # config.yaml + .env loading (see docs/CONFIGURATION.md)
+  db.py             # SQLite schema + migrations (see docs/DATA_MODEL.md)
   fec.py            # openFEC client (cached): candidates, totals, Schedule E
   weball.py         # FEC bulk candidate-summary file reader (fast discovery)
   discovery.py      # candidate universe (phase 1)
   nominees.py       # nominee resolution + primary-loser flagging (general/full modes)
   ratings/          # pluggable race-rating adapters
   website.py        # campaign-URL resolution + verified/unverified gating
-  crawler.py        # enumeration + Playwright render + per-class fetch budgets (phase 2)
+  crawler.py        # enumeration + Playwright render + fetch budgets + backoff (phase 2)
   pdf.py            # linked-PDF download + text extraction
   robots.py         # robots.txt policy (respect/override, per-domain)
   archiver.py       # WebP screenshot/HTML/text + Wayback Save-Page-Now (phase 2)
   prefilter.py      # cheap regex/URL gate to skip the LLM on empty pages
   classifier.py     # multi-provider classifier (Fireworks/Anthropic/OpenAI), escalation, strict JSON (phase 3)
-  ratelimit.py      # per-domain crawl politeness
+  ratelimit.py      # per-domain crawl politeness (one shared limiter per run)
   ratelimit_tokens.py  # per-model tokens/min buckets for concurrent scanning
-  pipeline.py       # scan orchestration + change-diffing + robots-blocked status
+  pipeline.py       # scan orchestration + change-diffing + scan dispositions
   util.py           # shared helpers: timestamps, hashing, party codes, state names
   corroboration.py  # FEC Schedule E alignment (phase 4)
   reviewweb.py      # local web console: review gate + /urls website triage (phase 5)
+  render.py         # shared presentation: labels, STATUSES table, static assets
+  assets/           # site stylesheet, index script, favicons
   publisher.py      # static review-console / results site + feeds + sitemap (phase 6)
   scheduler.py      # primary calendar + scan cadence (phase 7)
 workers/
   bsky-poster/      # Cloudflare Worker: feed.json -> @redboxwatch.bsky.social (own README)
 scripts/            # model-eval harness + civicAPI coverage validator
-docs/               # data model reference + frozen audit logs
-fixtures/           # offline test fixtures + ratings + primary calendar
-tests/              # ~290 offline tests + opt-in live classifier test
+docs/               # configuration + operations + data-model references, frozen audit logs
+fixtures/           # offline test fixtures + ratings demo + primary calendar
+tests/              # offline test suite (incl. docs-drift guards) + opt-in live classifier test
 config.yaml         # all non-secret settings (config.local.yaml, untracked, overrides it)
 ```
 
@@ -854,4 +760,5 @@ config.yaml         # all non-secret settings (config.local.yaml, untracked, ove
 
 [AGPL-3.0](LICENSE). Copyleft is deliberate: if you run a modified version of
 this tool as a network service, the AGPL requires you to publish your changes.
-You may not present a fork as affiliated with Red Box Watch / redboxwatch.org.
+You may not present a fork as affiliated with RedBoxWatch (also styled
+"Red Box Watch") / redboxwatch.org.

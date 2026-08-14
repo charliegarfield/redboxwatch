@@ -7,7 +7,10 @@ carries FEC candidate IDs — so a nominee is resolved by mapping a race
 ``(state, office, district, party)`` to one of the FEC-funded candidates in it,
 first hit wins:
 
-  1. manual override   -> verified   (data/nominees/<cycle>.json, untracked)
+  1. manual override   -> verified   (data/nominees/<cycle>.json, untracked;
+                                      may name a cid OUTSIDE the funded set —
+                                      still honored, with a warning and a
+                                      ``missing``-flagged synthetic member)
   2. uncontested-auto  -> high       (exactly one funded candidate of that party
                                       in the race == the de-facto nominee)
   3. results feed      -> medium     (a CALLED primary winner crosswalked to the
@@ -28,6 +31,7 @@ races a feed can't resolve are surfaced as ``unresolved`` rather than guessed.
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -218,26 +222,50 @@ class NomineeResolver:
                 source=source, confidence=confidence)
             resolved.add(key)
 
-        # 1. manual overrides (verified) — always win.
+        # 1. manual overrides (verified) — always win. An override may name a
+        # cid with NO row in the funded set (below the receipts floor, or a
+        # replacement nominee absent from the FEC file entirely): the human
+        # call still stands — the bucket resolves and the named cid is the
+        # nominee — but the synthetic member is flagged ``missing`` so
+        # downstream code can tell it is not a real funded row, and a warning
+        # makes the gap visible instead of silent.
         for key, members in buckets.items():
             ov = self._overrides.get(self._key_str(key))
             if not ov or not ov.get("candidate_id"):
                 continue
             c = next((m for m in members if m["candidate_id"] == ov["candidate_id"]), None)
             if c is None:               # override names a cid not in the funded set
-                c = {"candidate_id": ov["candidate_id"], "name": ov.get("name", "")}
+                c = {"candidate_id": ov["candidate_id"], "name": ov.get("name", ""),
+                     "missing": True}
+                print(f"WARNING: nominee override {self._key_str(key)} names "
+                      f"{ov['candidate_id']} ({ov.get('name') or 'no name'}), "
+                      f"which is not in the funded universe — honoring the "
+                      f"override, but the nominee has no candidate row.",
+                      file=sys.stderr)
             add(c, key, "manual", "verified")
 
         # 2. uncontested-auto: exactly one funded candidate of that party -> nominee.
+        # Skipped in all-candidate-primary states (see TOP_TWO_STATES): everyone
+        # shares one primary ballot and the top finishers OVERALL advance,
+        # regardless of party — so the per-party nominee model is structurally
+        # wrong there (a lone funded independent would be crowned "nominee"
+        # despite being eliminated). Those races need verified calls: only a
+        # manual override (layer 1) resolves them.
         for key, members in buckets.items():
-            if key not in resolved and len(members) == 1:
+            if (key not in resolved and len(members) == 1
+                    and key[1] not in TOP_TWO_STATES):
                 add(members[0], key, "uncontested", "high")
 
-        # 3. results feed for the remaining contested buckets.
+        # 3. results feed for the remaining contested buckets. Only states that
+        # still HAVE unresolved contested buckets are queried — a state fully
+        # resolved by overrides/uncontested-auto used to cost a full paginated
+        # feed round-trip for nothing (~40 wasted fetches per sweep). Top-two
+        # states are excluded for the same reason as layer 2: a per-party
+        # primary "winner" is not a nominee there.
         if self.feed is not None:
-            feed_states = (sorted(want) if want
-                           else sorted({k[1] for k, m in buckets.items()
-                                        if k not in resolved and len(m) >= 2}))
+            feed_states = sorted({k[1] for k, m in buckets.items()
+                                  if k not in resolved and len(m) >= 2
+                                  and k[1] not in TOP_TWO_STATES})
             for st in feed_states:
                 try:
                     calls = self.feed.calls(state=st)
@@ -246,7 +274,8 @@ class NomineeResolver:
                     continue
                 for call in calls:
                     key = (call.office, call.state.upper(), call.district, call.party)
-                    if key in resolved or key not in buckets:
+                    if (key in resolved or key not in buckets
+                            or key[1] in TOP_TWO_STATES):
                         continue
                     cid = crosswalk(call, buckets[key])
                     if cid:
@@ -275,6 +304,7 @@ TOP_TWO_STATES = {"AK", "CA", "WA"}
 def flag_primary_losers(conn, resolver: "NomineeResolver", *,
                         states: Iterable[str], ts: str,
                         exclude: Iterable[tuple] = (),
+                        allow_mass_clear: bool = False,
                         ) -> tuple[list[dict], int, int, set[str]]:
     """Mark primary losers (candidates.inactive=3) among a DB's active rows.
 
@@ -288,12 +318,28 @@ def flag_primary_losers(conn, resolver: "NomineeResolver", *,
     unless the race affirmatively resolves. Top-two states are excluded
     outright (see TOP_TWO_STATES).
 
+    A manual override may name a nominee with NO ``candidates`` row at all
+    (below the receipts floor, or a replacement nominee absent from the FEC
+    file). A primary winner belongs in the universe regardless of the floor:
+    any such nominee gets a minimal row INSERTed here, derived from the race
+    bucket plus the override's name (universe_reason='nominee',
+    nominee_source='manual'). An existing row is never overwritten.
+
     ``exclude`` is a set of ``(office, STATE, district_or_None)`` races whose
     primary has NOT yet happened even though the state's statewide date has
     passed (per-district postponements — e.g. AL CDs moved by proclamation,
     LA's House primary pushed to November). Their candidates are dropped from
     consideration entirely: a feed that still carries a voided earlier result
     must not mark losers in a race that hasn't voted.
+
+    Self-heal safety: clearing is driven by ABSENCE of evidence (a feed that
+    answers 200-with-no-calls where it used to call races), so a feed that
+    merely goes quiet for a state must not un-mark its settled races en masse.
+    If one run would clear more than max(5, 20% of that state's currently
+    marked rows), those clears are REFUSED (and the would-be-cleared names
+    printed) unless ``allow_mass_clear`` is set; small corrections — the
+    normal self-heal — still apply, and every applied clear prints the
+    candidate's name.
 
     Returns (newly_lost_rows, n_cleared, n_unresolved, feed_failed_states)."""
     states = sorted({s.upper() for s in states} - TOP_TWO_STATES)
@@ -319,7 +365,7 @@ def flag_primary_losers(conn, resolver: "NomineeResolver", *,
                      for n in result.nominees.values()}
     no_feed_info = set(states) if resolver.feed is None else result.feed_failed_states
     lost: list[dict] = []
-    cleared = 0
+    to_clear: list[dict] = []
     for c in rows:
         key = _bucket_key(c.get("office"), c.get("state"),
                           c.get("district"), c.get("party"))
@@ -331,9 +377,59 @@ def flag_primary_losers(conn, resolver: "NomineeResolver", *,
         elif c.get("inactive") == 3 and (
                 key in resolved_keys                      # now resolves to them
                 or (c.get("state") or "").upper() not in no_feed_info):
+            to_clear.append(c)
+
+    # Mass-clear guard (see docstring): per state, refuse a clear batch bigger
+    # than max(5, 20% of the rows currently marked there).
+    marked_by_state: dict[str, int] = {}
+    for c in rows:
+        if c.get("inactive") == 3:
+            st = (c.get("state") or "").upper()
+            marked_by_state[st] = marked_by_state.get(st, 0) + 1
+    clears_by_state: dict[str, list[dict]] = {}
+    for c in to_clear:
+        clears_by_state.setdefault((c.get("state") or "").upper(), []).append(c)
+    cleared = 0
+    for st, cands in sorted(clears_by_state.items()):
+        limit = max(5, 0.2 * marked_by_state.get(st, 0))
+        if len(cands) > limit and not allow_mass_clear:
+            print(f"REFUSING to clear {len(cands)} of "
+                  f"{marked_by_state.get(st, 0)} lost-primary mark(s) in {st} "
+                  f"in one run (limit {limit:.0f}): a feed going quiet is not "
+                  f"positive evidence a race un-resolved. Would have cleared:")
+            for c in cands:
+                print(f"    would clear: {c['candidate_id']} {c.get('name')} "
+                      f"({c.get('office')}-{st}-{c.get('district')})")
+            print("  (pass allow_mass_clear / an --allow-mass-clear flag to "
+                  "apply these clears deliberately)")
+            continue
+        for c in cands:
             conn.execute("UPDATE candidates SET inactive=NULL, updated_at=? "
                          "WHERE candidate_id=?", (ts, c["candidate_id"]))
+            print(f"  cleared lost-primary mark: {c['candidate_id']} "
+                  f"{c.get('name')} ({c.get('office')}-{st}-{c.get('district')})")
             cleared += 1
+    # Only a manual override can name a nominee outside the funded set (the
+    # other layers pick from actual bucket members); make sure each such
+    # nominee has a candidates row so the general-mode scan tracks the actual
+    # winner, not just their marked losers.
+    for n in result.nominees.values():
+        if n.source != "manual":
+            continue
+        if conn.execute("SELECT 1 FROM candidates WHERE candidate_id=?",
+                        (n.candidate_id,)).fetchone():
+            continue
+        conn.execute(
+            """INSERT INTO candidates (candidate_id, name, office, state,
+                   district, party, cycle, universe_reason, url_source,
+                   url_verified, nominee_source, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,'nominee','none',0,'manual',?,?)""",
+            (n.candidate_id, n.name, n.office, n.state, n.district, n.party,
+             resolver.cycle, ts, ts))
+        print(f"inserted nominee {n.candidate_id} ({n.name or 'no name'}) for "
+              f"{n.office}-{n.state}-{n.district}-{n.party} "
+              f"(universe_reason=nominee): manual override names a candidate "
+              f"outside the funded universe")
     conn.commit()
     return lost, cleared, len(result.unresolved), no_feed_info
 

@@ -1,14 +1,11 @@
 """Offline tests for discovery grouping logic (spec §3.1, acceptance #1)."""
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from redbox.config import Config
 from redbox.discovery import Discovery
 from redbox.ratings.fixture import FixtureRatingAdapter
-from redbox.website import WebsiteResolver
 
 
 def _cand(cid, name, office, state, district, party, ici=None):
@@ -66,8 +63,7 @@ def cfg_baseline():
 
 def _discovery(cfg, candidates, receipts):
     fec = FakeFEC(candidates, receipts)
-    resolver = WebsiteResolver(fec_client=None, overrides_path=Path("/nonexistent"))
-    return Discovery(cfg, fec, rating_adapter=FixtureRatingAdapter(), resolver=resolver)
+    return Discovery(cfg, fec, rating_adapter=FixtureRatingAdapter())
 
 
 def test_contested_primary_requires_two_funded(cfg):
@@ -145,6 +141,48 @@ def test_same_person_different_name_spellings_still_collapse(cfg):
     receipts = {"H4MO03221": 656775.41, "H8MO09146": 656775.41}
     entries = _discovery(cfg, candidates, receipts).build_universe(offices=["H"])
     assert entries == []
+
+
+def test_dedupe_keeps_incumbent_record_over_higher_sorting_stale_id(cfg_baseline):
+    # Real ONDER shape (MO-03): the stale id H8MO09146 sorts lexicographically
+    # HIGHER, but H4MO03221 is the FEC-flagged incumbent record. The old
+    # greatest-id tiebreak kept the stale one; the incumbent record must win.
+    candidates = [
+        _cand("H4MO03221", "ONDER, ROBERT FOR JR.", "H", "MO", "03", "REP", ici="I"),
+        _cand("H8MO09146", "ONDER JR, ROBERT FRANK", "H", "MO", "03", "REP"),
+    ]
+    receipts = {"H4MO03221": 656775.41, "H8MO09146": 656775.41}
+    entries = _discovery(cfg_baseline, candidates, receipts).build_universe(offices=["H"])
+    # Collapsed to ONE entry, and it is the incumbent's record — so the person
+    # enters the universe on incumbency instead of vanishing.
+    assert [e.candidate.candidate_id for e in entries] == ["H4MO03221"]
+    assert "incumbent" in entries[0].reasons
+
+
+def test_dedupe_no_incumbent_prefers_id_matching_rows_district(cfg_baseline):
+    # Real HARRIS ids (NC-08), neither record flagged incumbent: prefer the id
+    # whose embedded state+district (H4NC08066 -> NC-08) matches the row's
+    # actual race over the one registered for another district (H6NC09200 ->
+    # NC-09) — even though the latter sorts higher.
+    candidates = [
+        _cand("H4NC08066", "HARRIS, MARK E", "H", "NC", "08", "REP"),
+        _cand("H6NC09200", "HARRIS, MARK E", "H", "NC", "08", "REP"),
+    ]
+    receipts = {"H4NC08066": 749386.0, "H6NC09200": 749386.0}
+    entries = _discovery(cfg_baseline, candidates, receipts).build_universe(offices=["H"])
+    assert [e.candidate.candidate_id for e in entries] == ["H4NC08066"]
+
+
+def test_dedupe_falls_back_to_greatest_id_when_rules_are_neutral(cfg_baseline):
+    # Neither record is the incumbent and BOTH ids embed the row's OH-03 ->
+    # the pre-existing greatest-id behavior is preserved as the final fallback.
+    candidates = [
+        _cand("H0OH03111", "TWICE, TERRY", "H", "OH", "03", "DEM"),
+        _cand("H8OH03222", "TWICE, TERRY", "H", "OH", "03", "DEM"),
+    ]
+    receipts = {"H0OH03111": 250000.0, "H8OH03222": 250000.0}
+    entries = _discovery(cfg_baseline, candidates, receipts).build_universe(offices=["H"])
+    assert [e.candidate.candidate_id for e in entries] == ["H8OH03222"]
 
 
 def test_likely_and_solid_excluded_from_overlay(cfg):
@@ -238,8 +276,7 @@ def test_fec_inactive_candidacies_dropped(cfg):
     ]
     receipts = {"H1": 6800000, "H2": 400000}
     fec = InactiveFEC(candidates, receipts)
-    resolver = WebsiteResolver(fec_client=None, overrides_path=Path("/nonexistent"))
-    d = Discovery(cfg, fec, rating_adapter=FixtureRatingAdapter(), resolver=resolver)
+    d = Discovery(cfg, fec, rating_adapter=FixtureRatingAdapter())
     entries = d.build_universe(offices=["H"])
     # H1 dropped; H2 alone is no longer a contested primary either.
     assert entries == []
@@ -257,8 +294,7 @@ def test_inactive_lookup_failure_fails_open(cfg):
     ]
     receipts = {"H1": 100000, "H2": 80000}
     fec = BrokenFEC(candidates, receipts)
-    resolver = WebsiteResolver(fec_client=None, overrides_path=Path("/nonexistent"))
-    d = Discovery(cfg, fec, rating_adapter=FixtureRatingAdapter(), resolver=resolver)
+    d = Discovery(cfg, fec, rating_adapter=FixtureRatingAdapter())
     entries = d.build_universe(offices=["H"])
     assert {e.candidate.candidate_id for e in entries} == {"H1", "H2"}
 
@@ -546,6 +582,89 @@ def test_feed_call_crosswalks_to_dfl_coded_row():
     result = NomineeResolver(2026, overrides_path=None, feed=feed).resolve(
         rows, states={"MN"})
     assert result.candidate_ids() == {"S1"}
+
+
+def test_reason_label_keeps_baseline_reasons_with_nominee():
+    # The old nominee short-circuit dropped incumbent/funded_nominee reasons
+    # that were deliberately unioned in. universe_reason is display-only
+    # downstream, so the richer label is safe.
+    assert Discovery.reason_label({"nominee"}) == "nominee"
+    assert Discovery.reason_label({"nominee", "incumbent"}) == "nominee+incumbent"
+    assert (Discovery.reason_label({"nominee", "incumbent", "funded_nominee"})
+            == "nominee+incumbent+funded_nominee")
+
+
+# --- orphan report: persist() flags nothing, but reports demoted candidates ----
+def _seed_active(conn, cid, name, office, state, district, inactive=None):
+    conn.execute(
+        """INSERT INTO candidates (candidate_id,name,office,state,district,party,
+           cycle,universe_reason,url_verified,receipts,inactive,created_at,updated_at)
+           VALUES (?,?,?,?,?,'DEM',2026,'contested_primary',0,100000,?,'t','t')""",
+        (cid, name, office, state, district, inactive))
+    conn.commit()
+
+
+def test_persist_reports_orphans_scoped_to_run(cfg, tmp_path, capsys):
+    from redbox.db import init_db
+    conn = init_db(tmp_path / "db.sqlite")
+    _seed_active(conn, "H_ORPH", "HENRY, JON", "H", "NC", "06")     # left the file
+    _seed_active(conn, "H_NY", "OUTOF, SCOPE", "H", "NY", "01")     # other state
+    _seed_active(conn, "H_INACT", "GONE, GARY", "H", "NC", "07", inactive=2)
+    candidates = [
+        _cand("H1", "A", "H", "NC", "08", "DEM"),
+        _cand("H2", "B", "H", "NC", "08", "DEM"),
+    ]
+    receipts = {"H1": 100000, "H2": 80000}
+    disc = _discovery(cfg, candidates, receipts)
+    entries = disc.build_universe(offices=["H"], states=["NC"])
+    disc.persist(conn, entries)
+    out = capsys.readouterr().out
+    assert "H_ORPH HENRY, JON (NC-06)" in out
+    assert "no longer in the FEC universe" in out
+    assert "H_NY" not in out                # out of the run's state scope
+    assert "H_INACT" not in out             # already inactive -> not an orphan
+    # Report-only: nothing was flagged or modified.
+    assert conn.execute("SELECT inactive FROM candidates "
+                        "WHERE candidate_id='H_ORPH'").fetchone()[0] is None
+    assert conn.execute("SELECT COUNT(*) FROM candidates "
+                        "WHERE COALESCE(inactive,0)=0").fetchone()[0] == 4
+    conn.close()
+
+
+def test_persist_reports_orphans_unscoped_run(cfg, tmp_path, capsys):
+    from redbox.db import init_db
+    conn = init_db(tmp_path / "db.sqlite")
+    _seed_active(conn, "H_ORPH", "HENRY, JON", "H", "TN", "06")
+    _seed_active(conn, "S_ORPH", "SENATE, SUE", "S", "TN", "00")
+    candidates = [
+        _cand("H1", "A", "H", "NC", "08", "DEM"),
+        _cand("H2", "B", "H", "NC", "08", "DEM"),
+    ]
+    receipts = {"H1": 100000, "H2": 80000}
+    disc = _discovery(cfg, candidates, receipts)
+    entries = disc.build_universe(offices=["H", "S"])   # no state scope
+    disc.persist(conn, entries)
+    out = capsys.readouterr().out
+    assert "H_ORPH HENRY, JON (TN-06)" in out
+    assert "S_ORPH SENATE, SUE (TN-Sen)" in out
+    conn.close()
+
+
+def test_persist_no_orphan_report_when_universe_covers_everyone(cfg, tmp_path, capsys):
+    from redbox.db import init_db
+    conn = init_db(tmp_path / "db.sqlite")
+    candidates = [
+        _cand("H1", "A", "H", "NC", "08", "DEM"),
+        _cand("H2", "B", "H", "NC", "08", "DEM"),
+    ]
+    receipts = {"H1": 100000, "H2": 80000}
+    disc = _discovery(cfg, candidates, receipts)
+    entries = disc.build_universe(offices=["H"])
+    disc.persist(conn, entries)          # first run: nothing pre-existing
+    capsys.readouterr()
+    disc.persist(conn, entries)          # re-persist: same universe -> silent
+    assert "orphan" not in capsys.readouterr().out
+    conn.close()
 
 
 def test_presidential_filers_excluded_from_all_populations_in_midterm(cfg_baseline):

@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from .util import as_date as _as_date
+
 CALENDAR_FIXTURE = (
     Path(__file__).resolve().parent.parent / "fixtures" / "primary_calendar_2026.json"
 )
@@ -24,15 +26,6 @@ CALENDAR_FIXTURE = (
 
 def _today() -> date:
     return datetime.now(timezone.utc).date()
-
-
-def _as_date(s: str | None) -> date | None:
-    if not s:
-        return None
-    try:
-        return date.fromisoformat(s[:10])
-    except ValueError:
-        return None
 
 
 def general_election_date(cycle: int) -> date:
@@ -53,32 +46,41 @@ def load_calendar(conn: sqlite3.Connection, *, cycle: int,
     e.g. AL CDs rescheduled by proclamation, LA's House primary pushed to
     November), office-scoped rows keyed 'H' (whole office) or 'H:01'
     (single district). Backfill resolves most-specific-first.
+
+    An entry's optional ``runoff_date`` is persisted alongside the primary
+    date: in a runoff state, first-round results can't settle who lost a race
+    that advanced to the runoff, so consumers (mark-primary-losers) treat the
+    race as undecided until the RUNOFF date has passed.
     """
     path = fixture_path or CALENDAR_FIXTURE
     rows = json.loads(path.read_text())
 
-    def upsert(state, office, primary, filing, source):
+    def upsert(state, office, primary, filing, source, runoff):
         conn.execute(
             """INSERT INTO elections (state, cycle, office, primary_date,
-                   filing_deadline, source)
-               VALUES (?,?,?,?,?,?)
+                   filing_deadline, source, runoff_date)
+               VALUES (?,?,?,?,?,?,?)
                ON CONFLICT(state, cycle, office) DO UPDATE SET
                    primary_date=excluded.primary_date,
                    filing_deadline=excluded.filing_deadline,
-                   source=excluded.source""",
-            (state, cycle, office, primary, filing, source))
+                   source=excluded.source,
+                   runoff_date=excluded.runoff_date""",
+            (state, cycle, office, primary, filing, source, runoff))
 
     n = 0
     for r in rows:
         upsert(r["state"], "", r.get("primary_date"),
-               r.get("filing_deadline"), r.get("source"))
+               r.get("filing_deadline"), r.get("source"), r.get("runoff_date"))
         n += 1
         for o in r.get("overrides", []):
             for dd in (o.get("districts") or [None]):
                 office_key = o["office"] + (f":{dd}" if dd else "")
+                # NOT inherited from the statewide entry: a postponed race
+                # runs on its own timetable (e.g. AL CDs voting 8/11 are not
+                # settled/unsettled by the statewide 6/16 runoff).
                 upsert(r["state"], office_key, o.get("primary_date"),
                        o.get("filing_deadline") or r.get("filing_deadline"),
-                       r.get("source"))
+                       r.get("source"), o.get("runoff_date"))
                 n += 1
     conn.commit()
     return n
@@ -137,7 +139,10 @@ def due_candidates(
     A candidate is due when: it has a resolved ``website_url`` (and, if
     ``require_verified`` is set, a human-verified one), today falls between
     its filing deadline and the general election, and the time since its last
-    scan meets/exceeds the current cadence interval — daily inside the final
+    scan *attempt* — the MAX of the newest ``scans.fetched_at`` and
+    ``candidates.last_attempt_at``, so zero-page outcomes (robots_blocked,
+    fetch_failed) still count — meets/exceeds the current cadence interval:
+    daily inside the final
     ``daily_window_days`` before that candidate's primary or the general,
     weekly otherwise. Past the primary (losers are marked inactive) and when
     the primary date is unknown, cadence keys off the general election.
@@ -146,6 +151,14 @@ def due_candidates(
     out: list[DueItem] = []
     cands = conn.execute(
         "SELECT * FROM candidates WHERE COALESCE(inactive,0)=0").fetchall()
+    # Filing deadlines, one SELECT up front instead of one per candidate.
+    # Deliberately statewide (office=''): the filing deadline only gates when
+    # scanning STARTS, and candidates in a postponed race are campaigning (and
+    # red-boxing) on the statewide timetable regardless of their new date.
+    filings = {(r["state"], r["cycle"]): r["filing_deadline"]
+               for r in conn.execute(
+                   "SELECT state, cycle, filing_deadline FROM elections "
+                   "WHERE office=''")}
     for c in cands:
         c = dict(c)
         if not c.get("website_url"):
@@ -153,7 +166,7 @@ def due_candidates(
         if require_verified and not c.get("url_verified"):
             continue
         prim = _as_date(c.get("primary_date"))
-        filing = _as_date(_filing_for(conn, c.get("state"), c.get("cycle")))
+        filing = _as_date(filings.get((c.get("state"), c.get("cycle"))))
         general = general_election_date(c.get("cycle") or today.year)
 
         # Window gating: don't scan before the filing deadline or after the
@@ -184,7 +197,14 @@ def due_candidates(
             else:
                 interval, cadence = default_interval_days, "weekly"
 
-        last = _last_scan(conn, c["candidate_id"])
+        # Last activity = the later of the newest fetched page and the last
+        # concluded attempt (candidates.last_attempt_at). Zero-page outcomes
+        # (robots_blocked / fetch_failed) write no `scans` rows, so without the
+        # attempt stamp they'd look never-scanned and be due every day — a
+        # robots-politeness problem for blocked domains, not just noise. Both
+        # are ISO-8601 UTC strings, so lexicographic max is chronological.
+        last = max(filter(None, (_last_scan(conn, c["candidate_id"]),
+                                 c.get("last_attempt_at"))), default=None)
         last_date = _as_date(last)
         if last is None:
             due, reason = True, "never scanned"
@@ -198,7 +218,7 @@ def due_candidates(
                 due, reason = False, "scanned on/after today"
             else:
                 due = elapsed >= interval
-                reason = f"{elapsed}d since last scan (interval {interval}d)"
+                reason = f"{elapsed}d since last attempt (interval {interval}d)"
         if due:
             out.append(DueItem(candidate=c, cadence=cadence,
                                days_to_primary=days_to, reason=reason,
@@ -212,16 +232,6 @@ def due_candidates(
         return 9999
     out.sort(key=_next_election)
     return out
-
-
-def _filing_for(conn, state, cycle):
-    # Deliberately statewide (office=''): the filing deadline only gates when
-    # scanning STARTS, and candidates in a postponed race are campaigning (and
-    # red-boxing) on the statewide timetable regardless of their new date.
-    r = conn.execute(
-        "SELECT filing_deadline FROM elections WHERE state=? AND cycle=? AND office='' LIMIT 1",
-        (state, cycle)).fetchone()
-    return r["filing_deadline"] if r else None
 
 
 def _last_scan(conn, candidate_id) -> str | None:

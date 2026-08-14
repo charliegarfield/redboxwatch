@@ -326,8 +326,22 @@ def build_llm(*, first_pass: str, escalation: str, anthropic_api_key: str | None
     return RouterLLM(backends)
 
 
+class ClassifierParseError(RuntimeError):
+    """Model output could not be parsed as the required JSON object.
+
+    Raised (rather than manufacturing a placeholder verdict) so the pipeline
+    treats an unparseable response exactly like a transport failure: the page
+    is skipped and retried on the next scan. The old fallback — a synthetic
+    ``ambiguous``/0.0 result — flowed into a real detections row, an archive,
+    and a put_up change event that outlived the provider hiccup.
+    """
+
+
 def _parse_json(raw: str) -> dict[str, Any]:
-    """Parse model output; tolerate stray prose by extracting the JSON object."""
+    """Parse model output; tolerate stray prose by extracting the JSON object.
+
+    Raises :class:`ClassifierParseError` when no JSON object can be recovered.
+    """
     raw = raw.strip()
     try:
         return json.loads(raw)
@@ -338,14 +352,8 @@ def _parse_json(raw: str) -> dict[str, Any]:
                 return json.loads(raw[start:end + 1])
             except json.JSONDecodeError:
                 pass
-    # Could not parse — treat as ambiguous so it goes to review rather than
-    # being silently dropped as a negative.
-    return {
-        "classification": "ambiguous",
-        "confidence": 0.0,
-        "evidence": [],
-        "rationale": "Classifier output could not be parsed as JSON.",
-    }
+    raise ClassifierParseError(
+        f"classifier output could not be parsed as JSON: {raw[:200]!r}")
 
 
 # ---------------------------------------------------------------------------

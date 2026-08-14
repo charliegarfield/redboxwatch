@@ -327,9 +327,59 @@ def test_classifier_end_to_end_with_router_escalation():
     assert fw.calls and an.calls
 
 
-def test_parse_json_tolerates_prose_wrapping_and_falls_back():
+def test_parse_json_tolerates_prose_wrapping():
     assert _parse_json('{"classification":"ambiguous","confidence":0.5,"evidence":[],"rationale":"x"}')["classification"] == "ambiguous"
     wrapped = _parse_json('Here is the JSON:\n{"classification":"no_guidance_detected","confidence":0.9,"evidence":[],"rationale":"x"} done')
     assert wrapped["classification"] == "no_guidance_detected"
-    # Unparseable -> ambiguous (routes to review, not silently negative)
-    assert _parse_json("not json at all")["classification"] == "ambiguous"
+
+
+def test_parse_json_unparseable_raises_not_placeholder():
+    # An unparseable response must RAISE, not manufacture a synthetic
+    # ambiguous/0.0 verdict — the placeholder used to flow into a real
+    # detections row, an archive, and a put_up event that outlived the
+    # provider hiccup. The pipeline catches the raise and skips the page
+    # like any transport error (retried next scan).
+    import pytest
+
+    from redbox.classifier import ClassifierParseError
+
+    for raw in ("not json at all", "", "{broken json", "prose { still broken }"):
+        with pytest.raises(ClassifierParseError):
+            _parse_json(raw)
+
+
+def test_openai_backend_raises_on_unparseable_output():
+    # The raise propagates from a real backend's classify_chunk, so the
+    # pipeline's classify-failure handler (which catches Exception) sees it.
+    import pytest
+
+    from redbox.classifier import ClassifierParseError, OpenAICompatLLM
+
+    def post(payload):
+        return {"choices": [{"message": {"content": "I cannot answer that."}}]}
+
+    llm = OpenAICompatLLM("http://x", "k", dialect="fireworks", post=post)
+    with pytest.raises(ClassifierParseError):
+        llm.classify_chunk("PAGE", model="fireworks/deepseek-v4-flash")
+
+
+def test_parse_error_in_one_chunk_fails_the_whole_page():
+    # A multi-chunk page with one unparseable chunk must raise (page skipped
+    # and retried whole), never combine partial results into a verdict.
+    import pytest
+
+    from redbox.classifier import ClassifierParseError
+
+    def behaviour(text, model):
+        if "BAD" in text:
+            raise ClassifierParseError("unparseable chunk")
+        return _result("no_guidance_detected", 0.95)
+
+    c = Classifier(FakeLLM(behaviour), chunk_chars=20)
+    text = "\n\n".join(["filler block here"] * 4 + ["the BAD block"])
+    with pytest.raises(ClassifierParseError):
+        c.classify_text(text)
+    # Parseable-only pages still combine normally.
+    ok = Classifier(FakeLLM(behaviour), chunk_chars=20).classify_text(
+        "\n\n".join(["filler block here"] * 5))
+    assert ok.classification == "no_guidance_detected"

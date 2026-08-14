@@ -167,6 +167,57 @@ def test_backfill_preserves_dates_for_states_missing_from_calendar(tmp_path):
     assert rows == {"H1": "2026-06-23", "H2": "2026-09-01"}
 
 
+def test_zero_page_attempt_counts_as_activity(tmp_path):
+    # A robots_blocked (or fetch_failed) attempt writes NO `scans` rows — only
+    # candidates.last_attempt_at. It must still count as activity, or blocked
+    # domains look "never scanned" and are re-crawled daily forever (a
+    # robots-politeness problem, not just noise).
+    conn = init_db(tmp_path / "db.sqlite")
+    _cand(conn, "BLOCKED", "NY")             # primary 06-23 -> weekly on 05-20
+    load_calendar(conn, cycle=2026, fixture_path=_cal(tmp_path))
+    backfill_primary_dates(conn, cycle=2026)
+    today = date(2026, 5, 20)
+
+    # Attempted today -> not due under the weekly cadence.
+    conn.execute("UPDATE candidates SET scan_status='robots_blocked', "
+                 "last_attempt_at='2026-05-20T08:00:00+00:00' "
+                 "WHERE candidate_id='BLOCKED'")
+    conn.commit()
+    assert due_candidates(conn, today=today) == []
+
+    # Attempted 8 days ago -> the weekly interval has elapsed; due again.
+    conn.execute("UPDATE candidates SET last_attempt_at='2026-05-12T08:00:00+00:00' "
+                 "WHERE candidate_id='BLOCKED'")
+    conn.commit()
+    due = due_candidates(conn, today=today)
+    assert len(due) == 1 and due[0].candidate["candidate_id"] == "BLOCKED"
+
+
+def test_last_activity_is_max_of_scans_and_attempt(tmp_path):
+    # An old fetched page plus a fresh (zero-page) attempt: the LATER of the
+    # two governs, so the fresh attempt suppresses today's scan.
+    conn = init_db(tmp_path / "db.sqlite")
+    _cand(conn, "MIX", "NY", last_scan="2026-05-01T00:00:00+00:00")  # 19d ago
+    load_calendar(conn, cycle=2026, fixture_path=_cal(tmp_path))
+    backfill_primary_dates(conn, cycle=2026)
+    conn.execute("UPDATE candidates SET scan_status='fetch_failed', "
+                 "last_attempt_at='2026-05-20T08:00:00+00:00' "
+                 "WHERE candidate_id='MIX'")
+    conn.commit()
+    assert due_candidates(conn, today=date(2026, 5, 20)) == []
+
+
+def test_never_attempted_is_still_due(tmp_path):
+    # No `scans` rows AND no last_attempt_at -> genuinely never scanned -> due.
+    conn = init_db(tmp_path / "db.sqlite")
+    _cand(conn, "NEW", "NY")
+    load_calendar(conn, cycle=2026, fixture_path=_cal(tmp_path))
+    backfill_primary_dates(conn, cycle=2026)
+    due = due_candidates(conn, today=date(2026, 5, 20))
+    assert len(due) == 1
+    assert due[0].reason == "never scanned"
+
+
 def _cal_with_overrides(tmp_path):
     p = tmp_path / "cal_o.json"
     p.write_text(json.dumps([
@@ -177,6 +228,50 @@ def _cal_with_overrides(tmp_path):
          "overrides": [{"office": "H", "primary_date": "2026-11-03"}]},
     ]))
     return p
+
+
+def test_calendar_persists_runoff_date(tmp_path):
+    # An entry's optional runoff_date lands on its elections row; states
+    # without one carry NULL.
+    p = tmp_path / "cal_r.json"
+    p.write_text(json.dumps([
+        {"state": "OK", "primary_date": "2026-06-16",
+         "runoff_date": "2026-08-25", "filing_deadline": "2026-04-03"},
+        {"state": "NY", "primary_date": "2026-06-23",
+         "filing_deadline": "2026-04-06"},
+    ]))
+    conn = init_db(tmp_path / "db.sqlite")
+    load_calendar(conn, cycle=2026, fixture_path=p)
+    got = {r["state"]: r["runoff_date"] for r in conn.execute(
+        "SELECT state, runoff_date FROM elections WHERE office=''")}
+    assert got == {"OK": "2026-08-25", "NY": None}
+
+
+def test_shipped_fixture_carries_noted_runoff_dates(tmp_path):
+    # The 2026 fixture transcribes runoff dates already present in the state
+    # notes (and ONLY those — no invented dates), and load_calendar persists
+    # them. Override rows for postponed races do not inherit the statewide
+    # runoff: those races run on their own timetable.
+    conn = init_db(tmp_path / "db.sqlite")
+    load_calendar(conn, cycle=2026)          # the shipped fixture
+    got = {r["state"]: r["runoff_date"] for r in conn.execute(
+        "SELECT state, runoff_date FROM elections WHERE office=''")}
+    assert got["AL"] == "2026-06-16"
+    assert got["AR"] == "2026-03-31"
+    assert got["GA"] == "2026-06-16"
+    assert got["MS"] == "2026-04-07"
+    assert got["NC"] == "2026-05-12"
+    assert got["OK"] == "2026-08-25"
+    assert got["SC"] == "2026-06-23"
+    assert got["SD"] == "2026-07-28"
+    assert got["TX"] == "2026-05-26"
+    # No runoff in the note -> none persisted.
+    assert got["NY"] is None
+    assert got["FL"] is None
+    # AL's postponed CDs (override rows) don't inherit the 6/16 runoff.
+    assert conn.execute(
+        "SELECT runoff_date FROM elections WHERE state='AL' AND office='H:01'"
+    ).fetchone()[0] is None
 
 
 def test_backfill_uses_most_specific_election_row(tmp_path):

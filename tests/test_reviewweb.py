@@ -233,6 +233,70 @@ def test_group_review_covers_all_aliases(tmp_path):
     conn.close()
 
 
+def test_group_checkbox_checked_when_all_aliases_pending(tmp_path):
+    # No sibling decided yet: fanning out is safe and stays the default.
+    db = tmp_path / "db.sqlite"
+    conn = init_db(db)
+    _seed_candidate(conn)
+    d1 = _seed_detection(conn, url="https://example.org/media", text_hash="same")
+    _seed_detection(conn, url="https://example.org/press", text_hash="same")
+    conn.close()
+    app = ReviewApp(db)
+    _, _, body = get(app, f"/detection/{d1}")
+    page = body.decode()
+    assert 'name="group" value="1" checked' in page
+    assert "already decided" not in page
+    assert "pending" in page                    # sibling state rendered
+
+
+def test_group_checkbox_unchecked_when_sibling_decided(tmp_path):
+    # alice approved d2; bob opening d1 must SEE that and must not fan a
+    # decision over it by default — override is a visible opt-in.
+    db = tmp_path / "db.sqlite"
+    conn = init_db(db)
+    _seed_candidate(conn)
+    d1 = _seed_detection(conn, url="https://example.org/media", text_hash="same")
+    d2 = _seed_detection(conn, url="https://example.org/press", text_hash="same")
+    record_review(conn, d2, "approve", reviewer="alice")
+    conn.close()
+    app = ReviewApp(db)
+    _, _, body = get(app, f"/detection/{d1}")
+    page = body.decode()
+    assert 'name="group" value="1" checked' not in page   # default OFF
+    assert 'name="group" value="1"' in page               # but still available
+    assert "already approved by alice" in page            # sibling state shown
+    assert "1 of 2 already decided" in page               # and the label says why
+
+
+def test_group_checkbox_unchecked_when_sibling_rejected(tmp_path):
+    db = tmp_path / "db.sqlite"
+    conn = init_db(db)
+    _seed_candidate(conn)
+    d1 = _seed_detection(conn, url="https://example.org/media", text_hash="same")
+    d2 = _seed_detection(conn, url="https://example.org/press", text_hash="same")
+    record_review(conn, d2, "reject", reviewer="bob")
+    conn.close()
+    _, _, body = get(ReviewApp(db), f"/detection/{d1}")
+    page = body.decode()
+    assert 'name="group" value="1" checked' not in page
+    assert "already rejected by bob" in page
+
+
+def test_group_checkbox_needs_more_sibling_still_checked(tmp_path):
+    # needs_more is not a decision — fanning out over it is fine.
+    db = tmp_path / "db.sqlite"
+    conn = init_db(db)
+    _seed_candidate(conn)
+    d1 = _seed_detection(conn, url="https://example.org/media", text_hash="same")
+    d2 = _seed_detection(conn, url="https://example.org/press", text_hash="same")
+    record_review(conn, d2, "needs_more", reviewer="alice")
+    conn.close()
+    _, _, body = get(ReviewApp(db), f"/detection/{d1}")
+    page = body.decode()
+    assert 'name="group" value="1" checked' in page
+    assert "already decided" not in page
+
+
 def test_without_group_flag_only_one_alias_reviewed(tmp_path):
     db = tmp_path / "db.sqlite"
     conn = init_db(db)
@@ -578,6 +642,130 @@ def test_url_queue_excludes_inactive(tmp_path):
     conn.close()
     _, _, body = get(app, "/urls")
     assert "NOSITE, NORA" not in body.decode()
+
+
+def test_url_found_clears_scan_status(tmp_path):
+    # A human-corrected URL must be re-crawled: scan-all selects
+    # scan_status IS NULL, so saving a URL has to clear the old disposition.
+    from redbox.db import connect
+    app, db = _url_app(tmp_path)
+    conn = connect(db)
+    conn.execute("UPDATE candidates SET scan_status='scanned' "
+                 "WHERE candidate_id='H7'")
+    conn.commit()
+    conn.close()
+    status, _, _ = post(app, "/urls/H7", "outcome=found&url=norafornc.com")
+    assert status == "303 See Other"
+    conn = connect(db)
+    row = conn.execute("SELECT website_url, scan_status FROM candidates "
+                       "WHERE candidate_id='H7'").fetchone()
+    conn.close()
+    assert row["website_url"] == "https://norafornc.com"
+    assert row["scan_status"] is None           # next scan-all picks it up
+
+
+def test_url_form_shows_existing_url_before_overwrite(tmp_path):
+    # H1 was seeded WITH an auto-resolved URL; the form must show what a save
+    # would replace instead of silently stamping over it.
+    db = tmp_path / "db.sqlite"
+    conn = init_db(db)
+    _seed_candidate(conn)                       # website_url=https://example.org, source=search
+    conn.commit()
+    conn.close()
+    app = ReviewApp(db, overrides_path=tmp_path / "websites.json")
+    status, _, body = get(app, "/urls/H1")
+    page = body.decode()
+    assert status == "200 OK"
+    assert "already has a URL" in page
+    assert "https://example.org" in page        # the URL being replaced
+    assert "search" in page                     # and where it came from
+    assert 'name="confirm_replace"' in page
+    # A first-time fill (no existing URL) needs no confirm step.
+    app2, _ = _url_app(tmp_path / "fresh")
+    _, _, body2 = get(app2, "/urls/H7")
+    assert 'name="confirm_replace"' not in body2.decode()
+
+
+def test_url_overwrite_without_confirm_is_rejected(tmp_path):
+    from redbox.db import connect
+    db = tmp_path / "db.sqlite"
+    conn = init_db(db)
+    _seed_candidate(conn)
+    conn.commit()
+    conn.close()
+    app = ReviewApp(db, overrides_path=tmp_path / "websites.json")
+    status, _, body = post(app, "/urls/H1",
+                           "outcome=found&url=https://new.example&reviewer=bob")
+    assert status == "200 OK"                   # re-rendered form, no redirect
+    assert "nothing was changed" in body.decode()
+    conn = connect(db)
+    row = conn.execute("SELECT website_url, url_source FROM candidates "
+                       "WHERE candidate_id='H1'").fetchone()
+    conn.close()
+    assert row["website_url"] == "https://example.org"   # untouched
+    assert row["url_source"] == "search"
+    assert not (tmp_path / "websites.json").exists()
+
+
+def test_url_overwrite_with_confirm_succeeds(tmp_path):
+    import json as _json
+
+    from redbox.db import connect
+    db = tmp_path / "db.sqlite"
+    conn = init_db(db)
+    _seed_candidate(conn)
+    conn.commit()
+    conn.close()
+    app = ReviewApp(db, overrides_path=tmp_path / "websites.json")
+    status, headers, _ = post(
+        app, "/urls/H1",
+        "outcome=found&url=https://new.example&confirm_replace=1&reviewer=bob")
+    assert status == "303 See Other"
+    assert "done=H1" in headers["Location"]
+    conn = connect(db)
+    row = conn.execute("SELECT website_url, url_source, url_verified "
+                       "FROM candidates WHERE candidate_id='H1'").fetchone()
+    conn.close()
+    assert row["website_url"] == "https://new.example"
+    assert row["url_source"] == "manual"
+    assert row["url_verified"] == 1
+    overrides = _json.loads((tmp_path / "websites.json").read_text())
+    assert overrides["H1"]["url"] == "https://new.example"
+
+
+def test_url_none_writes_durable_triage_file(tmp_path):
+    import json as _json
+    app, _ = _url_app(tmp_path)
+    post(app, "/urls/H7", "outcome=none&reviewer=charlie")
+    triage = _json.loads((tmp_path / "url_triage.json").read_text())
+    assert triage["H7"]["outcome"] == "human_none"
+    assert triage["H7"]["reviewer"] == "charlie"
+    assert triage["H7"]["at"]                   # timestamped
+
+
+def test_url_wrong_race_writes_durable_triage_file(tmp_path):
+    import json as _json
+    app, _ = _url_app(tmp_path)
+    post(app, "/urls/H7", "outcome=wrong_race&reviewer=charlie")
+    triage = _json.loads((tmp_path / "url_triage.json").read_text())
+    assert triage["H7"]["outcome"] == "wrong_race"
+    assert triage["H7"]["reviewer"] == "charlie"
+
+
+def test_url_done_banner_names_candidate_and_outcome(tmp_path):
+    # A mis-click must be visible: the banner names the candidate (not just
+    # the FEC id), states the outcome, and offers the reopen link. The POST
+    # first, so H7 has LEFT the queue — the name can only come from the banner.
+    app, _ = _url_app(tmp_path)
+    _, headers, _ = post(app, "/urls/H7", "outcome=wrong_race&reviewer=charlie")
+    query = headers["Location"].split("?", 1)[1]
+    assert "done=H7" in query and "as=wrong_race" in query
+    _, _, body = get(app, "/urls", query=query)
+    page = body.decode()
+    assert "0 candidate(s) with no resolved campaign site" in page  # queue empty
+    assert "NOSITE, NORA" in page               # banner names the candidate
+    assert "not-running-for-this-seat" in page  # and the outcome
+    assert '/urls/H7' in page                   # the undo hint / reopen link
 
 
 # ---------------------------------------------------------------------------

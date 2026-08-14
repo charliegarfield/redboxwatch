@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 
 STATE_NAMES = {
@@ -46,6 +46,19 @@ def norm_party(p: str | None) -> str:
     if s.startswith("REP") or s.startswith("GOP") or s == "R":
         return "REP"
     return s[:3]
+
+
+def as_date(s: str | None) -> date | None:
+    """Parse an ISO date prefix ('2026-03-03...') -> date, or None.
+
+    Shared by discovery (race phase) and scheduler (cadence) — one
+    implementation, not two drifting copies."""
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(s[:10])
+    except ValueError:
+        return None
 
 
 def now_iso() -> str:

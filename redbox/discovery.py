@@ -33,19 +33,10 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Iterable
 
-
-def _as_date(s: str | None) -> "date | None":
-    """Parse an ISO date prefix ('2026-03-03...') -> date, or None."""
-    if not s:
-        return None
-    try:
-        return date.fromisoformat(s[:10])
-    except ValueError:
-        return None
-
 from .config import Config
 from .fec import FECClient
-from .ratings.base import RaceRating, RatingAdapter
+from .ratings.base import RatingAdapter
+from .util import as_date as _as_date
 from .util import now_iso
 
 # Canonical party normalization is shared with nominees/feed crosswalk (see
@@ -102,17 +93,12 @@ class Discovery:
         config: Config,
         fec: FECClient,
         rating_adapter: RatingAdapter | None = None,
-        resolver: object | None = None,
         weball_path: str | Path | None = None,
         use_cache: bool = True,
     ) -> None:
         self.cfg = config
         self.fec = fec
         self.ratings = rating_adapter
-        # `resolver` is accepted (and ignored) for backward compatibility:
-        # discovery deliberately does NOT resolve URLs — that's `resolve`'s
-        # job — and the eagerly-constructed WebsiteResolver was never read.
-        del resolver
         # If a FEC bulk 'weball' file is given (and exists), discovery reads
         # candidates + receipts from it — no per-candidate API calls.
         self.weball_path = Path(weball_path) if weball_path else None
@@ -195,6 +181,25 @@ class Discovery:
                 if t.strip(".") not in ("JR", "SR", "II", "III", "IV", "V")]
         return toks[0] if toks else last.strip()
 
+    @staticmethod
+    def _id_matches_row_geo(fc: FundedCandidate) -> bool:
+        """Whether fc's candidate_id embeds the row's actual state+district.
+
+        FEC House/Senate ids are laid out: office letter, cycle digit,
+        2-char state, 2-char district, sequence — H4NC08066 is NC-08,
+        S6MI00426 is MI (Senate ids carry '00' district, as do their rows).
+        Presidential ids embed no usable geography, so 'P' never yields a
+        match signal (returns False, leaving the id-order fallback to decide).
+        """
+        cid = fc.candidate_id or ""
+        office = (fc.raw.get("office") or cid[:1]).upper()
+        if office == "P" or len(cid) < 6:
+            return False
+        row_state = (fc.raw.get("state") or "").upper()
+        # '', '3', '03' all normalise to two digits; Senate '' -> '00'.
+        row_district = str(fc.raw.get("district") or "").strip().zfill(2)
+        return cid[2:4].upper() == row_state and cid[4:6] == row_district
+
     @classmethod
     def _dedupe_people(cls, funded: list[FundedCandidate]) -> list[FundedCandidate]:
         """Collapse one person's multiple FEC candidate_ids into a single entry.
@@ -204,19 +209,43 @@ class Discovery:
         identical to the dollar. Two such rows in the same group would otherwise
         register as a phantom contested primary (observed: MARK E HARRIS in
         NC-08 appearing as H4NC08066 *and* H6NC09200). We treat
-        (surname, office, state, district, party, receipts) as a person key and
-        keep one id (the lexicographically greatest, which favours the most
-        recent cycle prefix). Identical receipts is the discriminating signal —
-        two genuinely distinct same-surname candidates in the same race almost
-        never match to the cent (the surname, not the full name, keys the person
-        because the same person's records can spell their name differently).
+        (surname, office, state, district, party, receipts) as a person key.
+        Identical receipts is the discriminating signal — two genuinely distinct
+        same-surname candidates in the same race almost never match to the cent
+        (the surname, not the full name, keys the person because the same
+        person's records can spell their name differently).
+
+        Which colliding record survives is a ranked preference:
+
+        1. the record the FEC flags as the sitting incumbent
+           (incumbent_challenge == 'I');
+        2. else the record whose candidate_id's embedded state+district
+           (id[2:4]/id[4:6]) matches the row's actual state+district — i.e. the
+           id registered for THIS race, not a leftover from an old district;
+        3. else the lexicographically greatest candidate_id.
+
+        History: this used to be rule 3 alone, with a comment claiming the
+        greatest id "favours the most recent cycle prefix". That was false —
+        the comparison is dominated by the state/district/sequence portion of
+        the id, not the cycle digit — and it got its own motivating examples
+        wrong: on the real weball data every cross-district collision (ONDER
+        H4MO03221 vs H8MO09146, HARRIS H4NC08066 vs H6NC09200, MENENDEZ
+        H2NJ08232 vs H2NJ13075) kept the stale wrong-district non-incumbent id
+        and discarded the current incumbent's.
         """
+        def prefer(fc: FundedCandidate) -> tuple[bool, bool, str]:
+            return (
+                (fc.raw.get("incumbent_challenge") or "").upper() == "I",
+                cls._id_matches_row_geo(fc),
+                fc.candidate_id,
+            )
+
         by_person: dict[tuple, FundedCandidate] = {}
         for fc in funded:
             person_key = (cls._person_surname(fc.raw.get("name", "")),
                           *fc.group_key, round(fc.receipts, 2))
             existing = by_person.get(person_key)
-            if existing is None or fc.candidate_id > existing.candidate_id:
+            if existing is None or prefer(fc) > prefer(existing):
                 by_person[person_key] = fc
         return list(by_person.values())
 
@@ -363,6 +392,13 @@ class Discovery:
           pre-primary and ``general``-style (nominee) once its state has voted,
           using ``primary_dates`` (state -> ISO date) and ``today``.
         """
+        # Remember the run's scope so persist() can limit its orphan report to
+        # candidates this run actually had a chance to (re)produce.
+        self._scope = (
+            {o.upper() for o in offices} if offices else None,
+            {s.upper() for s in states} if states else None,
+            district,
+        )
         funded = self._funded_candidates(offices=offices, states=states, district=district)
         # Drop withdrawn/superseded candidacies BEFORE grouping: a phantom
         # record's money must not make its old district look contested and pull
@@ -465,13 +501,16 @@ class Discovery:
     @staticmethod
     def reason_label(reasons: set[str]) -> str:
         # "both" is the legacy label for exactly A+B; every other combination is
-        # '+'-joined in a fixed order so labels are stable across runs.
+        # '+'-joined in a fixed order so labels are stable across runs. A
+        # nominee's baseline reasons (incumbent / funded_nominee) join in like
+        # any other combination — an earlier short-circuit dropped them, hiding
+        # WHY a nominee was also baseline-covered. universe_reason is
+        # display-only downstream (review console / publisher detail pages), so
+        # the richer label breaks no consumer.
         if reasons == {"contested_primary", "competitive_general"}:
             return "both"
-        if "nominee" in reasons:
-            return "nominee"
-        order = ("contested_primary", "contested_general", "competitive_general",
-                 "incumbent", "funded_nominee")
+        order = ("nominee", "contested_primary", "contested_general",
+                 "competitive_general", "incumbent", "funded_nominee")
         return "+".join(r for r in order if r in reasons)
 
     # ------------------------------------------------------------------
@@ -512,7 +551,46 @@ class Discovery:
             rows,
         )
         conn.commit()
+        self._report_orphans(conn, produced={r[0] for r in rows})
         return len(rows)
+
+    def _report_orphans(self, conn: sqlite3.Connection, *, produced: set[str]) -> None:
+        """Print active candidates this run's universe did NOT produce.
+
+        persist() is upsert-only, so a candidate who leaves the FEC file would
+        otherwise stay active forever. Report-only — nothing is flagged or
+        modified; the human decides (a row may be a hand-inserted nominee, a
+        filer who dipped below the floor, or genuinely gone). Scoped to the
+        run's offices/states/district (recorded by build_universe) so a
+        `--states NC` run doesn't accuse every non-NC candidate.
+        """
+        offices, states, district = getattr(self, "_scope", (None, None, None))
+        q = ("SELECT candidate_id, name, office, state, district FROM candidates "
+             "WHERE COALESCE(inactive,0)=0 AND cycle=?")
+        params: list[Any] = [self.cfg.election_year]
+        if offices:
+            q += f" AND office IN ({','.join('?' * len(offices))})"
+            params += sorted(offices)
+        if states:
+            q += f" AND state IN ({','.join('?' * len(states))})"
+            params += sorted(states)
+        if district:
+            q += " AND district=?"
+            params.append(district)
+        orphans = [tuple(r) for r in conn.execute(q, params)
+                   if r[0] not in produced]
+        if not orphans:
+            return
+        print(f"  {len(orphans)} active candidate(s) not produced by this "
+              f"run's universe — REPORT ONLY, review by hand:")
+        for cid, name, office, state, dist in sorted(orphans):
+            if office == "S":
+                loc = f"{state}-Sen"
+            elif office == "P":
+                loc = "Pres"
+            else:
+                loc = f"{state}-{dist}"
+            print(f"    orphan (no longer in the FEC universe): {cid} {name} ({loc})")
 
     @staticmethod
     def to_csv(entries: list[UniverseEntry], path: str | Path) -> Path:

@@ -34,7 +34,9 @@ from .util import now_iso
 class ScanOutcome:
     candidate_id: str
     pages_scanned: int = 0        # usable pages (HTTP 200 with real content)
-    pages_failed: int = 0         # fetched but unusable: error status / empty / bot challenge
+    pages_failed: int = 0         # fetched but unusable: error status / empty / bot
+                                  # challenge (incl. never-before-seen 404s, which
+                                  # are counted here but persist no scans row)
     detections: int = 0
     positives: int = 0
     ambiguous: int = 0
@@ -144,8 +146,12 @@ def _classification_for_scan(conn: sqlite3.Connection, scan_id: int) -> str:
     re-scans and template-alias pages deliberately carry no detection row of
     their own, so a scan_id-only lookup would read them as no-guidance — and a
     red box removed after a quiet re-scan would diff none->none, silently
-    dropping the take-down event. Empty and prefiltered scans have no detection
-    with a matching hash and correctly read as no_guidance_detected.
+    dropping the take-down event. Empty scans have no detection with a
+    matching hash and correctly read as no_guidance_detected; prefiltered
+    scans read the same, because a page is only prefiltered when its body was
+    not classified this run (aliases of a classified body reuse its verdict
+    before the prefilter looks) and its baseline is not positive (those
+    always get a real model verdict).
     """
     row = conn.execute(
         """SELECT d.classification FROM detections d
@@ -180,20 +186,39 @@ def _is_challenge_text(text: str | None) -> bool:
     return any(m in low for m in _CHALLENGE_MARKERS)
 
 
+def usable_status(status: int | None) -> bool:
+    """Whether the response body is the page's OWN content: HTTP 200 only.
+
+    One predicate feeds BOTH the classify gate and :func:`usable_scan` so they
+    cannot disagree: every page the classifier is paid to read can also anchor
+    a diff baseline and count as coverage. 202 (Accepted — in the wild almost
+    always a bot-challenge/queue shell), 204 (no content) and 3xx (a
+    redirect's stub body) are not page content; classifying them bought
+    detections that were reviewable but invisible to the diff.
+    """
+    return status == 200
+
+
 def usable_scan(status: int | None, text: str | None) -> bool:
     """Whether a fetch says anything about what the page contains.
 
-    Error statuses, empty bodies, and bot-challenge shells carry no
-    information: diffing them against real content manufactures put_up /
+    Error/interstitial statuses, empty bodies, and bot-challenge shells carry
+    no information: diffing them against real content manufactures put_up /
     take_down events out of outages (a 403 bot-block is not the campaign
     taking its red box down). Only usable scans move a URL's recorded state.
+    Status-wise this is exactly :func:`usable_status` — the same range the
+    classify gate uses.
     """
     stripped = (text or "").strip()
-    return status == 200 and bool(stripped) and not _is_challenge_text(stripped)
+    return (usable_status(status) and bool(stripped)
+            and not _is_challenge_text(stripped))
 
 
 def usable_scan_sql(alias: str) -> str:
-    """SQL predicate mirroring :func:`usable_scan` for a ``scans`` alias."""
+    """SQL predicate mirroring :func:`usable_scan` for a ``scans`` alias.
+
+    The ``= 200`` literal mirrors :func:`usable_status`; keep them in sync.
+    """
     t = f"TRIM(COALESCE({alias}.raw_text,''))"
     markers = " OR ".join(
         f"LOWER({t}) LIKE '%{m}%'" for m in _CHALLENGE_MARKERS)
@@ -232,17 +257,31 @@ def backfill_change_events(conn: sqlite3.Connection, *, apply: bool = False) -> 
 
     Every input survives in the DB — scans keep text_hash/status/fetched_at,
     detections the verdicts — so this replays each (candidate, URL)'s scans in
-    order under the CURRENT diff rules (usable-scan baselines, hash
-    resolution, confirmed disappearance) and returns:
+    order under the current diff rules' *observable effects* (usable-scan
+    baselines, hash resolution, confirmed disappearance) and returns:
 
     - ``missing``:  events the live pipeline would have recorded but didn't
       (e.g. take-downs the pre-2026-07-25 logic dropped after a quiet re-scan);
     - ``spurious``: recorded events the rules would NOT produce (e.g. a 403
       bot-block or HTTP-500 outage diffed as a take_down/put_up by the
-      pre-2026-07-28 logic — the crawler being blocked is not a page change).
+      pre-2026-07-28 logic — the crawler being blocked is not a page change);
+    - ``mismatched``: events recorded at the right (candidate, URL, revealing
+      scan) but with the WRONG content — event_type or either classification
+      disagrees with the replay. (The keys-only comparison used to wave these
+      through untouched.)
+
+    Note the replay does not re-run the prefilter/dedup machinery — it reads
+    their *outputs*: pages the pipeline skipped (prefiltered, hash-unchanged,
+    template aliases) carry no detection row of their own, and their
+    classification resolves through the candidate's latest verdict for the
+    same text_hash — the same resolution ``_classification_for_scan`` uses
+    live. The 2026-07 alias-before-prefilter reordering only changes WHICH
+    scan carries a body's detection row, an input this replay consumes as
+    recorded data, so the two stay in agreement.
 
     Existing events are keyed by (candidate, URL, revealing scan). Writes —
-    inserting missing, deleting spurious — happen only with ``apply``.
+    inserting missing, deleting spurious, correcting mismatched — happen only
+    with ``apply``.
     """
     existing: dict[tuple, dict] = {
         (r["candidate_id"], r["url"], r["new_scan_id"]): dict(r)
@@ -300,6 +339,19 @@ def backfill_change_events(conn: sqlite3.Connection, *, apply: bool = False) -> 
                 detected_at=s["fetched_at"])
     missing = [v for k, v in expected.items() if k not in existing]
     spurious = [v for k, v in existing.items() if k not in expected]
+    # Same key, wrong content: the event exists where the replay expects one,
+    # but records a different transition (e.g. a put_up where the rules say
+    # take_down, or classifications from a placeholder verdict).
+    mismatched = []
+    for k, exp in expected.items():
+        got = existing.get(k)
+        if got is None:
+            continue
+        if (got["event_type"] != exp["event_type"]
+                or got["prev_classification"] != exp["prev_classification"]
+                or got["new_classification"] != exp["new_classification"]):
+            mismatched.append({**exp, "change_id": got["change_id"],
+                               "recorded_event_type": got["event_type"]})
     if apply:
         if missing:
             conn.executemany(
@@ -312,9 +364,17 @@ def backfill_change_events(conn: sqlite3.Connection, *, apply: bool = False) -> 
         if spurious:
             conn.executemany("DELETE FROM change_events WHERE change_id = ?",
                              [(r["change_id"],) for r in spurious])
-        if missing or spurious:
+        if mismatched:
+            conn.executemany(
+                """UPDATE change_events SET event_type = :event_type,
+                       prev_scan_id = :prev_scan_id,
+                       prev_classification = :prev_classification,
+                       new_classification = :new_classification,
+                       detected_at = :detected_at
+                   WHERE change_id = :change_id""", mismatched)
+        if missing or spurious or mismatched:
             conn.commit()
-    return {"missing": missing, "spurious": spurious}
+    return {"missing": missing, "spurious": spurious, "mismatched": mismatched}
 
 
 def scan_candidate(
@@ -347,7 +407,10 @@ def scan_candidate(
     # and ONE reviewable detection per real page, not one per URL. Keyed by
     # text_hash, populated only from pages actually classified (never from
     # prefiltered pages, so the "media paths always classify" recall rule
-    # can't be short-circuited by a body first seen on a boilerplate URL).
+    # can't be short-circuited by a body first seen on a boilerplate URL) and
+    # consulted BEFORE the prefilter, so a body already classified keeps its
+    # verdict on every alias regardless of URL class — a positive body seen
+    # on /media must not be re-read as no-guidance on a /donate alias.
     verdict_by_hash: dict[str, str] = {}
 
     for res in crawler.crawl_site(url):
@@ -364,6 +427,17 @@ def scan_candidate(
         # Look at the previous scan of this URL *before* inserting the new one,
         # so we can diff for put-up/take-down (spec §3.2).
         prev = _prev_scan(conn, cid, res.url)
+        # Phantom links: news templates and probed common paths 404 on every
+        # scan of every site, forever. A 404/410 for a URL NEVER seen before
+        # carries no information and anchors nothing — the confirmed-
+        # disappearance rule needs a prior scan row to confirm against — so no
+        # scans row is written (the fetch still counts as a failed page in the
+        # attempt bookkeeping below). A 404 on a URL WITH a prior scan IS
+        # recorded: it's the evidence trail for the two-consecutive-404
+        # take_down.
+        if prev is None and res.status in _GONE_STATUSES:
+            out.pages_failed += 1
+            continue
         unchanged = bool(prev and prev["text_hash"] == res.text_hash)
         cur_usable = usable_scan(res.status, res.classifier_text)
         # Baseline for diffing. Needed even when hash-unchanged for the
@@ -382,25 +456,38 @@ def scan_candidate(
         new_class = "no_guidance_detected"
         prefiltered = deduped = False
         if not unchanged:
-            # No usable content: blank text, a failed fetch (status 0/None), or an
-            # HTTP error. Skipped without an LLM call. (Diffing ignores these
-            # scans entirely — see the change-diff block below.)
+            # No classifiable content: blank text, a failed fetch (status
+            # 0/None), or any non-200 status (4xx/5xx errors, 202 challenge/
+            # queue shells, 204, 3xx stubs). Skipped without an LLM call —
+            # same status range as usable_scan, so a page the classifier
+            # reads is always one that can anchor a baseline. (Diffing
+            # ignores non-usable scans entirely — see the change-diff block.)
             empty = (not res.classifier_text.strip()
-                     or not res.status or res.status >= 400)
-            # Cheap pre-filter: skip the LLM on obviously-empty boilerplate pages
-            # (donate/privacy/...) with no red-box signal. Media pages and PDFs
-            # always classify. A skipped page is treated as no-guidance for diffing.
-            prefiltered = (not empty and not prefilter.decide(
-                res.url, res.classifier_text, res.content_type).scan)
-            if not (empty or prefiltered):
-                dup_class = verdict_by_hash.get(res.text_hash)
-                if dup_class is not None:
-                    # Alias of a body already classified this scan: reuse the
-                    # verdict for change-diffing; no LLM call, no duplicate
-                    # detection/archive (evidence exists under the first URL).
-                    deduped = True
-                    new_class = dup_class
-                else:
+                     or not usable_status(res.status))
+            # Alias dedup comes FIRST: a body already classified this scan
+            # keeps its verdict under every URL it appears on. Checked before
+            # the prefilter so a positive classified on /media can't be
+            # re-read as no-guidance on a boilerplate alias like /donate
+            # (a self-contradictory scan row and a false take_down).
+            dup_class = None if empty else verdict_by_hash.get(res.text_hash)
+            if dup_class is not None:
+                # Reuse the verdict for change-diffing; no LLM call, no
+                # duplicate detection/archive (evidence exists under the
+                # first URL).
+                deduped = True
+                new_class = dup_class
+            elif not empty:
+                # Cheap pre-filter: skip the LLM on obviously-empty boilerplate
+                # pages (donate/privacy/...) with no red-box signal. Media pages
+                # and PDFs always classify. A skipped page is treated as
+                # no-guidance for diffing — so a page whose last concluded state
+                # is positive is NEVER prefiltered: the prefilter's contract is
+                # that it decides nothing positive-related, and a take_down may
+                # only be concluded by a real model verdict.
+                baseline_positive = base is not None and base[1] in _POSITIVE
+                prefiltered = (not baseline_positive and not prefilter.decide(
+                    res.url, res.classifier_text, res.content_type).scan)
+                if not prefiltered:
                     try:
                         cl = classifier.classify_text(res.classifier_text)
                     except Exception as e:
@@ -512,7 +599,17 @@ def scan_candidate(
         out.skipped_reason = out.skipped_reason or (
             f"no usable pages ({out.pages_failed} failed fetches)"
             if out.pages_failed else "site unreachable or returned no pages")
-    conn.execute("UPDATE candidates SET scan_status=? WHERE candidate_id=?",
-                 (status, cid))
+    # last_attempt_at is stamped on EVERY concluded attempt — including the
+    # zero-page outcomes above, which write no `scans` rows. Without it those
+    # candidates have no timestamp anywhere and the scheduler sees them as
+    # "never scanned", re-crawling robots-blocked/unreachable sites every day.
+    # last_scan_partial records whether the wall-clock ceiling truncated this
+    # attempt (1) or it ran to completion (0): a truncated partial finishes as
+    # a normal 'scanned', so without the flag an operator can't distinguish it
+    # from a complete sweep of the site.
+    conn.execute(
+        "UPDATE candidates SET scan_status=?, last_attempt_at=?, "
+        "last_scan_partial=? WHERE candidate_id=?",
+        (status, now_iso(), int(out.timed_out), cid))
     conn.commit()
     return out

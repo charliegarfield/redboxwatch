@@ -1,9 +1,13 @@
-"""FEC bulk 'weball' candidate-summary file reader (spec §3.1, scale).
+"""FEC bulk candidate-summary file reader (spec §3.1, scale).
 
-The FEC publishes a per-cycle "All candidates" financial-summary file (weball26
-for 2026): one pipe-delimited row per candidate with name, party, state,
-district, AND total receipts inline. Using it for discovery replaces thousands
-of per-candidate API calls (/candidates/ + /totals/) with a single local file —
+This reads the FEC "Current campaigns — House and Senate" financial-summary
+file (webl{yy}.zip; webl26 for 2026 — NOT the all-candidates 'weball' product,
+despite this module's historical name): one pipe-delimited row per candidate
+with name, party, state, district, AND total receipts inline. Despite the
+product's House-and-Senate name, presidential (P-prefixed) rows do appear in
+the file and are expected — the parser keeps them and discovery gates them by
+cycle (``_office_on_ballot``). Using it for discovery replaces thousands of
+per-candidate API calls (/candidates/ + /totals/) with a single local file —
 the difference between a ~10-hour rate-limited discovery and a ~1-second one.
 
 File description:
@@ -23,8 +27,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
-
-# Default location alongside the cache. Override via config `weball_path`.
 
 
 @dataclass

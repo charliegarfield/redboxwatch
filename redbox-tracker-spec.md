@@ -6,11 +6,17 @@
 > code wins**. Known divergences include: screenshots are WebP (not PNG),
 > scans no longer store `raw_html`, unverified URLs are scanned by default
 > (verification is enforced at the review gate; `require_verified_url`
-> restores the §3.1 pre-scan gate), the `publications` table was never used
-> (publish state lives in `reviews`), the dataset JSON/CSV export (§3.8) was
-> not built, and the data model has grown a `change_events` table for
-> put-up/take-down history. §1 (what we detect) and §3.7a (published-language
-> discipline) remain authoritative editorial policy.
+> restores the §3.1 pre-scan gate), §3.1's "unverified URLs go to the review
+> queue **before first scan**" gate is likewise superseded by that same
+> default (never *publishing* against an unconfirmed domain remains
+> enforced), the website-resolution chain uses **Wikipedia** rather than
+> §3.1's suggested Ballotpedia — Ballotpedia blocks automated access and is
+> on the resolver's denylist in `redbox/website.py` — the `publications`
+> table was never used (publish state lives in `reviews`), the dataset
+> JSON/CSV export (§3.8) was not built, and the data model has grown a
+> `change_events` table for put-up/take-down history. §1 (what we detect)
+> and §3.7a (published-language discipline) remain authoritative editorial
+> policy.
 
 A system that detects "red-boxing" — public-facing messaging guidance that campaigns post to coordinate (lawfully, by the letter of the rule) with outside spenders such as super PACs. It builds a candidate universe, scans candidate websites for the *functional content pattern* of red-box guidance, archives evidence, corroborates against independent-expenditure filings, gates positive findings behind human review, and publishes per-candidate status.
 

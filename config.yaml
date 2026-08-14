@@ -108,6 +108,11 @@ scan_cadence:
   daily_window_days: 21
   default_interval_days: 7
 
+# Per-candidate scan wall-clock ceiling, seconds (docs/OPERATIONS.md): a merely
+# slow site ends as a clean partial (last_scan_partial=1) instead of pinning a
+# worker for hours. Uncomment to change the built-in default:
+# candidate_wallclock_seconds: 1500
+
 # Politeness. Set a REAL contact address in config.local.yaml (untracked)
 # before running live crawls — the honest, reachable User-Agent is part of the
 # crawler posture (ROBOTS_POLICY.md), and it should identify YOU, not this repo.

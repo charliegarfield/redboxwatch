@@ -830,8 +830,162 @@ def test_wallclock_deadline_yields_partial_scan(tmp_path, monkeypatch):
     assert out.timed_out is True
     assert 0 < out.pages_scanned <= 5
     assert "wall-clock ceiling" in out.skipped_reason
-    st = conn.execute("SELECT scan_status FROM candidates WHERE candidate_id='H1'").fetchone()[0]
-    assert st == "scanned"                   # partial, not failed
+    row = conn.execute("SELECT scan_status, last_scan_partial FROM candidates "
+                       "WHERE candidate_id='H1'").fetchone()
+    assert row["scan_status"] == "scanned"   # partial, not failed
+    # The truncation is persisted: an operator can tell this 'scanned' was a
+    # partial sweep, not complete coverage of the site.
+    assert row["last_scan_partial"] == 1
+    conn.close()
+
+
+# --- The prefilter must never override a classified body or a positive
+# baseline. ----------------------------------------------------------------
+# Bug shape observed: the prefilter short-circuited before the alias cache, so
+# a body classified positive under /media was diffed as negative under a
+# /donate alias (false take_down, self-contradictory DB); and any
+# positive-baseline page could be concluded negative on the prefilter's
+# say-so alone, with no model in the loop.
+
+# A body the LLM reads as guidance but that matches NONE of the prefilter's
+# lexical signal patterns — the shape that made the alias bug real: the /media
+# copy always classifies (media path), while the signal-free /donate copy used
+# to be prefiltered instead of reusing the verdict.
+SUBTLE_POSITIVE = ("Voters in this district deserve to know that our opponent "
+                   "voted against the water bill. Any advertising on this point "
+                   "is best kept in plain language.")
+
+
+class SubtleLLM(CountingLLM):
+    """Positive on the subtle body's phrasing, negative otherwise."""
+
+    def classify_chunk(self, text, *, model):
+        self.calls.append(text)
+        if "deserve to know" in text:
+            return {"classification": "red_box_guidance", "confidence": 0.95,
+                    "evidence": [{"quote": "deserve to know", "why": "directive"}],
+                    "rationale": "subtle guidance"}
+        return {"classification": "no_guidance_detected", "confidence": 0.95,
+                "evidence": [], "rationale": "nothing"}
+
+
+class CrossClassAliasFetcher:
+    """/media and /donate serve the SAME positive body (catch-all template):
+    the boilerplate alias must reuse the media verdict, not be prefiltered."""
+
+    def __init__(self):
+        self.pages = {
+            "https://example.org": ('<a href="/media">m</a><a href="/donate">d</a>', "home"),
+            "https://example.org/media": ("", SUBTLE_POSITIVE),
+            "https://example.org/donate": ("", SUBTLE_POSITIVE),
+        }
+
+    def fetch(self, url, *, screenshot=True):
+        key = url.rstrip("/") or url
+        html, text = self.pages.get(key, ("", ""))
+        return FetchResult(
+            url=url, final_url=url, status=200, content_type="text/html",
+            render_mode="browser", html=html, visible_text=text, dom_text=text,
+            screenshot_png=b"PNG" if screenshot else None)
+
+
+def test_boilerplate_alias_of_positive_body_reuses_verdict(tmp_path):
+    # One positive body under /media and /donate -> ONE detection; the
+    # /donate copy is deduped via the verdict cache (checked before the
+    # prefilter), never diffed as negative, and no change event appears.
+    conn = init_db(tmp_path / "db.sqlite")
+    candidate = _seed_candidate(conn)
+    llm = SubtleLLM()
+    out = scan_candidate(
+        conn, candidate, crawler=_crawler_with(CrossClassAliasFetcher()),
+        classifier=Classifier(llm),
+        archiver=Archiver(tmp_path / "a", wayback=StubWayback(), push_wayback=False))
+
+    assert out.pages_scanned == 3                  # home + /media + /donate
+    assert out.deduped == 1                        # /donate reused the verdict
+    assert out.prefiltered == 0                    # NOT short-circuited
+    assert out.positives == 1                      # one reviewable finding
+    assert conn.execute(
+        "SELECT COUNT(*) FROM detections WHERE classification='red_box_guidance'"
+    ).fetchone()[0] == 1
+    # LLM saw each distinct body once: home + the shared positive body.
+    assert len(llm.calls) == 2
+    # No take_down (or any event) manufactured for the /donate copy.
+    assert conn.execute("SELECT COUNT(*) FROM change_events").fetchone()[0] == 0
+    conn.close()
+
+
+class MutableDonateFetcher:
+    """Home links only to /donate (boilerplate URL); its text is scriptable."""
+
+    def __init__(self, donate_text):
+        self.donate_text = donate_text
+
+    def fetch(self, url, *, screenshot=True):
+        key = url.rstrip("/") or url
+        if key == "https://example.org":
+            html, text = '<a href="/donate">d</a>', "home"
+        elif key == "https://example.org/donate":
+            html, text = "", self.donate_text
+        else:
+            return FetchResult(url=url, final_url=url, status=404, content_type="text/html",
+                               render_mode="browser", html="", visible_text="", dom_text="")
+        return FetchResult(url=url, final_url=url, status=200, content_type="text/html",
+                           render_mode="browser", html=html, visible_text=text, dom_text=text,
+                           screenshot_png=b"PNG")
+
+
+def test_take_down_on_boilerplate_url_requires_model_verdict(tmp_path):
+    # A /donate page classified positive later re-serves changed, signal-free
+    # text. The prefilter must NOT conclude it (it never decides anything
+    # positive-related): the classifier is invoked, and the take_down is
+    # recorded only from its no-guidance verdict.
+    conn = init_db(tmp_path / "db.sqlite")
+    candidate = _seed_candidate(conn)
+    fetcher = MutableDonateFetcher("Younger voters should see ads on the go.")
+    llm = CountingLLM()
+    kw = Classifier(llm)
+    archiver = Archiver(tmp_path / "a", wayback=StubWayback(), push_wayback=False)
+
+    o1 = scan_candidate(conn, candidate, crawler=_crawler_with(fetcher),
+                        classifier=kw, archiver=archiver)
+    assert o1.positives == 1                       # signal text reached the LLM
+
+    fetcher.donate_text = "Chip in $25 today to help us. Donate now."
+    o2 = scan_candidate(conn, candidate, crawler=_crawler_with(fetcher),
+                        classifier=kw, archiver=archiver)
+    # The classifier WAS consulted on the new text (positive baseline forces it)...
+    assert any("Chip in" in t for t in llm.calls)
+    assert o2.prefiltered == 0
+    # ...and its verdict is what records the take_down.
+    assert o2.take_downs == 1 and o2.changes == 1
+    ev = conn.execute("SELECT * FROM change_events WHERE event_type='take_down'").fetchone()
+    assert ev["url"] == "https://example.org/donate"
+    assert ev["prev_classification"] == "red_box_guidance"
+    assert ev["new_classification"] == "no_guidance_detected"
+    conn.close()
+
+
+def test_never_positive_boilerplate_page_still_prefiltered(tmp_path):
+    # The cost optimization survives the fix: a boilerplate page whose
+    # baseline was never positive keeps skipping the classifier even as its
+    # signal-free text churns between scans.
+    conn = init_db(tmp_path / "db.sqlite")
+    candidate = _seed_candidate(conn)
+    fetcher = MutableDonateFetcher("Chip in $25 today to help us. Donate now.")
+    llm = CountingLLM()
+    kw = Classifier(llm)
+    archiver = Archiver(tmp_path / "a", wayback=StubWayback(), push_wayback=False)
+
+    o1 = scan_candidate(conn, candidate, crawler=_crawler_with(fetcher),
+                        classifier=kw, archiver=archiver)
+    assert o1.prefiltered == 1
+    fetcher.donate_text = "Give $10 before the end-of-quarter deadline."
+    o2 = scan_candidate(conn, candidate, crawler=_crawler_with(fetcher),
+                        classifier=kw, archiver=archiver)
+    assert o2.prefiltered == 1
+    # The LLM never saw either donate text.
+    assert not any("Chip in" in t or "end-of-quarter" in t for t in llm.calls)
     conn.close()
 
 
@@ -847,4 +1001,258 @@ def test_no_deadline_means_no_ceiling(tmp_path):
                          archiver=Archiver(tmp_path / "a", push_wayback=False))
     assert out.timed_out is False
     assert out.pages_scanned == 3
+    conn.close()
+
+
+def test_zero_page_scan_stamps_last_attempt_at(tmp_path):
+    # A scan concluding with ZERO pages (every fetch fails) writes no `scans`
+    # rows, so candidates.last_attempt_at is the ONLY timestamp of the attempt.
+    # Without it the scheduler sees the candidate as "never scanned" and
+    # re-crawls the dead site every day.
+    conn = init_db(tmp_path / "db.sqlite")
+    candidate = _seed_candidate(conn)
+
+    class AllErrorFetcher:
+        def fetch(self, url, *, screenshot=True):
+            return FetchResult(url=url, final_url=url, status=404,
+                               content_type="text/html", render_mode="browser",
+                               html="", visible_text="", dom_text="")
+
+    out = _scan(conn, candidate, AllErrorFetcher(), tmp_path)
+    assert out.pages_scanned == 0
+    row = conn.execute("SELECT scan_status, last_attempt_at FROM candidates "
+                       "WHERE candidate_id='H1'").fetchone()
+    assert row["scan_status"] == "fetch_failed"
+    assert row["last_attempt_at"]                 # stamped despite zero pages
+    conn.close()
+
+
+def test_normal_scan_stamps_last_attempt_at(tmp_path):
+    # The stamp is written on EVERY concluded attempt, not just failures.
+    conn = init_db(tmp_path / "db.sqlite")
+    candidate = _seed_candidate(conn)
+    out = _scan(conn, candidate, FixtureFetcher(), tmp_path)
+    assert out.pages_scanned == 3
+    row = conn.execute(
+        "SELECT scan_status, last_attempt_at, last_scan_partial FROM candidates "
+        "WHERE candidate_id='H1'").fetchone()
+    assert row["scan_status"] == "scanned"
+    assert row["last_attempt_at"]
+    # A run-to-completion sweep is affirmatively marked complete (0, not NULL).
+    assert row["last_scan_partial"] == 0
+    conn.close()
+
+
+# --- Phantom 404s (never-seen URLs) must not persist junk scan rows. ---------
+
+def test_phantom_404_writes_no_scan_row(tmp_path):
+    # A 404 on a URL with NO prior scan (phantom links from news templates)
+    # is pure junk: no scans row, no diffing — but the fetch still counts in
+    # the attempt bookkeeping (pages_failed), matching existing semantics.
+    conn = init_db(tmp_path / "db.sqlite")
+    candidate = _seed_candidate(conn)
+    fetcher = ErrorableFetcher()
+    fetcher.media = (404, "")
+    out = _scan(conn, candidate, fetcher, tmp_path)
+    assert out.pages_scanned == 1                 # home only
+    assert out.pages_failed == 1                  # the 404 still counted
+    assert conn.execute("SELECT COUNT(*) FROM scans").fetchone()[0] == 1  # home only
+    # Re-scan: the URL is STILL never-seen, so still nothing persisted.
+    _scan(conn, candidate, fetcher, tmp_path)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM scans WHERE url LIKE '%/media'").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM change_events").fetchone()[0] == 0
+    conn.close()
+
+
+def test_404_after_real_scan_still_recorded(tmp_path):
+    # A 404 on a URL WITH a prior scan is the confirmed-take-down evidence
+    # path (two consecutive 404s) and must keep being persisted.
+    conn = init_db(tmp_path / "db.sqlite")
+    candidate = _seed_candidate(conn)
+    fetcher = ErrorableFetcher()
+    _scan(conn, candidate, fetcher, tmp_path)                    # positive, real scan
+    fetcher.media = (404, "")
+    _scan(conn, candidate, fetcher, tmp_path)                    # first 404: recorded
+    assert conn.execute(
+        "SELECT COUNT(*) FROM scans WHERE url LIKE '%/media' AND http_status=404"
+    ).fetchone()[0] == 1
+    o3 = _scan(conn, candidate, fetcher, tmp_path)               # second 404: confirms
+    assert o3.take_downs == 1
+    conn.close()
+
+
+# --- Classify gate and usable_scan agree on the status range (200 only). -----
+# 202 responses got full LLM calls + detections rows but could never count as
+# coverage or anchor a baseline (reviewable but invisible to the diff).
+
+def test_202_page_is_neither_classified_nor_usable(tmp_path):
+    from redbox.pipeline import usable_scan
+
+    conn = init_db(tmp_path / "db.sqlite")
+    candidate = _seed_candidate(conn)
+    fetcher = ErrorableFetcher()
+    fetcher.media = (202, "Younger voters should see ads on the go.")
+    llm = CountingLLM()
+    out = scan_candidate(
+        conn, candidate, crawler=_crawler_with(fetcher), classifier=Classifier(llm),
+        archiver=Archiver(tmp_path / "a", wayback=StubWayback(), push_wayback=False))
+    # The LLM never saw the 202 body — no wasted spend, no detection row.
+    assert not any("should see" in t for t in llm.calls)
+    assert out.pages_scanned == 1 and out.pages_failed == 1      # not coverage
+    media = conn.execute(
+        "SELECT scan_id, http_status FROM scans WHERE url LIKE '%/media'").fetchone()
+    assert media["http_status"] == 202                           # audit trail kept
+    assert conn.execute("SELECT COUNT(*) FROM detections WHERE scan_id=?",
+                        (media["scan_id"],)).fetchone()[0] == 0
+    assert usable_scan(202, "Younger voters should see ads on the go.") is False
+    conn.close()
+
+
+def test_204_and_302_pages_not_classified_or_usable(tmp_path):
+    from redbox.pipeline import usable_scan
+
+    for i, (status, text) in enumerate([(204, ""), (302, "Object moved to here.")]):
+        conn = init_db(tmp_path / f"db{i}.sqlite")
+        candidate = _seed_candidate(conn)
+        fetcher = ErrorableFetcher()
+        fetcher.media = (status, text)
+        llm = CountingLLM()
+        out = scan_candidate(
+            conn, candidate, crawler=_crawler_with(fetcher),
+            classifier=Classifier(llm),
+            archiver=Archiver(tmp_path / f"a{i}", wayback=StubWayback(),
+                              push_wayback=False))
+        assert out.pages_scanned == 1 and out.pages_failed == 1, status
+        assert not any(text and text in t for t in llm.calls), status
+        media = conn.execute(
+            "SELECT scan_id FROM scans WHERE url LIKE '%/media'").fetchone()
+        assert conn.execute("SELECT COUNT(*) FROM detections WHERE scan_id=?",
+                            (media["scan_id"],)).fetchone()[0] == 0, status
+        assert usable_scan(status, "some perfectly real body text") is False, status
+        conn.close()
+
+
+def test_usable_scan_sql_agrees_with_python(tmp_path):
+    # The SQL mirror (used by the publisher and _baseline_state) must match
+    # usable_scan row for row, statuses included.
+    from redbox.pipeline import usable_scan, usable_scan_sql
+
+    conn = init_db(tmp_path / "db.sqlite")
+    conn.execute("""INSERT INTO candidates (candidate_id,name,website_url,url_verified,
+        created_at,updated_at) VALUES ('H1','T','https://x.com',1,'t','t')""")
+    cases = [(200, "real content here"), (200, ""), (202, "real content here"),
+             (204, ""), (302, "Object moved to here."), (404, ""), (500, ""),
+             (200, "Just a moment... Checking your browser before accessing.")]
+    ids = {}
+    for i, (st, txt) in enumerate(cases):
+        ids[conn.execute(
+            """INSERT INTO scans (candidate_id,url,fetched_at,http_status,
+                   raw_text,text_hash) VALUES ('H1',?, 't', ?, ?, ?)""",
+            (f"https://x.com/p{i}", st, txt, f"h{i}")).lastrowid] = (st, txt)
+    conn.commit()
+    sql_ids = {r["scan_id"] for r in conn.execute(
+        f"SELECT scan_id FROM scans s WHERE {usable_scan_sql('s')}")}
+    for scan_id, (st, txt) in ids.items():
+        assert (scan_id in sql_ids) == usable_scan(st, txt), (st, txt)
+    conn.close()
+
+
+# --- Unparseable classifier output skips the page like a transport error. ----
+
+def test_unparseable_model_output_skips_page_not_candidate(tmp_path):
+    # An unparseable response used to manufacture ambiguous/0.0 — a real
+    # detections row, an archive, and a put_up event outliving the provider
+    # hiccup. Now it must skip the page exactly like a transport failure:
+    # nothing persisted, page retried next scan, candidate scan continues.
+    from redbox.classifier import ClassifierParseError
+
+    class ParseFailLLM:
+        def classify_chunk(self, text, *, model):
+            if "should see" in text:   # only the /media positive fixture
+                raise ClassifierParseError("simulated unparseable model output")
+            return {"classification": "no_guidance_detected", "confidence": 0.95,
+                    "evidence": [], "rationale": "ok"}
+
+    conn = init_db(tmp_path / "db.sqlite")
+    candidate = _seed_candidate(conn)
+    out = scan_candidate(conn, candidate, crawler=_crawler(),
+                         classifier=Classifier(ParseFailLLM()),
+                         archiver=Archiver(tmp_path / "a", push_wayback=False))
+    assert out.skipped_reason is None
+    assert out.pages_scanned == 2                    # home + /press; /media dropped
+    # Nothing concluded for the page: no scan row (so not hash-skipped — it
+    # is retried next run), no detection, no archive, no change event.
+    urls = {r["url"] for r in conn.execute("SELECT url FROM scans")}
+    assert "https://example.org/media" not in urls
+    assert conn.execute(
+        "SELECT COUNT(*) FROM detections WHERE classification IN "
+        "('ambiguous','red_box_guidance')").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM archives").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM change_events").fetchone()[0] == 0
+    conn.close()
+
+
+def test_parseable_output_behavior_unchanged_after_parse_fix(tmp_path):
+    # Sanity guard for the parse-error change: a normal scan still produces
+    # the detection + archive exactly as before.
+    conn = init_db(tmp_path / "db.sqlite")
+    candidate = _seed_candidate(conn)
+    out = _scan(conn, candidate, ErrorableFetcher(), tmp_path)
+    assert out.positives == 1 and out.archived == 1
+    conn.close()
+
+
+# --- Backfill detects and corrects WRONG events, not just missing/spurious. --
+
+def test_backfill_reports_and_corrects_mismatched_event(tmp_path):
+    # An event recorded at the right (candidate, URL, revealing scan) but with
+    # the wrong content — here a put_up where the replay says take_down — must
+    # land in the 'mismatched' bucket and be corrected in place on apply.
+    from redbox.pipeline import backfill_change_events
+
+    conn = init_db(tmp_path / "db.sqlite")
+    conn.execute("""INSERT INTO candidates (candidate_id,name,website_url,url_verified,
+        created_at,updated_at) VALUES ('H1','T','https://example.org',1,'t','t')""")
+
+    def scan(hash_, text, when):
+        return conn.execute("""INSERT INTO scans (candidate_id,url,fetched_at,
+            http_status,raw_text,text_hash)
+            VALUES ('H1','https://example.org/media',?,200,?,?)""",
+            (when, text, hash_)).lastrowid
+
+    s1 = scan("boxhash", "younger voters should see", "2026-07-01T00:00:00+00:00")
+    conn.execute("""INSERT INTO detections (scan_id,candidate_id,classification,
+        confidence,evidence,rationale,model,classified_at)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        (s1, "H1", "red_box_guidance", 0.9, "[]", "r", "m", "2026-07-01T00:00:00+00:00"))
+    s2 = scan("cleanhash", "press kit and logos", "2026-07-15T00:00:00+00:00")
+    # The deliberately WRONG event at the correct key:
+    conn.execute("""INSERT INTO change_events (candidate_id,url,event_type,prev_scan_id,
+        new_scan_id,prev_classification,new_classification,detected_at)
+        VALUES ('H1','https://example.org/media','put_up',?,?,
+                'no_guidance_detected','red_box_guidance','2026-07-15T00:00:00+00:00')""",
+        (s1, s2))
+    conn.commit()
+
+    dry = backfill_change_events(conn, apply=False)
+    assert dry["missing"] == [] and dry["spurious"] == []
+    assert len(dry["mismatched"]) == 1
+    m = dry["mismatched"][0]
+    assert m["event_type"] == "take_down"            # what the replay expects
+    assert m["recorded_event_type"] == "put_up"      # what the DB wrongly holds
+    # Dry run: the wrong row is untouched.
+    assert conn.execute("SELECT event_type FROM change_events").fetchone()[0] == "put_up"
+
+    backfill_change_events(conn, apply=True)
+    assert conn.execute("SELECT COUNT(*) FROM change_events").fetchone()[0] == 1
+    row = conn.execute("SELECT * FROM change_events").fetchone()
+    assert row["event_type"] == "take_down"
+    assert row["prev_classification"] == "red_box_guidance"
+    assert row["new_classification"] == "no_guidance_detected"
+    assert row["prev_scan_id"] == s1 and row["new_scan_id"] == s2
+
+    again = backfill_change_events(conn, apply=True)             # idempotent
+    assert (again["missing"] == [] and again["spurious"] == []
+            and again["mismatched"] == [])
     conn.close()

@@ -7,6 +7,7 @@ written to ``config.yaml``.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -210,12 +211,50 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     deep-merged on top (local wins). Deployment-specific values that don't
     belong in the public repo — the crawler contact address, per-domain robots
     overrides, production model choices — live there.
+
+    Local-layer resolution:
+
+    - ``path is None`` (the implicit default): ``config.local.yaml`` is merged
+      on top when present. A missing ``config.yaml`` is tolerated (empty base),
+      so a fresh checkout still runs on defaults.
+    - an explicit ``path`` that resolves to the same file as the default
+      ``config.yaml``: treated exactly like the implicit case, so
+      ``--config config.yaml`` doesn't silently drop the local layer.
+    - any other explicit ``path``: a sibling ``<stem>.local.yaml`` next to it
+      is merged when present; when absent the base file is used alone,
+      silently. An explicit path that does not exist raises
+      :class:`FileNotFoundError` instead of silently yielding all defaults.
+
+    Whenever a local layer is merged a one-line notice naming the file goes to
+    stderr.
+
+    Note on merge semantics: ``_deep_merge`` recurses into dicts but replaces
+    lists (and every other non-dict value) wholesale — a local file overriding
+    e.g. ``common_paths`` must restate the entire list, not just additions.
     """
     _load_dotenv(REPO_ROOT / ".env")
-    cfg_path = Path(path) if path else DEFAULT_CONFIG_PATH
+    if path is None:
+        cfg_path = DEFAULT_CONFIG_PATH
+        local_path = LOCAL_CONFIG_PATH
+    else:
+        cfg_path = Path(path)
+        if not cfg_path.exists():
+            raise FileNotFoundError(
+                f"config file not found: {cfg_path} (explicitly requested; "
+                "omit --config to use the default config.yaml)"
+            )
+        if cfg_path.resolve() == DEFAULT_CONFIG_PATH.resolve():
+            local_path = LOCAL_CONFIG_PATH
+        else:
+            local_path = cfg_path.with_name(cfg_path.stem + ".local.yaml")
     raw = yaml.safe_load(cfg_path.read_text()) if cfg_path.exists() else {}
     raw = raw or {}
-    if path is None and LOCAL_CONFIG_PATH.exists():
-        local = yaml.safe_load(LOCAL_CONFIG_PATH.read_text()) or {}
+    if local_path.exists():
+        local = yaml.safe_load(local_path.read_text()) or {}
         raw = _deep_merge(raw, local)
+        print(
+            f"[config] merged local layer {local_path} "
+            f"({len(local)} top-level key{'s' if len(local) != 1 else ''})",
+            file=sys.stderr,
+        )
     return Config(raw=raw)

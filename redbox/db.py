@@ -65,6 +65,9 @@ CREATE TABLE IF NOT EXISTS scans (
 );
 CREATE INDEX IF NOT EXISTS idx_scans_candidate ON scans(candidate_id);
 CREATE INDEX IF NOT EXISTS idx_scans_url_hash ON scans(url, text_hash);
+-- _prev_scan/_baseline_state filter candidate_id + url IN(...) ORDER BY
+-- scan_id DESC; the trailing scan_id lets those resolve without a sort.
+CREATE INDEX IF NOT EXISTS idx_scans_cand_url ON scans(candidate_id, url, scan_id);
 
 -- Classifier output (spec §3.5)
 CREATE TABLE IF NOT EXISTS detections (
@@ -191,6 +194,12 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
     "candidates": {
         # Last scan disposition: NULL=unscanned, 'scanned', 'robots_blocked'.
         "scan_status": "TEXT",
+        # ISO-8601 UTC time the last scan ATTEMPT concluded — stamped alongside
+        # scan_status on every attempt, including zero-page outcomes
+        # (robots_blocked / fetch_failed) that write no `scans` rows. The
+        # scheduler keys cadence off MAX(scans.fetched_at, last_attempt_at) so
+        # a blocked/unreachable site isn't "never scanned" and re-hit daily.
+        "last_attempt_at": "TEXT",
         # general/full modes: how the nominee was confirmed
         # (uncontested | feed:<name> | manual). NULL for primary-mode rows.
         "nominee_source": "TEXT",
@@ -201,6 +210,19 @@ _MIGRATIONS: dict[str, dict[str, str]] = {
         # kept for history but excluded from resolve/scan/publish; mark-inactive
         # refreshes only value 1, so 2/3 are never clobbered by an FEC sync.
         "inactive": "INTEGER",
+        # Whether the last concluded attempt was truncated by the candidate
+        # wall-clock ceiling (1) or ran to completion (0) — stamped alongside
+        # scan_status/last_attempt_at on every attempt, so an operator can
+        # tell a partial sweep from a full one. NULL on rows predating the
+        # column (disposition unknown).
+        "last_scan_partial": "INTEGER",
+    },
+    "elections": {
+        # Statewide primary-runoff date (ISO-8601), where the state holds one
+        # (transcribed from the calendar fixture's runoff_date field). A race
+        # in a runoff state isn't settled — and its losers aren't knowable —
+        # until the RUNOFF has passed, not the first-round date.
+        "runoff_date": "TEXT",
     },
     "archives": {
         # Raw document preserved when the detection source was a PDF; the

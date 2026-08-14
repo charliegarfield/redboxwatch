@@ -3,10 +3,15 @@
 > **Status: frozen audit log** (moved from repo-root `SCALE_NOTES.md`,
 > 2026-07-28). This is a dated record of the 2026-06 scale audit and its
 > fixes, kept for history. Its `file:line` references have drifted with the
-> code and its remaining "TODO" items were either fixed in the 2026-07-28
-> hardening pass (sequential resolution, publisher evidence re-copy,
-> Playwright teardown-guard class of issues) or superseded — do not treat
-> this document as live engineering state.
+> code. The "TODO — not yet fixed" section was re-verified against the code
+> on **2026-08-05**, after the 2026-08 fix campaign: several items are now
+> genuinely fixed (Playwright teardown, the publisher's per-build evidence
+> re-copy, the shared per-domain rate limiter — resolution had already gone
+> concurrent + cached on 2026-06-24) and each item below carries a dated
+> status note. The rest remain open. An earlier version of this header
+> claimed all TODOs were closed by a 2026-07-28 hardening pass; that was
+> wrong. Do not treat this document as live engineering state — the status
+> notes are the last verified word.
 
 Audit done 2026-06-02 (three static passes + a live run on 7 unseen New Jersey
 House candidates). NY today is ~62 candidates / ~5,800 pages; "nationwide" means
@@ -146,7 +151,7 @@ Severity: **BLOCKER** (breaks or is unusable) · **SLOW** (works, costly/painful
 
 ---
 
-## TODO — not yet fixed
+## TODO — statuses re-verified 2026-08-05
 
 ### Resolution (remaining)
 - **MINOR — a bad resolution still crawls the wrong domain.** *Live (pre-Serper):*
@@ -154,6 +159,7 @@ Severity: **BLOCKER** (breaks or is unusable) · **SLOW** (works, costly/painful
   crawled 141 pages of the wrong domain. Serper+judge makes this far rarer (it rejected that case), but the
   scanner still trusts whatever URL it's given — a host sanity check before
   crawling (title/name match) would close it fully.
+  **[STILL OPEN as of 2026-08-05** — no pre-crawl host sanity check exists.]
 
 ### Crawl / classify hot path
 - **MINOR — per-page screenshot still captured for every page** (`crawler.py`):
@@ -161,37 +167,67 @@ Severity: **BLOCKER** (breaks or is unusable) · **SLOW** (works, costly/painful
   page/worker, not the whole site — but each ordinary page is still screenshotted
   before we know it won't route to review. Capturing only for review-bound pages
   would cut the remaining waste. (OOM risk itself is resolved.)
+  **[STILL OPEN as of 2026-08-05** — `PlaywrightFetcher.fetch` defaults
+  `screenshot=True` and the crawl never passes `False`.]
 - **MINOR — leaked Chromium if `PlaywrightFetcher.__exit__` cleanup throws**
   (`crawler.py:124-130`): the three teardown calls are existence-guarded
   (`if self._context:` …) but **not exception-guarded** — if `_context.close()`
   raises, `_browser.close()`/`_pw.stop()` are skipped. Wrap each in its own
   try/finally.
+  **[FIXED in the 2026-08 campaign** — every teardown step is now
+  individually exception-guarded, so a failing `context.close()` no longer
+  leaks the browser/process.]
 - **MINOR — per-domain rate limiter isn't shared across workers** (`ratelimit.py`;
   fresh instance per worker in `cli.py`), so two workers on the same host don't
   pace each other. Rare (most workers hit distinct domains).
+  **[FIXED in the 2026-08 campaign** — `scan-all` builds ONE thread-safe
+  `DomainRateLimiter` and passes it to every worker; the crawler also gained
+  429/503 backoff (Retry-After honored, host abandoned after 3 consecutive
+  strikes).]
 - **MINOR — no WAL checkpoint tuning**; `-wal` can grow over a long run.
+  **[STILL OPEN as of 2026-08-05.]**
 
 ### Publisher (only matters once publishing nationally)
 - **SLOW — per-build screenshot re-copy.** `shutil.copy2` of every archived image
   on every build with no mtime/hash check (`publisher.py:~143`); gigabytes of
   redundant I/O at thousands of detections. Also keys on `src.name`, so identical
   basenames could collide.
+  **[FIXED in the 2026-08 campaign** — the copy is skipped when the
+  destination already matches on size+mtime (archives are immutable and
+  content-hash-named, which also settles the basename-collision worry), and
+  the build now sweeps `site/evidence/` files it no longer references.]
 
 ### Discovery / data
 - **SLOW — discovery has no incremental persistence** (`cli.py` cmd_discover
   persists only after the full loop). A late failure loses the whole run.
   (`resolve` commits every 10; discover doesn't.)
+  **[STILL OPEN as of 2026-08-05** — mitigated in practice by the bulk-file
+  path (a nationwide discover is ~seconds), but the API path persists only at
+  the end.]
 - **MINOR — FEC cache is unbounded, no TTL** (`fec.py`): tens of thousands of
   small files nationwide; `candidate_totals` is cached, so receipts can go stale
   mid-cycle.
+  **[STILL OPEN as of 2026-08-05** — the *resolution* cache gained optional
+  TTL support; the FEC cache did not. Workaround: `--no-cache`, or refresh
+  receipts via `fetch-fec` + the bulk file.]
 - **MINOR — `discover` writes a year-named CSV** (`cli.py:~84`,
   `data/candidate_universe_<year>.csv`): the name varies by `election_year` but
   **not** by state or DB path, so two configs in the same cycle (e.g. NY vs NJ)
   still clobber one file. (Hit twice during this audit.) Derive the CSV path from
   the DB path stem, or include the state set.
+  **[STILL OPEN as of 2026-08-05.]**
 - **MINOR — weball district default** `"00"` collapses Senate / at-large
   (`weball.py:~80`); office is also in the key so collisions are unlikely, but
   worth a second look.
+  **[STILL OPEN as of 2026-08-05** — unchanged; office remains part of the
+  key.]
+
+### Noted gap closed since the audit
+Item 12's "no wall-clock ceiling yet" is no longer true: the 2026-08 campaign
+added a per-candidate wall-clock ceiling (`candidate_wallclock_seconds`,
+recorded as `last_scan_partial`), total-deadline/byte guards on PDF and
+sitemap/robots fetches, hard sitemap-enumeration caps, and a stuck-scan
+watchdog thread in `scan-all`. See `docs/OPERATIONS.md`.
 
 ---
 

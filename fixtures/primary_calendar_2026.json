@@ -2,6 +2,7 @@
   {
     "state": "AL",
     "primary_date": "2026-05-19",
+    "runoff_date": "2026-06-16",
     "filing_deadline": "2026-01-23",
     "source": "fec+greenpapers",
     "confidence": "high",
@@ -37,6 +38,7 @@
   {
     "state": "AR",
     "primary_date": "2026-03-03",
+    "runoff_date": "2026-03-31",
     "filing_deadline": "2025-11-11",
     "source": "fec+greenpapers",
     "confidence": "high",
@@ -91,6 +93,7 @@
   {
     "state": "GA",
     "primary_date": "2026-05-19",
+    "runoff_date": "2026-06-16",
     "filing_deadline": "2026-03-06",
     "source": "fec+greenpapers",
     "confidence": "high",
@@ -199,6 +202,7 @@
   {
     "state": "MS",
     "primary_date": "2026-03-10",
+    "runoff_date": "2026-04-07",
     "filing_deadline": "2025-12-26",
     "source": "fec+greenpapers",
     "confidence": "high",
@@ -264,6 +268,7 @@
   {
     "state": "NC",
     "primary_date": "2026-03-03",
+    "runoff_date": "2026-05-12",
     "filing_deadline": "2025-12-19",
     "source": "fec+greenpapers+ncsbe",
     "confidence": "high",
@@ -286,6 +291,7 @@
   {
     "state": "OK",
     "primary_date": "2026-06-16",
+    "runoff_date": "2026-08-25",
     "filing_deadline": "2026-04-03",
     "source": "fec+greenpapers",
     "confidence": "high",
@@ -316,6 +322,7 @@
   {
     "state": "SC",
     "primary_date": "2026-06-09",
+    "runoff_date": "2026-06-23",
     "filing_deadline": "2026-03-30",
     "source": "fec+greenpapers",
     "confidence": "high",
@@ -324,6 +331,7 @@
   {
     "state": "SD",
     "primary_date": "2026-06-02",
+    "runoff_date": "2026-07-28",
     "filing_deadline": "2026-03-31",
     "source": "fec+greenpapers",
     "confidence": "high",
@@ -339,6 +347,7 @@
   {
     "state": "TX",
     "primary_date": "2026-03-03",
+    "runoff_date": "2026-05-26",
     "filing_deadline": "2025-12-08",
     "source": "fec+greenpapers",
     "confidence": "high",

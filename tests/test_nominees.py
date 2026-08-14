@@ -125,6 +125,105 @@ def test_manual_override_wins_over_feed_and_uncontested(tmp_path):
     assert res.nominees["H2"].confidence == "verified"
 
 
+def test_manual_override_outside_funded_set_resolves_with_warning(tmp_path, capsys):
+    # Real case (ME-Sen DEM): the replacement nominee has no FEC row at all,
+    # so the override names a cid absent from the bucket. The human call must
+    # still resolve the bucket — and warn loudly instead of staying silent.
+    ov = tmp_path / "2026.json"
+    ov.write_text(json.dumps({"S-ME-0-DEM": {"candidate_id": "S6ME00464",
+                                             "name": "Troy Jackson"}}))
+    cands = [
+        _cand("M1", "PLATNER, GRAHAM", "S", "ME", "00", "DEM"),
+        _cand("M2", "OTHER, OLIVIA", "S", "ME", "00", "DEM"),
+    ]
+    res = NomineeResolver(2026, overrides_path=ov, feed=None).resolve(cands)
+    assert set(res.nominees) == {"S6ME00464"}
+    assert res.nominees["S6ME00464"].source == "manual"
+    assert res.nominees["S6ME00464"].name == "Troy Jackson"
+    assert res.unresolved == []
+    err = capsys.readouterr().err
+    assert "S6ME00464" in err
+    assert "Troy Jackson" in err
+    assert "S-ME-0-DEM" in err
+    assert "not in the funded universe" in err
+
+
+class _LoggingFeed:
+    """Feed that records which states it was queried for."""
+    name = "log"
+
+    def __init__(self, calls=()):
+        self._calls = list(calls)
+        self.queried = []
+
+    def calls(self, state=None):
+        self.queried.append(state)
+        return [c for c in self._calls if c.state == state]
+
+
+def test_feed_not_queried_for_fully_resolved_states():
+    # NY's only bucket is uncontested (resolved without the feed); only TX
+    # still has an unresolved contested bucket -> only TX hits the feed.
+    feed = _LoggingFeed([RaceCall("TX", "H", "1", "DEM", "Yolanda R. Prince",
+                                  source="log")])
+    cands = [
+        _cand("H1", "PRINCE, YOLANDA R", "H", "TX", "01", "DEM"),
+        _cand("H2", "ALEXANDER, DAX", "H", "TX", "01", "DEM"),
+        _cand("N1", "SOLO, SAL", "H", "NY", "05", "DEM"),
+    ]
+    res = NomineeResolver(2026, overrides_path=None, feed=feed).resolve(
+        cands, states=["NY", "TX"])
+    assert feed.queried == ["TX"]
+    assert set(res.nominees) == {"H1", "N1"}
+
+
+def test_feed_not_queried_when_override_resolves_the_contest(tmp_path):
+    # A manual override settles TX's only contested bucket -> zero feed calls.
+    ov = tmp_path / "2026.json"
+    ov.write_text(json.dumps({"H-TX-1-DEM": {"candidate_id": "H2",
+                                             "name": "Dax Alexander"}}))
+    feed = _LoggingFeed()
+    cands = [
+        _cand("H1", "PRINCE, YOLANDA R", "H", "TX", "01", "DEM"),
+        _cand("H2", "ALEXANDER, DAX", "H", "TX", "01", "DEM"),
+    ]
+    res = NomineeResolver(2026, overrides_path=ov, feed=feed).resolve(
+        cands, states=["TX"])
+    assert feed.queried == []
+    assert set(res.nominees) == {"H2"}
+
+
+# --- top-two states inside resolve() -------------------------------------------
+def test_resolve_never_auto_crowns_nominees_in_top_two_states():
+    # CA/WA/AK all-candidate primaries: a lone funded filer of a party is NOT
+    # a de-facto nominee (they can be eliminated outright), and a feed's
+    # per-party "winner" is not a nominee either. Neither auto layer applies.
+    feed = _LoggingFeed([RaceCall("WA", "H", "3", "REP", "Ann Aaa", source="log")])
+    cands = [
+        _cand("C1", "LONE, LARRY", "H", "CA", "11", "DEM"),      # lone filer
+        _cand("W1", "AAA, ANN", "H", "WA", "03", "REP"),         # contested
+        _cand("W2", "BBB, BOB", "H", "WA", "03", "REP"),
+        _cand("K1", "KENAI, KIM", "S", "AK", "00", "REP"),       # lone filer
+    ]
+    res = NomineeResolver(2026, overrides_path=None, feed=feed).resolve(cands)
+    assert res.nominees == {}
+    assert feed.queried == []            # WA never hits the feed
+
+
+def test_resolve_manual_override_still_wins_in_top_two_state(tmp_path):
+    # A human call is exactly what top-two races need — layer 1 still applies.
+    ov = tmp_path / "2026.json"
+    ov.write_text(json.dumps({"H-CA-11-DEM": {"candidate_id": "C1",
+                                              "name": "Wanda Winner"}}))
+    cands = [
+        _cand("C1", "WINNER, WANDA", "H", "CA", "11", "DEM"),
+        _cand("C2", "RUNNERUP, RUTH", "H", "CA", "11", "DEM"),
+    ]
+    res = NomineeResolver(2026, overrides_path=ov, feed=None).resolve(cands)
+    assert set(res.nominees) == {"C1"}
+    assert res.nominees["C1"].source == "manual"
+
+
 # --- civicAPI feed adapter parsing (injected JSON, no network) -----------------
 def _civic_page(races, count=None):
     return {"count": count if count is not None else len(races),
@@ -395,3 +494,157 @@ def test_flag_primary_losers_excludes_postponed_races(tmp_path):
         "SELECT candidate_id FROM candidates WHERE inactive=3")}
     assert marks == {"L4"}               # nobody in the postponed CD-01
     conn.close()
+
+
+def test_flag_primary_losers_inserts_override_nominee_missing_from_universe(tmp_path, capsys):
+    # Real case (TX-30 REP): the runoff winner never cleared the receipts
+    # floor, so the override names a cid with no candidates row. The funded
+    # field still loses their primary AND the actual nominee gets a minimal
+    # row — a primary winner belongs in the universe regardless of the floor.
+    from redbox.db import init_db
+    from redbox.nominees import NomineeResolver, flag_primary_losers
+    conn = init_db(tmp_path / "db.sqlite")
+    conn.executemany(
+        """INSERT INTO candidates (candidate_id,name,office,state,district,party,
+           cycle,universe_reason,url_verified,receipts,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,2026,'contested_primary',0,100000,'t','t')""",
+        [("F1", "FUNDED, FAY", "H", "TX", "30", "REP"),
+         ("F2", "FUNDED, FRED", "H", "TX", "30", "REP")])
+    conn.commit()
+    ov = tmp_path / "2026.json"
+    ov.write_text(json.dumps({"H-TX-30-REP": {"candidate_id": "H6TX30211",
+                                              "name": "Everett Jackson"}}))
+    resolver = NomineeResolver(2026, overrides_path=ov, feed=None)
+    lost, cleared, unresolved, _ = flag_primary_losers(
+        conn, resolver, states={"TX"}, ts="t2")
+    assert sorted(c["candidate_id"] for c in lost) == ["F1", "F2"]
+    flags = {r[0]: r[1] for r in conn.execute(
+        "SELECT candidate_id, inactive FROM candidates")}
+    assert flags["F1"] == 3 and flags["F2"] == 3
+    row = conn.execute(
+        "SELECT * FROM candidates WHERE candidate_id='H6TX30211'").fetchone()
+    assert row is not None
+    assert (row["office"], row["state"], row["district"], row["party"]) == \
+        ("H", "TX", "30", "REP")
+    assert row["name"] == "Everett Jackson"
+    assert row["universe_reason"] == "nominee"
+    assert row["nominee_source"] == "manual"
+    assert row["inactive"] is None
+    assert row["cycle"] == 2026
+    assert row["created_at"] == "t2"
+    captured = capsys.readouterr()
+    assert "H6TX30211" in captured.err          # warning from resolve()
+    assert "not in the funded universe" in captured.err
+    assert "inserted nominee H6TX30211" in captured.out
+
+    # Idempotent: the second sweep finds the row it inserted, so the override
+    # now matches a real member — no second insert, no warning, losers stay.
+    lost2, cleared2, _, _ = flag_primary_losers(
+        conn, resolver, states={"TX"}, ts="t3")
+    assert lost2 == [] and cleared2 == 0
+    assert conn.execute("SELECT COUNT(*) FROM candidates "
+                        "WHERE candidate_id='H6TX30211'").fetchone()[0] == 1
+    captured = capsys.readouterr()
+    assert "inserted nominee" not in captured.out
+    assert captured.err == ""
+    conn.close()
+
+
+def test_flag_primary_losers_no_insert_when_nominee_already_in_universe(tmp_path, capsys):
+    # Override names a cid that IS a funded bucket member: the insert path
+    # must not fire and the existing row must not be touched.
+    from redbox.db import init_db
+    from redbox.nominees import NomineeResolver, flag_primary_losers
+    conn = init_db(tmp_path / "db.sqlite")
+    conn.executemany(
+        """INSERT INTO candidates (candidate_id,name,office,state,district,party,
+           cycle,universe_reason,url_verified,receipts,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,2026,'contested_primary',0,100000,'t','t')""",
+        [("F1", "FUNDED, FAY", "H", "TX", "30", "REP"),
+         ("F2", "FUNDED, FRED", "H", "TX", "30", "REP")])
+    conn.commit()
+    ov = tmp_path / "2026.json"
+    ov.write_text(json.dumps({"H-TX-30-REP": {"candidate_id": "F1",
+                                              "name": "Fay Funded"}}))
+    resolver = NomineeResolver(2026, overrides_path=ov, feed=None)
+    lost, _, _, _ = flag_primary_losers(conn, resolver, states={"TX"}, ts="t2")
+    assert [c["candidate_id"] for c in lost] == ["F2"]
+    assert conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0] == 2
+    row = conn.execute("SELECT universe_reason, created_at FROM candidates "
+                       "WHERE candidate_id='F1'").fetchone()
+    assert row["universe_reason"] == "contested_primary"   # untouched
+    assert row["created_at"] == "t"
+    captured = capsys.readouterr()
+    assert "inserted nominee" not in captured.out
+    assert captured.err == ""
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# mass-clear guard: a feed going quiet must not un-mark a state's settled races
+
+def _mass_clear_db(tmp_path, n_buckets=6):
+    """n contested TX buckets, each holding one active winner and one row
+    already marked lost-primary (inactive=3)."""
+    from redbox.db import init_db
+    conn = init_db(tmp_path / "db.sqlite")
+    rows = []
+    for i in range(1, n_buckets + 1):
+        rows.append((f"W{i}", f"WINNER{i}, WENDY", "H", "TX", f"{i:02d}", "DEM", None))
+        rows.append((f"L{i}", f"LOSER{i}, LARRY", "H", "TX", f"{i:02d}", "DEM", 3))
+    conn.executemany(
+        """INSERT INTO candidates (candidate_id,name,office,state,district,party,
+           inactive,cycle,universe_reason,url_verified,receipts,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,2026,'contested_primary',0,100000,'t','t')""",
+        rows)
+    conn.commit()
+    return conn
+
+
+def test_flag_primary_losers_refuses_mass_clear(tmp_path, capsys):
+    # 6 marked rows in TX would all clear because the feed answered with no
+    # calls (200-but-quiet). 6 > max(5, 20% of 6) -> refuse, keep the marks,
+    # print the would-be-cleared names and the escape-hatch hint.
+    from redbox.nominees import NomineeResolver, flag_primary_losers
+    conn = _mass_clear_db(tmp_path)
+    quiet = NomineeResolver(2026, overrides_path=None, feed=_FakeFeed([]))
+    lost, cleared, unresolved, _ = flag_primary_losers(
+        conn, quiet, states={"TX"}, ts="t2")
+    assert lost == [] and cleared == 0
+    assert conn.execute("SELECT COUNT(*) FROM candidates "
+                        "WHERE inactive=3").fetchone()[0] == 6
+    out = capsys.readouterr().out
+    assert "REFUSING" in out
+    for i in range(1, 7):
+        assert f"L{i} LOSER{i}, LARRY" in out       # every refused name printed
+    assert "allow-mass-clear" in out                # hint for the future CLI flag
+
+
+def test_flag_primary_losers_allow_mass_clear_applies_and_prints(tmp_path, capsys):
+    from redbox.nominees import NomineeResolver, flag_primary_losers
+    conn = _mass_clear_db(tmp_path)
+    quiet = NomineeResolver(2026, overrides_path=None, feed=_FakeFeed([]))
+    lost, cleared, _, _ = flag_primary_losers(
+        conn, quiet, states={"TX"}, ts="t2", allow_mass_clear=True)
+    assert lost == [] and cleared == 6
+    assert conn.execute("SELECT COUNT(*) FROM candidates "
+                        "WHERE inactive=3").fetchone()[0] == 0
+    out = capsys.readouterr().out
+    assert "REFUSING" not in out
+    for i in range(1, 7):
+        assert f"cleared lost-primary mark: L{i}" in out
+
+
+def test_flag_primary_losers_small_clear_passes_guard_and_prints_name(tmp_path, capsys):
+    # A batch at/below max(5, 20%) is the normal self-heal and still applies —
+    # and the cleared candidate's name is printed.
+    from redbox.nominees import NomineeResolver, flag_primary_losers
+    conn = _mass_clear_db(tmp_path, n_buckets=4)    # 4 clears <= limit 5
+    quiet = NomineeResolver(2026, overrides_path=None, feed=_FakeFeed([]))
+    lost, cleared, _, _ = flag_primary_losers(
+        conn, quiet, states={"TX"}, ts="t2")
+    assert lost == [] and cleared == 4
+    assert conn.execute("SELECT COUNT(*) FROM candidates "
+                        "WHERE inactive=3").fetchone()[0] == 0
+    out = capsys.readouterr().out
+    assert "cleared lost-primary mark: L1 LOSER1, LARRY (H-TX-01)" in out

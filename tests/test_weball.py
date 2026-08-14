@@ -73,11 +73,9 @@ def test_discovery_groups_from_weball(tmp_path):
     # End-to-end: bulk-file source -> contested-primary grouping.
     from redbox.config import Config
     from redbox.discovery import Discovery
-    from redbox.website import WebsiteResolver
 
     cfg = Config(raw={"election_year": 2026, "receipts_floor": 50000})
-    resolver = WebsiteResolver(overrides_path=tmp_path / "none.json", wikipedia=False)
-    d = Discovery(cfg, fec=None, rating_adapter=None, resolver=resolver,
+    d = Discovery(cfg, fec=None, rating_adapter=None,
                   weball_path=_write(tmp_path))
     entries = d.build_universe(offices=["H"], states=["NY"], district="12")
     ids = {e.candidate.candidate_id for e in entries}

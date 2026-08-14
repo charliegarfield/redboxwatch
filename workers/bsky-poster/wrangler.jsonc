@@ -1,4 +1,4 @@
-// Posts newly published Red Box Watch findings to Bluesky.
+// Posts newly published RedBoxWatch findings to Bluesky.
 // Reads the public JSON Feed, dedupes via KV, posts via AT Protocol.
 // Secrets (wrangler secret put): BSKY_APP_PASSWORD, RUN_TOKEN.
 {
