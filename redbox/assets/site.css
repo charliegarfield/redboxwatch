@@ -37,6 +37,9 @@ code{font-size:.85em;background:var(--paper-bright);border:1px solid var(--hair)
 .nameplate{text-align:center;padding:2.1rem 2rem 1.6rem}
 .brand{font-family:var(--display);font-size:clamp(2rem,5vw,3.1rem);font-weight:620;font-variation-settings:"opsz" 144,"WONK" 1;letter-spacing:-.01em;line-height:1;text-decoration:none;color:var(--ink);white-space:nowrap}
 .brand:hover{color:var(--ink)}
+/* camelCase junctions have no kern pairs in Fraunces — hand-kern them */
+.brand .kb{margin-left:.05em}
+.brand .kw{margin-left:-.01em}
 .brand .redbox{width:.42em;height:.42em;margin-right:.34em;vertical-align:.05em}
 .brand:hover .redbox{background:var(--red-deep)}
 .tagline{margin:.75rem 0 0;font-family:var(--grot);font-size:.72rem;letter-spacing:.22em;text-transform:uppercase;color:var(--ink-soft)}

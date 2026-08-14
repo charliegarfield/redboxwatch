@@ -1016,7 +1016,7 @@ def _layout(title: str, body: str, *, page_class: str = "", active: str = "",
     <nav>{nav('index', 'Index', 'index')}{nav('methodology', 'Methodology', 'methodology')}{nav('corrections', 'Corrections &amp; Appeals', 'corrections')}{nav('about', 'About', 'about')}</nav>
   </div>
   <div class="nameplate wrap">
-    <a class="brand" href="{_href('index', root)}"><span class="redbox"></span>RedBoxWatch</a>
+    <a class="brand" href="{_href('index', root)}"><span class="redbox"></span>Red<span class="kb">B</span>ox<span class="kw">W</span>atch</a>
     <p class="tagline">A public ledger of red&#8209;boxing &#8212; campaign&#8209;site signals to super PACs</p>
   </div>
   <div class="wrap"><div class="double-rule"></div></div>
